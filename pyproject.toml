@@ -1,0 +1,37 @@
+[project]
+name = "agent-trade"
+version = "0.1.0"
+description = "Agent Trade — мультиагентная система анализа крипторынка (Этап 1: инфраструктура)"
+requires-python = ">=3.12"
+dependencies = [
+    "asyncpg>=0.30,<0.31",
+    "redis>=5.2,<5.3",
+    "pydantic-settings>=2,<3",
+    "structlog>=24,<25",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+    "pytest-asyncio>=0.24,<0.25",
+    "ruff>=0.6",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["src", "src.core"]
