@@ -31,6 +31,22 @@ class Settings(BaseSettings):
     # --- Логирование ---
     LOG_LEVEL: str = "INFO"
 
+    # --- Сбор данных (Этап 2) ---
+    EXCHANGE: str = "binance"
+    SYMBOL: str = "BTC/USDT"            # спотовый символ
+    SWAP_SYMBOL: str = "BTC/USDT:USDT"  # бессрочный фьючерс (swap)
+    TIMEFRAMES: str = "1m,5m,15m,1h"    # таймфреймы свечей через запятую
+    OHLCV_INTERVAL: int = 30            # сек между опросами свечей
+    ORDERBOOK_INTERVAL: int = 10        # сек между снимками стакана
+    ORDERBOOK_DEPTH: int = 50           # глубина стакана
+    TRADES_INTERVAL: int = 15           # сек между опросами сделок
+    FUTURES_INTERVAL: int = 60          # сек между опросами funding/OI
+
+    @property
+    def timeframes_list(self) -> list[str]:
+        """Разбирает строку TIMEFRAMES в список таймфреймов."""
+        return [tf.strip() for tf in self.TIMEFRAMES.split(",") if tf.strip()]
+
     @property
     def pg_dsn(self) -> str:
         """Собирает строку подключения (DSN) к PostgreSQL."""

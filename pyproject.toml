@@ -8,6 +8,7 @@ dependencies = [
     "redis>=5.2,<5.3",
     "pydantic-settings>=2,<3",
     "structlog>=24,<25",
+    "ccxt>=4.4,<4.5",
 ]
 
 [project.optional-dependencies]
@@ -26,6 +27,7 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 pythonpath = ["."]
 

@@ -28,3 +28,11 @@ async def ping_redis() -> bool:
         return bool(await get_redis().ping())
     except Exception:
         return False
+
+
+async def close_redis() -> None:
+    """Закрывает соединение с Redis и сбрасывает синглтон."""
+    global _client
+    if _client is not None:
+        await _client.aclose()
+        _client = None

@@ -29,7 +29,7 @@ services:
       timeout: 5s
       retries: 5
 
-  app:
+  collector:
     build: .
     env_file: .env
     depends_on:
@@ -37,8 +37,15 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    # На Этапе 1 контейнер выполняет health-check инфраструктуры.
-    command: ["python", "-m", "src.healthcheck"]
+    # Этап 2: контейнер запускает круглосуточный сервис-коллектор.
+    command: ["python", "-m", "src.main"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-m", "src.healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
 
 volumes:
   pg_data:
