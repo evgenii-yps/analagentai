@@ -7,11 +7,15 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import asyncpg
 
 from src.core.config import settings
+
+if TYPE_CHECKING:
+    # Импорт только для аннотаций — без циклической зависимости в рантайме.
+    from src.agents.base import AgentOutput
 
 
 class DB:
@@ -205,6 +209,102 @@ class DB:
             ON CONFLICT (instrument_id, ts) DO UPDATE SET value = EXCLUDED.value;
         """
         await self.pool.execute(query, instrument_id, ts, float(value))
+
+    # --- Чтение данных для агентов (Этап 3) ---
+
+    async def get_ohlcv(
+        self,
+        instrument_id: int,
+        timeframe: str,
+        limit: int,
+    ) -> list[asyncpg.Record]:
+        """Последние ``limit`` свечей по возрастанию ts (старые → новые)."""
+        query = """
+            SELECT ts, open, high, low, close, volume
+            FROM (
+                SELECT ts, open, high, low, close, volume
+                FROM ohlcv
+                WHERE instrument_id = $1 AND timeframe = $2
+                ORDER BY ts DESC
+                LIMIT $3
+            ) sub
+            ORDER BY ts ASC;
+        """
+        return await self.pool.fetch(query, instrument_id, timeframe, limit)
+
+    async def get_recent_orderbook(
+        self,
+        instrument_id: int,
+        limit: int,
+    ) -> list[asyncpg.Record]:
+        """Последние ``limit`` снимков стакана по возрастанию ts (старые → новые)."""
+        query = """
+            SELECT ts, bids, asks, spread, bid_volume, ask_volume
+            FROM (
+                SELECT ts, bids, asks, spread, bid_volume, ask_volume
+                FROM orderbook_snapshots
+                WHERE instrument_id = $1
+                ORDER BY ts DESC
+                LIMIT $2
+            ) sub
+            ORDER BY ts ASC;
+        """
+        return await self.pool.fetch(query, instrument_id, limit)
+
+    async def get_recent_funding(
+        self,
+        instrument_id: int,
+        limit: int,
+    ) -> list[asyncpg.Record]:
+        """Последние ``limit`` значений funding по возрастанию ts."""
+        query = """
+            SELECT ts, rate
+            FROM (
+                SELECT ts, rate
+                FROM funding
+                WHERE instrument_id = $1
+                ORDER BY ts DESC
+                LIMIT $2
+            ) sub
+            ORDER BY ts ASC;
+        """
+        return await self.pool.fetch(query, instrument_id, limit)
+
+    async def get_recent_open_interest(
+        self,
+        instrument_id: int,
+        limit: int,
+    ) -> list[asyncpg.Record]:
+        """Последние ``limit`` значений open interest по возрастанию ts."""
+        query = """
+            SELECT ts, value
+            FROM (
+                SELECT ts, value
+                FROM open_interest
+                WHERE instrument_id = $1
+                ORDER BY ts DESC
+                LIMIT $2
+            ) sub
+            ORDER BY ts ASC;
+        """
+        return await self.pool.fetch(query, instrument_id, limit)
+
+    async def save_agent_output(self, output: AgentOutput) -> None:
+        """INSERT заключения агента в ``agent_outputs``."""
+        query = """
+            INSERT INTO agent_outputs
+                (agent, instrument_id, signal, confidence, metrics, rationale)
+            VALUES ($1, $2, $3, $4, $5::jsonb, $6);
+        """
+        await self.pool.execute(
+            query,
+            output.agent,
+            output.instrument_id,
+            output.signal,
+            float(output.confidence),
+            json.dumps(output.metrics),
+            output.rationale,
+        )
 
 
 def _ms_to_dt(ms: int | None) -> datetime:

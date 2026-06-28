@@ -86,3 +86,16 @@ CREATE TABLE IF NOT EXISTS signals (
     success        BOOLEAN
 );
 CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals (ts DESC);
+
+-- Заключения аналитических агентов (Этап 3).
+CREATE TABLE IF NOT EXISTS agent_outputs (
+    id            BIGSERIAL PRIMARY KEY,
+    agent         TEXT NOT NULL,                 -- market | liquidity | futures
+    instrument_id INT NOT NULL REFERENCES instruments(id),
+    ts            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    signal        TEXT NOT NULL,                 -- bullish | bearish | neutral | insufficient_data
+    confidence    DOUBLE PRECISION NOT NULL DEFAULT 0,
+    metrics       JSONB,
+    rationale     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_agent_outputs ON agent_outputs (agent, instrument_id, ts DESC);

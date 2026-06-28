@@ -9,6 +9,8 @@ dependencies = [
     "pydantic-settings>=2,<3",
     "structlog>=24,<25",
     "ccxt>=4.4,<4.5",
+    "pandas>=2.2,<3",
+    "numpy>=1.26,<3",
 ]
 
 [project.optional-dependencies]
@@ -36,4 +38,4 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["src", "src.core"]
+packages = ["src", "src.core", "src.collectors", "src.agents"]

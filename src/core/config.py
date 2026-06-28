@@ -42,6 +42,11 @@ class Settings(BaseSettings):
     TRADES_INTERVAL: int = 15           # сек между опросами сделок
     FUTURES_INTERVAL: int = 60          # сек между опросами funding/OI
 
+    # --- Аналитические агенты (Этап 3) ---
+    AGENT_TIMEFRAME: str = "1h"   # таймфрейм для Market Agent
+    AGENT_INTERVAL: int = 60      # сек между запусками агентов
+    AGENT_MIN_CANDLES: int = 200  # минимум свечей для анализа
+
     @property
     def timeframes_list(self) -> list[str]:
         """Разбирает строку TIMEFRAMES в список таймфреймов."""
