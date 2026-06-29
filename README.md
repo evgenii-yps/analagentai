@@ -10,8 +10,10 @@
   только сбор и хранение.
 - **Этап 3 (первые агенты):** три независимых аналитических агента (Market, Liquidity,
   Futures), каждый читает только свои данные и пишет независимое заключение в
-  `agent_outputs`. Решение «покупать/продавать» НЕ здесь — его примет Decision Agent
-  (Этап 4).
+  `agent_outputs`.
+- **Этап 4 (Decision Agent):** агрегирующий агент читает ТОЛЬКО `agent_outputs`
+  (не сырые данные), взвешивает свежие выводы трёх агентов и пишет итоговое решение
+  (`buy`/`sell`/`wait`) с вероятностью в таблицу `signals`.
 
 ## Стек
 
@@ -24,7 +26,7 @@
 
 ```
 .
-├── docker-compose.yml      # postgres + redis + collector + agents
+├── docker-compose.yml      # postgres + redis + collector + agents + decision
 ├── Dockerfile              # образ приложения (python:3.12-slim)
 ├── .env.example            # пример переменных окружения
 ├── pyproject.toml          # метаданные, ruff, pytest
@@ -33,6 +35,7 @@
 ├── src/
 │   ├── main.py             # точка входа — сервис-коллектор
 │   ├── agents_main.py      # точка входа — сервис агентов
+│   ├── decision_main.py    # точка входа — Decision Agent
 │   ├── healthcheck.py      # CLI-проверка PG и Redis
 │   ├── core/
 │   │   ├── config.py       # Settings (pydantic-settings)
@@ -47,13 +50,16 @@
 │   │   ├── trades.py       # сделки (тики)
 │   │   ├── futures.py      # funding + open interest (swap)
 │   │   └── runner.py       # оркестрация + graceful shutdown
-│   └── agents/
-│       ├── base.py         # BaseAgent + AgentOutput
-│       ├── market.py       # теханализ по OHLCV (EMA/RSI/ATR/MACD/ADX)
-│       ├── liquidity.py    # анализ стакана (дисбаланс, стенки)
-│       ├── futures.py      # funding + open interest
-│       └── runner.py       # планировщик агентов + graceful shutdown
-└── tests/                  # тесты конфига, коллекторов и агентов (индикаторы)
+│   ├── agents/
+│   │   ├── base.py         # BaseAgent + AgentOutput
+│   │   ├── market.py       # теханализ по OHLCV (EMA/RSI/ATR/MACD/ADX)
+│   │   ├── liquidity.py    # анализ стакана (дисбаланс, стенки)
+│   │   ├── futures.py      # funding + open interest
+│   │   └── runner.py       # планировщик агентов + graceful shutdown
+│   └── decision/
+│       ├── agent.py        # DecisionAgent + чистая логика агрегации
+│       └── runner.py       # планировщик решений + graceful shutdown
+└── tests/                  # тесты конфига, коллекторов, агентов, агрегации
 ```
 
 ## Сбор данных (Этап 2)
@@ -100,6 +106,37 @@ docker compose exec postgres psql -U agenttrade -d agenttrade -c \
 
 # heartbeat агентов
 docker compose exec redis redis-cli KEYS 'agent:heartbeat:*'
+```
+
+## Decision Agent (Этап 4)
+
+Отдельный сервис `decision` (команда `python -m src.decision_main`) агрегирует выводы
+трёх агентов в одно итоговое решение и пишет его в `signals`.
+
+Логика: берётся последний вывод каждого агента; устаревшие (старше
+`AGENT_FRESHNESS_SEC`) и `insufficient_data` отбрасываются; сигнал переводится в
+направление (bullish +1 / bearish −1 / neutral 0); считается взвешенный балл
+`Σ(направление × confidence × вес) / Σ(вес × confidence)` в диапазоне −1..+1.
+Балл > `DECISION_THRESHOLD` → `buy`, < −`DECISION_THRESHOLD` → `sell`, иначе `wait`.
+Если свежих выводов меньше `MIN_AGENTS` → `wait`. Вероятность растёт с |балл| и
+единодушием агентов.
+
+Ключевой принцип: Decision Agent **не анализирует рынок сам** — ему доступны только
+`db.get_latest_agent_output` и `db.save_signal`, к сырым рыночным таблицам доступа нет
+(видно по коду). Heartbeat — `decision:heartbeat` (TTL 300 сек).
+
+Настройки (с дефолтами): `DECISION_INTERVAL` (60), `DECISION_THRESHOLD` (0.3),
+`AGENT_FRESHNESS_SEC` (300), `MIN_AGENTS` (2), `WEIGHT_MARKET`/`WEIGHT_LIQUIDITY`/`WEIGHT_FUTURES` (1.0).
+
+Проверка решений:
+
+```bash
+docker compose exec postgres psql -U agenttrade -d agenttrade -c \
+  "SELECT decision, round(probability::numeric,3) prob, \
+   jsonb_array_length(agents_payload) n_agents, left(rationale,80) rationale \
+   FROM signals ORDER BY ts DESC LIMIT 5;"
+
+docker compose exec redis redis-cli GET decision:heartbeat
 ```
 
 ## Пошаговый запуск

@@ -306,6 +306,47 @@ class DB:
             output.rationale,
         )
 
+    # --- Decision Agent (Этап 4) ---
+
+    async def get_latest_agent_output(
+        self,
+        agent: str,
+        instrument_id: int,
+    ) -> dict[str, Any] | None:
+        """Последний вывод агента по инструменту (ts DESC) или None."""
+        query = """
+            SELECT agent, instrument_id, ts, signal, confidence, metrics, rationale
+            FROM agent_outputs
+            WHERE agent = $1 AND instrument_id = $2
+            ORDER BY ts DESC
+            LIMIT 1;
+        """
+        row = await self.pool.fetchrow(query, agent, instrument_id)
+        return dict(row) if row is not None else None
+
+    async def save_signal(
+        self,
+        instrument_id: int,
+        decision: str,
+        probability: float,
+        agents_payload: list[dict[str, Any]],
+        rationale: str,
+    ) -> None:
+        """INSERT итогового решения в ``signals`` (status остаётся 'open')."""
+        query = """
+            INSERT INTO signals
+                (instrument_id, decision, probability, agents_payload, rationale)
+            VALUES ($1, $2, $3, $4::jsonb, $5);
+        """
+        await self.pool.execute(
+            query,
+            instrument_id,
+            decision,
+            float(probability),
+            json.dumps(agents_payload),
+            rationale,
+        )
+
 
 def _ms_to_dt(ms: int | None) -> datetime:
     """Преобразует Unix-время в мс (UTC-aware datetime). None → текущее время."""

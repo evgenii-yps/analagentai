@@ -47,6 +47,24 @@ class Settings(BaseSettings):
     AGENT_INTERVAL: int = 60      # сек между запусками агентов
     AGENT_MIN_CANDLES: int = 200  # минимум свечей для анализа
 
+    # --- Decision Agent (Этап 4) ---
+    DECISION_INTERVAL: int = 60       # сек между решениями
+    DECISION_THRESHOLD: float = 0.3   # порог балла для buy/sell
+    AGENT_FRESHNESS_SEC: int = 300    # макс. возраст вывода агента
+    MIN_AGENTS: int = 2               # минимум свежих агентов для решения
+    WEIGHT_MARKET: float = 1.0        # вес Market Agent
+    WEIGHT_LIQUIDITY: float = 1.0     # вес Liquidity Agent
+    WEIGHT_FUTURES: float = 1.0       # вес Futures Agent
+
+    @property
+    def agent_weights(self) -> dict[str, float]:
+        """Веса агентов для взвешенной агрегации."""
+        return {
+            "market": self.WEIGHT_MARKET,
+            "liquidity": self.WEIGHT_LIQUIDITY,
+            "futures": self.WEIGHT_FUTURES,
+        }
+
     @property
     def timeframes_list(self) -> list[str]:
         """Разбирает строку TIMEFRAMES в список таймфреймов."""
