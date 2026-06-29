@@ -186,6 +186,98 @@ def _adx_note(adx: float) -> str:
     return f"тренда почти нет (<{_ADX_TREND_MIN:.0f}) — рынок во флэте"
 
 
+def compute_trade_levels(
+    decision: str,
+    price: float | None,
+    support: float | None,
+    resistance: float | None,
+    atr: float | None,
+    *,
+    atr_mult: float = 1.5,
+    min_rr: float = 1.5,
+) -> dict[str, Any]:
+    """Чистая функция расчёта торговых уровней из S/R и ATR. Детерминирована.
+
+    Считает только на основе того, что уже добывает Market Agent: ближайшая
+    поддержка, ближайшее сопротивление и ATR(14). За вход берётся текущая цена.
+
+    Для buy: зона входа = [поддержка; цена], стоп = поддержка − atr_mult×ATR,
+    цель = сопротивление. Для sell — зеркально. R/R = потенциал / риск.
+
+    Возвращает dict со ``status``:
+      * ``wait``         — направления нет, уровни не считаем;
+      * ``insufficient`` — нет S/R или ATR (с полем ``reason``);
+      * ``ok``           — полный расклад уровней.
+    """
+    if decision == "wait":
+        return {"status": "wait"}
+    if (
+        price is None or price <= 0
+        or atr is None or atr <= 0
+        or support is None or support <= 0
+        or resistance is None or resistance <= 0
+    ):
+        return {
+            "status": "insufficient",
+            "reason": "нет уровней поддержки/сопротивления или недоступен ATR",
+        }
+    # Поддержка должна быть ниже цены, сопротивление — выше (иначе уровни вырождены).
+    if not support < price < resistance:
+        return {
+            "status": "insufficient",
+            "reason": (
+                "поддержка/сопротивление не охватывают текущую цену "
+                "(нет поддержки ниже или сопротивления выше в окне 50 свечей)"
+            ),
+        }
+
+    buffer = atr_mult * atr
+    entry = float(price)
+    if decision == "buy":
+        zone_low, zone_high = support, entry
+        stop = support - buffer
+        target = resistance
+        risk = entry - stop
+        reward = target - entry
+    elif decision == "sell":
+        zone_low, zone_high = entry, resistance
+        stop = resistance + buffer
+        target = support
+        risk = stop - entry
+        reward = entry - target
+    else:
+        return {"status": "insufficient", "reason": f"неизвестное решение: {decision}"}
+
+    if risk <= 0 or reward <= 0:
+        return {
+            "status": "insufficient",
+            "reason": "вырожденные уровни (риск или потенциал ≤ 0)",
+        }
+
+    rr = reward / risk
+    return {
+        "status": "ok",
+        "decision": decision,
+        "entry": round(entry, 2),
+        "zone_low": round(zone_low, 2),
+        "zone_high": round(zone_high, 2),
+        "stop": round(stop, 2),
+        "stop_dist_pct": round(abs(entry - stop) / entry * 100, 2),
+        "stop_dist_atr": round(abs(entry - stop) / atr, 2),
+        "target": round(target, 2),
+        "target_pct": round(reward / entry * 100, 2),
+        "risk_abs": round(risk, 2),
+        "reward_abs": round(reward, 2),
+        "rr": round(rr, 2),
+        "rr_weak": rr < min_rr,
+        "min_rr": min_rr,
+        "atr": round(float(atr), 2),
+        "atr_mult": atr_mult,
+        "support": round(float(support), 2),
+        "resistance": round(float(resistance), 2),
+    }
+
+
 def render_market(out: dict[str, Any]) -> str:
     sig = out["signal"]
     if sig == "insufficient_data":
@@ -507,6 +599,78 @@ def render_verdict(
     return "\n".join(lines)
 
 
+def render_trade_plan(levels: dict[str, Any]) -> str:
+    head = [
+        "## 6. Торговый план (пилотная логика)",
+        "",
+        "> ⚠️ **Пилотная логика для разбора со специалистом, НЕ финансовый совет.** "
+        "Уровни рассчитаны механически из ближайших поддержки/сопротивления и ATR — "
+        "это иллюстрация подхода, а не рекомендация к сделке.",
+        "",
+    ]
+    status = levels.get("status")
+    if status == "wait":
+        head.append(
+            "Решение системы — **wait**: входить не во что, торговые уровни "
+            "не рассчитываются."
+        )
+        return "\n".join(head) + "\n"
+    if status != "ok":
+        head.append(
+            f"**Недостаточно данных для уровней:** {levels.get('reason', '—')}. "
+            "Фиктивные цифры не выводим."
+        )
+        return "\n".join(head) + "\n"
+
+    L = levels
+    is_buy = L["decision"] == "buy"
+    side = "покупку (buy)" if is_buy else "продажу (sell)"
+    verb = "откупать" if is_buy else "продавать"
+    zone_from = "поддержки" if is_buy else "текущей цены"
+    zone_to = "текущей цены" if is_buy else "сопротивления"
+    stop_anchor = "поддержкой" if is_buy else "сопротивлением"
+    target_anchor = "сопротивление выше" if is_buy else "поддержка ниже"
+    rr_note = (
+        f"⚠️ слабое соотношение (хуже 1:{L['min_rr']:.1f}) — потенциал не оправдывает риск"
+        if L["rr_weak"]
+        else f"приемлемо (не хуже 1:{L['min_rr']:.1f})"
+    )
+    lines = head + [
+        f"Расчёт под **{side}**. За вход принята текущая цена "
+        f"**{_fmt(L['entry'])} USDT**. ATR(14) = {_fmt(L['atr'])}, "
+        f"буфер стопа = {L['atr_mult']}×ATR.",
+        "",
+        "| Уровень | Цена | Пояснение |",
+        "|---|---|---|",
+        f"| Зона входа | {_fmt(L['zone_low'])} – {_fmt(L['zone_high'])} | "
+        f"коридор, где разумно {verb}: от {zone_from} до {zone_to} |",
+        f"| Стоп | {_fmt(L['stop'])} | за {stop_anchor} на {L['atr_mult']}×ATR; "
+        f"{L['stop_dist_pct']:.2f}% ({L['stop_dist_atr']:.2f}×ATR) от входа |",
+        f"| Цель | {_fmt(L['target'])} | ближайшее {target_anchor} цены; "
+        f"потенциал {L['target_pct']:.2f}% |",
+        f"| Риск / Прибыль | **{L['rr']:.2f} : 1** | "
+        f"(цель−вход)/(вход−стоп) — {rr_note} |",
+        "",
+        "**Простыми словами:**",
+        f"- **Вход {_fmt(L['entry'])} USDT** — текущая цена; докупать имеет смысл "
+        f"в коридоре {_fmt(L['zone_low'])}–{_fmt(L['zone_high'])} USDT.",
+        f"- **Стоп {_fmt(L['stop'])} USDT** — если цена дойдёт сюда, идея не "
+        f"сработала; убыток ≈ {L['stop_dist_pct']:.2f}% от входа "
+        f"(это {L['stop_dist_atr']:.2f} «средних свечей» ATR).",
+        f"- **Цель {_fmt(L['target'])} USDT** — ближайший разворотный уровень; "
+        f"потенциал ≈ {L['target_pct']:.2f}%.",
+        f"- **R/R {L['rr']:.2f}** — на каждый 1 USDT риска приходится "
+        f"{L['rr']:.2f} USDT потенциальной прибыли."
+        + (
+            " Соотношение слабое: по риску сделка невыгодная."
+            if L["rr_weak"]
+            else ""
+        ),
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def _plus(dt: datetime, hours: int) -> str:
     from datetime import timedelta
     return (dt + timedelta(hours=hours)).strftime("%H:%M")
@@ -551,6 +715,7 @@ def build_report(ctx: dict[str, Any]) -> str:
             ctx["decision"], ctx["probability"], ctx["price"],
             ctx["decision_outputs"], ctx["signal_id"], ctx["now_msk"],
         ),
+        render_trade_plan(ctx["levels"]),
     ]
     return "\n".join(header) + "\n" + "\n".join(body)
 
@@ -632,6 +797,16 @@ async def run(no_db: bool) -> None:
                 decision, probability, payload, dec_rationale,
             )
 
+        # --- 4b. Торговые уровни (из S/R и ATR, добытых Market Agent) ---
+        mm = market_out["metrics"] if m_sig != "insufficient_data" else {}
+        levels = compute_trade_levels(
+            decision,
+            price,
+            mm.get("support"),
+            mm.get("resistance"),
+            mm.get("atr14"),
+        )
+
         # --- 5. Отчёт ---
         ctx = {
             "exchange": exchange_id,
@@ -654,6 +829,7 @@ async def run(no_db: bool) -> None:
             "threshold": threshold,
             "min_agents": min_agents,
             "signal_id": signal_id,
+            "levels": levels,
         }
         report = build_report(ctx)
         print(report)
