@@ -51,7 +51,7 @@ def test_probability_at_threshold_is_notified() -> None:
 
 
 def test_format_signal_buy() -> None:
-    text = format_signal(_sig("buy", 0.82), "BTC/USDT")
+    text = format_signal(_sig("buy", 0.82), "BTC/USDT", "Europe/Moscow")
     assert "ПОКУПАТЬ BTC" in text
     assert "🟢" in text
     assert "82%" in text
@@ -59,7 +59,21 @@ def test_format_signal_buy() -> None:
 
 
 def test_format_signal_sell() -> None:
-    text = format_signal(_sig("sell", 0.91), "BTC/USDT")
+    text = format_signal(_sig("sell", 0.91), "BTC/USDT", "Europe/Moscow")
     assert "ПРОДАВАТЬ BTC" in text
     assert "🔴" in text
     assert "91%" in text
+
+
+def test_format_signal_time_in_moscow() -> None:
+    # _NOW = 12:00 UTC → 15:00 МСК (UTC+3).
+    text = format_signal(_sig("buy", 0.82), "BTC/USDT", "Europe/Moscow")
+    assert "15:00 МСК" in text
+    assert "UTC" not in text
+
+
+def test_format_signal_time_other_timezone() -> None:
+    # Для другой зоны метка берётся из самой зоны (не «МСК»).
+    text = format_signal(_sig("buy", 0.82), "BTC/USDT", "UTC")
+    assert "12:00" in text
+    assert "МСК" not in text

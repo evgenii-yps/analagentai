@@ -168,10 +168,11 @@ TELEGRAM_BOT_TOKEN=<токен от @BotFather>
 TELEGRAM_CHAT_ID=<id чата>
 NOTIFY_MIN_PROBABILITY=0.7
 NOTIFY_COOLDOWN_SEC=1800
+NOTIFY_TIMEZONE=Europe/Moscow
 ```
 
 Формат сообщения: 🟢/🔴 действие (ПОКУПАТЬ/ПРОДАВАТЬ), вероятность в %, причина
-(из `rationale`) и время UTC.
+(из `rationale`) и время в часовом поясе `NOTIFY_TIMEZONE` (по умолчанию МСК).
 
 ## Пошаговый запуск
 

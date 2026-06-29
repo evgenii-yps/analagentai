@@ -62,6 +62,7 @@ class Settings(BaseSettings):
     NOTIFY_INTERVAL: int = 30         # сек между проверками новых сигналов
     NOTIFY_MIN_PROBABILITY: float = 0.7  # минимальная вероятность для отправки
     NOTIFY_COOLDOWN_SEC: int = 1800   # пауза перед повтором того же решения
+    NOTIFY_TIMEZONE: str = "Europe/Moscow"  # часовой пояс времени в уведомлениях
 
     @property
     def agent_weights(self) -> dict[str, float]:

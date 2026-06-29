@@ -12,6 +12,7 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import structlog
 
@@ -59,8 +60,15 @@ def should_notify(
     return (now - last_sent_ts).total_seconds() >= cfg.cooldown_sec
 
 
-def format_signal(signal: dict[str, Any], symbol: str) -> str:
-    """Форматирует сигнал в HTML-сообщение на русском."""
+# Короткие метки для часто используемых зон (иначе берём abbr из самой зоны).
+_TZ_LABELS = {"Europe/Moscow": "МСК"}
+
+
+def format_signal(signal: dict[str, Any], symbol: str, tz_name: str) -> str:
+    """Форматирует сигнал в HTML-сообщение на русском.
+
+    Время сигnala переводится из UTC в ``tz_name`` (напр. Europe/Moscow → МСК).
+    """
     base = symbol.split("/")[0]
     decision = signal["decision"]
     if decision == "buy":
@@ -68,14 +76,18 @@ def format_signal(signal: dict[str, Any], symbol: str) -> str:
     else:
         emoji, action = "🔴", "ПРОДАВАТЬ"
     probability = round(float(signal["probability"]) * 100)
+
     ts: datetime = signal["ts"]
-    when = ts.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S")
+    local_ts = ts.astimezone(ZoneInfo(tz_name))
+    label = _TZ_LABELS.get(tz_name) or local_ts.tzname() or tz_name
+    when = local_ts.strftime("%Y-%m-%d %H:%M")
+
     rationale = signal.get("rationale") or "—"
     return (
         f"{emoji} <b>СИГНАЛ: {action} {base}</b>\n"
         f"Вероятность: <b>{probability}%</b>\n"
         f"Почему: {rationale}\n"
-        f"Время: {when} UTC"
+        f"Время: {when} {label}"
     )
 
 
@@ -88,10 +100,12 @@ class NotifyAgent:
         min_probability: float,
         cooldown_sec: float,
         symbol: str,
+        tz_name: str,
     ) -> None:
         self.interval = interval
         self.cfg = NotifyConfig(min_probability, cooldown_sec)
         self.symbol = symbol
+        self.tz_name = tz_name
         self._log = structlog.get_logger().bind(component="notify")
 
     async def process_once(self) -> None:
@@ -116,7 +130,7 @@ class NotifyAgent:
             await db.mark_signal_notified(signal["id"])
             return
 
-        sent = await send_message(format_signal(signal, self.symbol))
+        sent = await send_message(format_signal(signal, self.symbol, self.tz_name))
         if sent:
             await db.mark_signal_notified(signal["id"])
             await self._set_last_state(instrument_id, signal["decision"], now)

@@ -38,6 +38,7 @@ async def run() -> None:
             min_probability=settings.NOTIFY_MIN_PROBABILITY,
             cooldown_sec=settings.NOTIFY_COOLDOWN_SEC,
             symbol=settings.SYMBOL,
+            tz_name=settings.NOTIFY_TIMEZONE,
         )
         tasks = [asyncio.create_task(agent.run(), name="notify")]
 
