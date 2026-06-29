@@ -378,6 +378,143 @@ class DB:
             "UPDATE signals SET notified = TRUE WHERE id = $1;", signal_id
         )
 
+    # --- Оценка результатов (Этап 6) ---
+
+    async def ensure_evaluator_schema(self) -> None:
+        """Идемпотентно создаёт таблицу ``signal_evaluations`` (на старом томе)."""
+        await self.pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS signal_evaluations (
+                id              BIGSERIAL PRIMARY KEY,
+                signal_id       BIGINT NOT NULL REFERENCES signals(id),
+                horizon         TEXT NOT NULL,
+                price_at_signal DOUBLE PRECISION NOT NULL,
+                price_at_close  DOUBLE PRECISION NOT NULL,
+                pnl_pct         DOUBLE PRECISION NOT NULL,
+                drawdown_pct    DOUBLE PRECISION NOT NULL,
+                success         BOOLEAN NOT NULL,
+                evaluated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+                UNIQUE (signal_id, horizon)
+            );
+            """
+        )
+
+    async def get_signals_to_evaluate(
+        self,
+        horizon: str,
+        horizon_sec: float,
+    ) -> list[dict[str, Any]]:
+        """Направленные сигналы, у которых прошёл горизонт и нет оценки по нему."""
+        query = """
+            SELECT s.id, s.instrument_id, s.ts, s.decision
+            FROM signals s
+            WHERE s.decision <> 'wait'
+              AND (now() - s.ts) >= make_interval(secs => $2)
+              AND NOT EXISTS (
+                  SELECT 1 FROM signal_evaluations e
+                  WHERE e.signal_id = s.id AND e.horizon = $1
+              )
+            ORDER BY s.ts ASC;
+        """
+        rows = await self.pool.fetch(query, horizon, float(horizon_sec))
+        return [dict(r) for r in rows]
+
+    async def get_ohlcv_window(
+        self,
+        instrument_id: int,
+        start_ts: datetime,
+        end_ts: datetime,
+        timeframe: str = "1m",
+    ) -> list[dict[str, Any]]:
+        """Свечи окна (start_ts, end_ts] по возрастанию ts."""
+        query = """
+            SELECT ts, open, high, low, close, volume
+            FROM ohlcv
+            WHERE instrument_id = $1 AND timeframe = $2
+              AND ts > $3 AND ts <= $4
+            ORDER BY ts ASC;
+        """
+        rows = await self.pool.fetch(query, instrument_id, timeframe, start_ts, end_ts)
+        return [dict(r) for r in rows]
+
+    async def get_price_at(
+        self,
+        instrument_id: int,
+        ts: datetime,
+        timeframe: str = "1m",
+    ) -> float | None:
+        """Close ближайшей свечи на/до ``ts`` (цена на момент сигнала) или None."""
+        query = """
+            SELECT close
+            FROM ohlcv
+            WHERE instrument_id = $1 AND timeframe = $2 AND ts <= $3
+            ORDER BY ts DESC
+            LIMIT 1;
+        """
+        return await self.pool.fetchval(query, instrument_id, timeframe, ts)
+
+    async def save_evaluation(
+        self,
+        signal_id: int,
+        horizon: str,
+        price_at_signal: float,
+        price_at_close: float,
+        pnl_pct: float,
+        drawdown_pct: float,
+        success: bool,
+    ) -> None:
+        """INSERT оценки (идемпотентно по UNIQUE (signal_id, horizon))."""
+        query = """
+            INSERT INTO signal_evaluations
+                (signal_id, horizon, price_at_signal, price_at_close,
+                 pnl_pct, drawdown_pct, success)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (signal_id, horizon) DO NOTHING;
+        """
+        await self.pool.execute(
+            query,
+            signal_id,
+            horizon,
+            float(price_at_signal),
+            float(price_at_close),
+            float(pnl_pct),
+            float(drawdown_pct),
+            success,
+        )
+
+    async def finalize_signal(
+        self,
+        signal_id: int,
+        pnl_pct: float,
+        drawdown_pct: float,
+        success: bool,
+    ) -> None:
+        """Записывает сводку по главному горизонту в signals и закрывает сигнал."""
+        query = """
+            UPDATE signals
+            SET pnl_pct = $2, drawdown_pct = $3, success = $4, status = 'closed'
+            WHERE id = $1;
+        """
+        await self.pool.execute(
+            query, signal_id, float(pnl_pct), float(drawdown_pct), success
+        )
+
+    async def get_success_stats(self) -> list[dict[str, Any]]:
+        """Статистика по decision×horizon: доля success и средний pnl_pct."""
+        query = """
+            SELECT s.decision,
+                   e.horizon,
+                   count(*) AS n,
+                   avg(CASE WHEN e.success THEN 1.0 ELSE 0.0 END) AS success_rate,
+                   avg(e.pnl_pct) AS avg_pnl_pct
+            FROM signal_evaluations e
+            JOIN signals s ON s.id = e.signal_id
+            GROUP BY s.decision, e.horizon
+            ORDER BY s.decision, e.horizon;
+        """
+        rows = await self.pool.fetch(query)
+        return [dict(r) for r in rows]
+
 
 def _ms_to_dt(ms: int | None) -> datetime:
     """Преобразует Unix-время в мс (UTC-aware datetime). None → текущее время."""

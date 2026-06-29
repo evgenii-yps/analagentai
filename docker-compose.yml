@@ -101,6 +101,24 @@ services:
       retries: 3
       start_period: 20s
 
+  evaluator:
+    build: .
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # Этап 6: сервис оценки результатов сигналов (тот же образ, своя команда).
+    command: ["python", "-m", "src.evaluator_main"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-m", "src.healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
 volumes:
   pg_data:
   redis_data:

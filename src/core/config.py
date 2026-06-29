@@ -64,6 +64,17 @@ class Settings(BaseSettings):
     NOTIFY_COOLDOWN_SEC: int = 1800   # пауза перед повтором того же решения
     NOTIFY_TIMEZONE: str = "Europe/Moscow"  # часовой пояс времени в уведомлениях
 
+    # --- Оценка результатов (Этап 6) ---
+    EVAL_INTERVAL: int = 300          # сек между прогонами оценщика
+    EVAL_HORIZONS: str = "1h,4h"      # горизонты оценки через запятую
+    EVAL_PRIMARY_HORIZON: str = "4h"  # главный горизонт (сводка в signals)
+    STATS_LOG_INTERVAL: int = 3600    # сек между логами статистики
+
+    @property
+    def eval_horizons_list(self) -> list[str]:
+        """Разбирает строку EVAL_HORIZONS в список горизонтов."""
+        return [h.strip() for h in self.EVAL_HORIZONS.split(",") if h.strip()]
+
     @property
     def agent_weights(self) -> dict[str, float]:
         """Веса агентов для взвешенной агрегации."""

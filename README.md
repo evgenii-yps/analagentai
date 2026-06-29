@@ -17,6 +17,9 @@
 - **Этап 5 (уведомления):** сервис читает новые решения из `signals` и шлёт в Telegram
   ТОЛЬКО сильные сигналы (`decision ≠ wait`, `probability ≥ NOTIFY_MIN_PROBABILITY`,
   без повторов и спама).
+- **Этап 6 (анализ результатов):** сервис-оценщик дооценивает сигналы фактом движения
+  цены на горизонтах 1ч/4ч (pnl%, просадка, success) и пишет в `signal_evaluations`;
+  по главному горизонту (4ч) заполняет сводку в `signals` и закрывает сигнал.
 
 ## Стек
 
@@ -29,17 +32,18 @@
 
 ```
 .
-├── docker-compose.yml      # postgres + redis + collector + agents + decision + notify
+├── docker-compose.yml      # postgres + redis + collector + agents + decision + notify + evaluator
 ├── Dockerfile              # образ приложения (python:3.12-slim)
 ├── .env.example            # пример переменных окружения
 ├── pyproject.toml          # метаданные, ruff, pytest
 ├── requirements.txt        # закреплённые версии для Docker/CI
-├── db/init.sql             # схема БД (8 таблиц + индексы)
+├── db/init.sql             # схема БД (9 таблиц + индексы)
 ├── src/
 │   ├── main.py             # точка входа — сервис-коллектор
 │   ├── agents_main.py      # точка входа — сервис агентов
 │   ├── decision_main.py    # точка входа — Decision Agent
 │   ├── notify_main.py      # точка входа — сервис уведомлений
+│   ├── evaluator_main.py   # точка входа — оценщик результатов
 │   ├── healthcheck.py      # CLI-проверка PG и Redis
 │   ├── core/
 │   │   ├── config.py       # Settings (pydantic-settings)
@@ -63,11 +67,14 @@
 │   ├── decision/
 │   │   ├── agent.py        # DecisionAgent + чистая логика агрегации
 │   │   └── runner.py       # планировщик решений + graceful shutdown
-│   └── notify/
-│       ├── telegram.py     # отправка в Telegram (httpx, async)
-│       ├── agent.py        # NotifyAgent + should_notify + формат сообщения
-│       └── runner.py       # планировщик уведомлений + graceful shutdown
-└── tests/                  # тесты конфига, коллекторов, агентов, агрегации, уведомлений
+│   ├── notify/
+│   │   ├── telegram.py     # отправка в Telegram (httpx, async)
+│   │   ├── agent.py        # NotifyAgent + should_notify + формат сообщения
+│   │   └── runner.py       # планировщик уведомлений + graceful shutdown
+│   └── evaluator/
+│       ├── evaluator.py    # compute_evaluation + класс Evaluator
+│       └── runner.py       # планировщик оценки + graceful shutdown
+└── tests/                  # тесты конфига, коллекторов, агентов, агрегации, уведомлений, оценки
 ```
 
 ## Сбор данных (Этап 2)
@@ -174,6 +181,41 @@ NOTIFY_TIMEZONE=Europe/Moscow
 Формат сообщения: 🟢/🔴 действие (ПОКУПАТЬ/ПРОДАВАТЬ), вероятность в %, причина
 (из `rationale`) и время в часовом поясе `NOTIFY_TIMEZONE` (по умолчанию МСК).
 
+## Анализ результатов (Этап 6)
+
+Отдельный сервис `evaluator` (команда `python -m src.evaluator_main`) дооценивает каждый
+направленный сигнал фактом: пошла ли цена в предсказанную сторону. Для горизонтов 1ч и 4ч
+по 1m-свечам считаются `pnl_pct` (движение в сторону сигнала; для `sell` со знаком минус,
+положительный = верно), `drawdown_pct` (макс. ход против сигнала, всегда ≥ 0) и
+`success` (`pnl_pct > 0`). Результаты пишутся в `signal_evaluations`
+(идемпотентно, `UNIQUE (signal_id, horizon)`).
+
+Когда оценён главный горизонт (`EVAL_PRIMARY_HORIZON`, 4ч) — сводка пишется в `signals`
+(`pnl_pct`/`drawdown_pct`/`success`) и статус становится `closed`. Нехватка свечей —
+мягкий пропуск с повтором позже. Периодически (раз в `STATS_LOG_INTERVAL`) в лог выводится
+статистика: доля `success` и средний `pnl_pct` по `decision × horizon`.
+Heartbeat — `evaluator:heartbeat`.
+
+Настройки (с дефолтами): `EVAL_INTERVAL` (300), `EVAL_HORIZONS` (1h,4h),
+`EVAL_PRIMARY_HORIZON` (4h), `STATS_LOG_INTERVAL` (3600).
+
+Проверка результатов:
+
+```bash
+docker compose exec postgres psql -U agenttrade -d agenttrade -c \
+  "SELECT signal_id, horizon, round(pnl_pct::numeric,3) pnl, \
+   round(drawdown_pct::numeric,3) dd, success FROM signal_evaluations \
+   ORDER BY signal_id, horizon;"
+
+# агрегированная статистика по decision × horizon
+docker compose exec postgres psql -U agenttrade -d agenttrade -c \
+  "SELECT s.decision, e.horizon, count(*) n, \
+   round(avg(e.success::int)::numeric,3) success_rate, \
+   round(avg(e.pnl_pct)::numeric,3) avg_pnl \
+   FROM signal_evaluations e JOIN signals s ON s.id=e.signal_id \
+   GROUP BY s.decision, e.horizon ORDER BY 1,2;"
+```
+
 ## Пошаговый запуск
 
 1. Скопируйте пример окружения и задайте пароль БД:
@@ -192,9 +234,9 @@ NOTIFY_TIMEZONE=Europe/Moscow
    ```
 
    Контейнер `postgres` при первом старте автоматически применит `db/init.sql`
-   и создаст 8 таблиц с индексами. Контейнеры `collector` и `agents` дождутся
-   готовности PostgreSQL и Redis и начнут работу — в логах будет видна работа
-   коллекторов и агентов.
+   и создаст 9 таблиц с индексами. Сервисы `collector`, `agents`, `decision`,
+   `notify`, `evaluator` дождутся готовности PostgreSQL и Redis и начнут работу —
+   в логах будет видна работа всех сервисов.
 
 3. Проверьте health-check вручную (внутри контейнера коллектора):
 
@@ -215,8 +257,8 @@ NOTIFY_TIMEZONE=Europe/Moscow
 docker compose exec postgres psql -U agenttrade -d agenttrade -c '\dt'
 ```
 
-Должны присутствовать 8 таблиц: `instruments`, `ohlcv`, `trades`, `funding`,
-`open_interest`, `orderbook_snapshots`, `signals`, `agent_outputs`.
+Должны присутствовать 9 таблиц: `instruments`, `ohlcv`, `trades`, `funding`,
+`open_interest`, `orderbook_snapshots`, `signals`, `agent_outputs`, `signal_evaluations`.
 
 ## Проверка потока данных (через несколько минут после старта)
 

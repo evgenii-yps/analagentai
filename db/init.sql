@@ -88,6 +88,20 @@ CREATE TABLE IF NOT EXISTS signals (
 );
 CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals (ts DESC);
 
+-- Оценка результатов сигналов фактом движения цены (Этап 6).
+CREATE TABLE IF NOT EXISTS signal_evaluations (
+    id              BIGSERIAL PRIMARY KEY,
+    signal_id       BIGINT NOT NULL REFERENCES signals(id),
+    horizon         TEXT NOT NULL,                 -- 1h | 4h
+    price_at_signal DOUBLE PRECISION NOT NULL,
+    price_at_close  DOUBLE PRECISION NOT NULL,
+    pnl_pct         DOUBLE PRECISION NOT NULL,
+    drawdown_pct    DOUBLE PRECISION NOT NULL,
+    success         BOOLEAN NOT NULL,
+    evaluated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (signal_id, horizon)
+);
+
 -- Заключения аналитических агентов (Этап 3).
 CREATE TABLE IF NOT EXISTS agent_outputs (
     id            BIGSERIAL PRIMARY KEY,
