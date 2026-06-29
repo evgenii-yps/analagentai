@@ -347,6 +347,37 @@ class DB:
             rationale,
         )
 
+    # --- Уведомления (Этап 5) ---
+
+    async def ensure_notify_schema(self) -> None:
+        """Идемпотентно добавляет колонку ``notified`` (на случай старого тома)."""
+        await self.pool.execute(
+            "ALTER TABLE signals "
+            "ADD COLUMN IF NOT EXISTS notified BOOLEAN NOT NULL DEFAULT FALSE;"
+        )
+
+    async def get_unnotified_strong_signals(
+        self,
+        min_probability: float,
+    ) -> list[dict[str, Any]]:
+        """Неотправленные сильные сигналы (decision != wait, prob >= порога), ts ASC."""
+        query = """
+            SELECT id, instrument_id, ts, decision, probability, rationale
+            FROM signals
+            WHERE notified = FALSE
+              AND decision <> 'wait'
+              AND probability >= $1
+            ORDER BY ts ASC;
+        """
+        rows = await self.pool.fetch(query, float(min_probability))
+        return [dict(r) for r in rows]
+
+    async def mark_signal_notified(self, signal_id: int) -> None:
+        """Помечает сигнал как отправленный (защита от повторов)."""
+        await self.pool.execute(
+            "UPDATE signals SET notified = TRUE WHERE id = $1;", signal_id
+        )
+
 
 def _ms_to_dt(ms: int | None) -> datetime:
     """Преобразует Unix-время в мс (UTC-aware datetime). None → текущее время."""

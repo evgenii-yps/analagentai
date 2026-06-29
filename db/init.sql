@@ -83,7 +83,8 @@ CREATE TABLE IF NOT EXISTS signals (
     status         TEXT NOT NULL DEFAULT 'open', -- open | closed
     pnl_pct        DOUBLE PRECISION,
     drawdown_pct   DOUBLE PRECISION,
-    success        BOOLEAN
+    success        BOOLEAN,
+    notified       BOOLEAN NOT NULL DEFAULT FALSE -- отправлено ли уведомление (Этап 5)
 );
 CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals (ts DESC);
 

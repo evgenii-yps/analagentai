@@ -56,6 +56,13 @@ class Settings(BaseSettings):
     WEIGHT_LIQUIDITY: float = 1.0     # вес Liquidity Agent
     WEIGHT_FUTURES: float = 1.0       # вес Futures Agent
 
+    # --- Уведомления (Этап 5) ---
+    TELEGRAM_BOT_TOKEN: str = ""      # токен Telegram-бота (пусто → сервис простаивает)
+    TELEGRAM_CHAT_ID: str = ""        # ID чата получателя
+    NOTIFY_INTERVAL: int = 30         # сек между проверками новых сигналов
+    NOTIFY_MIN_PROBABILITY: float = 0.7  # минимальная вероятность для отправки
+    NOTIFY_COOLDOWN_SEC: int = 1800   # пауза перед повтором того же решения
+
     @property
     def agent_weights(self) -> dict[str, float]:
         """Веса агентов для взвешенной агрегации."""
@@ -64,6 +71,11 @@ class Settings(BaseSettings):
             "liquidity": self.WEIGHT_LIQUIDITY,
             "futures": self.WEIGHT_FUTURES,
         }
+
+    @property
+    def telegram_configured(self) -> bool:
+        """Заданы ли токен и chat_id для отправки в Telegram."""
+        return bool(self.TELEGRAM_BOT_TOKEN and self.TELEGRAM_CHAT_ID)
 
     @property
     def timeframes_list(self) -> list[str]:

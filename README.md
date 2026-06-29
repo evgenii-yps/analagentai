@@ -14,6 +14,9 @@
 - **Этап 4 (Decision Agent):** агрегирующий агент читает ТОЛЬКО `agent_outputs`
   (не сырые данные), взвешивает свежие выводы трёх агентов и пишет итоговое решение
   (`buy`/`sell`/`wait`) с вероятностью в таблицу `signals`.
+- **Этап 5 (уведомления):** сервис читает новые решения из `signals` и шлёт в Telegram
+  ТОЛЬКО сильные сигналы (`decision ≠ wait`, `probability ≥ NOTIFY_MIN_PROBABILITY`,
+  без повторов и спама).
 
 ## Стек
 
@@ -26,7 +29,7 @@
 
 ```
 .
-├── docker-compose.yml      # postgres + redis + collector + agents + decision
+├── docker-compose.yml      # postgres + redis + collector + agents + decision + notify
 ├── Dockerfile              # образ приложения (python:3.12-slim)
 ├── .env.example            # пример переменных окружения
 ├── pyproject.toml          # метаданные, ruff, pytest
@@ -36,6 +39,7 @@
 │   ├── main.py             # точка входа — сервис-коллектор
 │   ├── agents_main.py      # точка входа — сервис агентов
 │   ├── decision_main.py    # точка входа — Decision Agent
+│   ├── notify_main.py      # точка входа — сервис уведомлений
 │   ├── healthcheck.py      # CLI-проверка PG и Redis
 │   ├── core/
 │   │   ├── config.py       # Settings (pydantic-settings)
@@ -56,10 +60,14 @@
 │   │   ├── liquidity.py    # анализ стакана (дисбаланс, стенки)
 │   │   ├── futures.py      # funding + open interest
 │   │   └── runner.py       # планировщик агентов + graceful shutdown
-│   └── decision/
-│       ├── agent.py        # DecisionAgent + чистая логика агрегации
-│       └── runner.py       # планировщик решений + graceful shutdown
-└── tests/                  # тесты конфига, коллекторов, агентов, агрегации
+│   ├── decision/
+│   │   ├── agent.py        # DecisionAgent + чистая логика агрегации
+│   │   └── runner.py       # планировщик решений + graceful shutdown
+│   └── notify/
+│       ├── telegram.py     # отправка в Telegram (httpx, async)
+│       ├── agent.py        # NotifyAgent + should_notify + формат сообщения
+│       └── runner.py       # планировщик уведомлений + graceful shutdown
+└── tests/                  # тесты конфига, коллекторов, агентов, агрегации, уведомлений
 ```
 
 ## Сбор данных (Этап 2)
@@ -138,6 +146,32 @@ docker compose exec postgres psql -U agenttrade -d agenttrade -c \
 
 docker compose exec redis redis-cli GET decision:heartbeat
 ```
+
+## Уведомления в Telegram (Этап 5)
+
+Отдельный сервис `notify` (команда `python -m src.notify_main`) читает новые решения
+из `signals` и шлёт в Telegram **только сильные сигналы**. Уведомление уходит, если
+одновременно: `decision ≠ wait`; `probability ≥ NOTIFY_MIN_PROBABILITY`; сигнал ещё
+не отправлен (`notified = FALSE`); решение отличается от последнего отправленного по
+инструменту ИЛИ прошло больше `NOTIFY_COOLDOWN_SEC` (анти-спам). Состояние последней
+отправки хранится в Redis (`notify:last:{instrument_id}`), heartbeat — `notify:heartbeat`.
+
+Сервис не падает ни при каких ошибках сети/Telegram; при пустых
+`TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` он просто простаивает с предупреждением.
+Колонка `signals.notified` добавляется идемпотентно при старте
+(`ensure_notify_schema`), так что апгрейд поверх старого тома не требует пересоздания БД.
+
+Настройка (значения — только в локальном `.env`, не в репозитории):
+
+```
+TELEGRAM_BOT_TOKEN=<токен от @BotFather>
+TELEGRAM_CHAT_ID=<id чата>
+NOTIFY_MIN_PROBABILITY=0.7
+NOTIFY_COOLDOWN_SEC=1800
+```
+
+Формат сообщения: 🟢/🔴 действие (ПОКУПАТЬ/ПРОДАВАТЬ), вероятность в %, причина
+(из `rationale`) и время UTC.
 
 ## Пошаговый запуск
 

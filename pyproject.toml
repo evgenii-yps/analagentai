@@ -11,6 +11,7 @@ dependencies = [
     "ccxt>=4.4,<4.5",
     "pandas>=2.2,<3",
     "numpy>=1.26,<3",
+    "httpx>=0.27,<1",
 ]
 
 [project.optional-dependencies]
@@ -38,4 +39,4 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["src", "src.core", "src.collectors", "src.agents", "src.decision"]
+packages = ["src", "src.core", "src.collectors", "src.agents", "src.decision", "src.notify"]
