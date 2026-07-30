@@ -17,9 +17,11 @@ class Settings(BaseSettings):
 
     # --- PostgreSQL ---
     POSTGRES_USER: str = "agenttrade"
-    # Пароль обязателен: при его отсутствии приложение падает на старте
-    # с понятной ошибкой валидации (field required).
-    POSTGRES_PASSWORD: str
+    # Дефолт нужен для старта в ноль ручных шагов (стек и автоперезапуск на
+    # сервере не должны требовать ручного ввода пароля). В проде переопределяется
+    # через .env или реальную переменную окружения; тот же дефолт задан для
+    # контейнера postgres в docker-compose, поэтому значения согласованы.
+    POSTGRES_PASSWORD: str = "agenttrade"
     POSTGRES_DB: str = "agenttrade"
     PG_HOST: str = "postgres"
     PG_PORT: int = 5432
@@ -32,7 +34,7 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"
 
     # --- Сбор данных (Этап 2) ---
-    EXCHANGE: str = "binance"
+    EXCHANGE: str = "okx"               # пилотная биржа (Binance/Bybit отдают 451 из EU)
     SYMBOL: str = "BTC/USDT"            # спотовый символ
     SWAP_SYMBOL: str = "BTC/USDT:USDT"  # бессрочный фьючерс (swap)
     TIMEFRAMES: str = "1m,5m,15m,1h"    # таймфреймы свечей через запятую

@@ -3,7 +3,9 @@ services:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-agenttrade}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      # Дефолт нужен для старта в ноль ручных шагов; согласован с дефолтом в
+      # src/core/config.py. В проде переопределяется через .env.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-agenttrade}
       POSTGRES_DB: ${POSTGRES_DB:-agenttrade}
     volumes:
       - pg_data:/var/lib/postgresql/data
@@ -31,7 +33,12 @@ services:
 
   collector:
     build: .
-    env_file: .env
+    # .env необязателен: без него применяются согласованные дефолты из
+    # src/core/config.py, поэтому стек стартует в ноль ручных шагов. Если .env
+    # присутствует (реальные секреты/Telegram-токен на сервере) — он переопределяет.
+    env_file:
+      - path: .env
+        required: false
     depends_on:
       postgres:
         condition: service_healthy
@@ -49,7 +56,12 @@ services:
 
   agents:
     build: .
-    env_file: .env
+    # .env необязателен: без него применяются согласованные дефолты из
+    # src/core/config.py, поэтому стек стартует в ноль ручных шагов. Если .env
+    # присутствует (реальные секреты/Telegram-токен на сервере) — он переопределяет.
+    env_file:
+      - path: .env
+        required: false
     depends_on:
       postgres:
         condition: service_healthy
@@ -67,7 +79,12 @@ services:
 
   decision:
     build: .
-    env_file: .env
+    # .env необязателен: без него применяются согласованные дефолты из
+    # src/core/config.py, поэтому стек стартует в ноль ручных шагов. Если .env
+    # присутствует (реальные секреты/Telegram-токен на сервере) — он переопределяет.
+    env_file:
+      - path: .env
+        required: false
     depends_on:
       postgres:
         condition: service_healthy
@@ -85,7 +102,12 @@ services:
 
   notify:
     build: .
-    env_file: .env
+    # .env необязателен: без него применяются согласованные дефолты из
+    # src/core/config.py, поэтому стек стартует в ноль ручных шагов. Если .env
+    # присутствует (реальные секреты/Telegram-токен на сервере) — он переопределяет.
+    env_file:
+      - path: .env
+        required: false
     depends_on:
       postgres:
         condition: service_healthy
@@ -103,7 +125,12 @@ services:
 
   evaluator:
     build: .
-    env_file: .env
+    # .env необязателен: без него применяются согласованные дефолты из
+    # src/core/config.py, поэтому стек стартует в ноль ручных шагов. Если .env
+    # присутствует (реальные секреты/Telegram-токен на сервере) — он переопределяет.
+    env_file:
+      - path: .env
+        required: false
     depends_on:
       postgres:
         condition: service_healthy
@@ -125,7 +152,12 @@ services:
   # Результат — в таблицах exchange_audit/pair_audit и в reports/ (том смонтирован).
   audit:
     build: .
-    env_file: .env
+    # .env необязателен: без него применяются согласованные дефолты из
+    # src/core/config.py, поэтому стек стартует в ноль ручных шагов. Если .env
+    # присутствует (реальные секреты/Telegram-токен на сервере) — он переопределяет.
+    env_file:
+      - path: .env
+        required: false
     depends_on:
       postgres:
         condition: service_healthy
