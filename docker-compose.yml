@@ -3,16 +3,15 @@ services:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-agenttrade}
-      # Дефолт нужен для старта в ноль ручных шагов; согласован с дефолтом в
-      # src/core/config.py. В проде переопределяется через .env.
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-agenttrade}
+      # Без дефолта: пароль генерируется scripts/init_env.sh и берётся из .env.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB:-agenttrade}
     volumes:
       - pg_data:/var/lib/postgresql/data
       # DDL применяется автоматически при первой инициализации БД.
       - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
-    ports:
-      - "5432:5432"
+    # Порт НЕ публикуется на хост: PostgreSQL доступен только внутри Docker-сети
+    # (сервер с публичным IP). Для локальной отладки — override-compose.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-agenttrade} -d ${POSTGRES_DB:-agenttrade}"]
       interval: 5s
@@ -21,12 +20,17 @@ services:
 
   redis:
     image: redis:7-alpine
+    # requirepass — defense in depth: даже внутри Docker-сети Redis требует auth.
+    # Пустой пароль (нет .env) → requirepass "" = без пароля.
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}"]
+    environment:
+      # redis-cli автоматически берёт пароль из REDISCLI_AUTH (пусто → без auth).
+      REDISCLI_AUTH: ${REDIS_PASSWORD}
     volumes:
       - redis_data:/data
-    ports:
-      - "6379:6379"
+    # Порт НЕ публикуется на хост: Redis доступен только внутри Docker-сети.
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
       interval: 5s
       timeout: 5s
       retries: 5

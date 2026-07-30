@@ -17,11 +17,11 @@ class Settings(BaseSettings):
 
     # --- PostgreSQL ---
     POSTGRES_USER: str = "agenttrade"
-    # Дефолт нужен для старта в ноль ручных шагов (стек и автоперезапуск на
-    # сервере не должны требовать ручного ввода пароля). В проде переопределяется
-    # через .env или реальную переменную окружения; тот же дефолт задан для
-    # контейнера postgres в docker-compose, поэтому значения согласованы.
-    POSTGRES_PASSWORD: str = "agenttrade"
+    # Дефолта НЕТ намеренно: константный пароль в коде недопустим для сервера с
+    # публичным IP. Секрет генерируется криптографически при первом старте
+    # (scripts/init_env.sh) и передаётся через .env. Без него приложение падает
+    # на старте с понятной ошибкой валидации (field required).
+    POSTGRES_PASSWORD: str
     POSTGRES_DB: str = "agenttrade"
     PG_HOST: str = "postgres"
     PG_PORT: int = 5432
@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     # --- Redis ---
     REDIS_HOST: str = "redis"
     REDIS_PORT: int = 6379
+    # Пароль Redis (defense in depth). Генерируется тем же scripts/init_env.sh.
+    # Пусто → подключение без пароля (порт при этом не публикуется наружу).
+    REDIS_PASSWORD: str = ""
 
     # --- Логирование ---
     LOG_LEVEL: str = "INFO"
