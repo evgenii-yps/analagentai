@@ -114,3 +114,47 @@ CREATE TABLE IF NOT EXISTS agent_outputs (
     rationale     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_agent_outputs ON agent_outputs (agent, instrument_id, ts DESC);
+
+-- Аудит доступности бирж (Этап 6.4).
+-- Результат воспроизводимой проверки публичных эндпоинтов каждой биржи.
+CREATE TABLE IF NOT EXISTS exchange_audit (
+    id              BIGSERIAL PRIMARY KEY,
+    checked_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    source_ip_label TEXT        NOT NULL,        -- метка машины: local | hetzner-nbg
+    exchange        TEXT        NOT NULL,
+    endpoint        TEXT        NOT NULL,        -- tickers | instruments | ws
+    http_status     INTEGER,
+    latency_ms      INTEGER,
+    geo_blocked     BOOLEAN     NOT NULL,
+    ws_available    BOOLEAN,
+    rate_limit_note TEXT,
+    error_text      TEXT,
+    notes           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_exchange_audit_lookup
+    ON exchange_audit (exchange, checked_at DESC);
+
+-- Аудит торговых пар на биржах (Этап 6.4).
+-- Тип NUMERIC(28,14) выбран сознательно: цена токенов вроде DENT (~0.0000277)
+-- при обычной точности NUMERIC(18,8) молча округлялась бы в ноль.
+CREATE TABLE IF NOT EXISTS pair_audit (
+    id                 BIGSERIAL PRIMARY KEY,
+    checked_at         TIMESTAMPTZ   NOT NULL DEFAULT now(),
+    source_ip_label    TEXT          NOT NULL,
+    exchange           TEXT          NOT NULL,
+    symbol             TEXT          NOT NULL,
+    listed             BOOLEAN       NOT NULL,
+    last_price         NUMERIC(28,14),
+    bid                NUMERIC(28,14),
+    ask                NUMERIC(28,14),
+    spread_pct         NUMERIC(10,4),
+    depth_bid_2pct_usd NUMERIC(18,2),
+    depth_ask_2pct_usd NUMERIC(18,2),
+    vol_24h_usd        NUMERIC(18,2),
+    tick_size          NUMERIC(28,14),
+    min_order_usd      NUMERIC(18,2),
+    verdict            TEXT          NOT NULL,   -- not_listed | illiquid | tradable
+    notes              TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pair_audit_lookup
+    ON pair_audit (symbol, exchange, checked_at DESC);

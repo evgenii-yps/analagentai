@@ -119,6 +119,21 @@ services:
       retries: 3
       start_period: 20s
 
+  # Этап 6.4: разовый аудит доступности бирж и ликвидности пар.
+  # Не поднимается автоматически (profile). Запуск одной командой:
+  #   docker compose run --rm audit
+  # Результат — в таблицах exchange_audit/pair_audit и в reports/ (том смонтирован).
+  audit:
+    build: .
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles: ["audit"]
+    volumes:
+      - ./reports:/app/reports
+    command: ["python", "-m", "scripts.exchange_audit", "--source-ip-label", "local"]
+
 volumes:
   pg_data:
   redis_data:

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 import asyncpg
@@ -514,6 +515,118 @@ class DB:
         """
         rows = await self.pool.fetch(query)
         return [dict(r) for r in rows]
+
+    # --- Аудит бирж (Этап 6.4) ---
+
+    async def ensure_audit_schema(self) -> None:
+        """Идемпотентно создаёт таблицы аудита (на случай старого тома).
+
+        Тип NUMERIC(28,14) выбран сознательно: цена токенов вроде DENT
+        (~0.0000277) при NUMERIC(18,8) молча округлялась бы в ноль.
+        """
+        await self.pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS exchange_audit (
+                id              BIGSERIAL PRIMARY KEY,
+                checked_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+                source_ip_label TEXT        NOT NULL,
+                exchange        TEXT        NOT NULL,
+                endpoint        TEXT        NOT NULL,
+                http_status     INTEGER,
+                latency_ms      INTEGER,
+                geo_blocked     BOOLEAN     NOT NULL,
+                ws_available    BOOLEAN,
+                rate_limit_note TEXT,
+                error_text      TEXT,
+                notes           TEXT
+            );
+            """
+        )
+        await self.pool.execute(
+            "CREATE INDEX IF NOT EXISTS idx_exchange_audit_lookup "
+            "ON exchange_audit (exchange, checked_at DESC);"
+        )
+        await self.pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pair_audit (
+                id                 BIGSERIAL PRIMARY KEY,
+                checked_at         TIMESTAMPTZ   NOT NULL DEFAULT now(),
+                source_ip_label    TEXT          NOT NULL,
+                exchange           TEXT          NOT NULL,
+                symbol             TEXT          NOT NULL,
+                listed             BOOLEAN       NOT NULL,
+                last_price         NUMERIC(28,14),
+                bid                NUMERIC(28,14),
+                ask                NUMERIC(28,14),
+                spread_pct         NUMERIC(10,4),
+                depth_bid_2pct_usd NUMERIC(18,2),
+                depth_ask_2pct_usd NUMERIC(18,2),
+                vol_24h_usd        NUMERIC(18,2),
+                tick_size          NUMERIC(28,14),
+                min_order_usd      NUMERIC(18,2),
+                verdict            TEXT          NOT NULL,
+                notes              TEXT
+            );
+            """
+        )
+        await self.pool.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pair_audit_lookup "
+            "ON pair_audit (symbol, exchange, checked_at DESC);"
+        )
+
+    async def insert_exchange_audit(
+        self,
+        *,
+        source_ip_label: str,
+        exchange: str,
+        endpoint: str,
+        http_status: int | None,
+        latency_ms: int | None,
+        geo_blocked: bool,
+        ws_available: bool | None,
+        rate_limit_note: str | None,
+        error_text: str | None,
+        notes: str | None,
+    ) -> None:
+        """INSERT одной строки результата проверки эндпоинта биржи."""
+        query = """
+            INSERT INTO exchange_audit
+                (source_ip_label, exchange, endpoint, http_status, latency_ms,
+                 geo_blocked, ws_available, rate_limit_note, error_text, notes)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10);
+        """
+        await self.pool.execute(
+            query, source_ip_label, exchange, endpoint, http_status, latency_ms,
+            geo_blocked, ws_available, rate_limit_note, error_text, notes,
+        )
+
+    async def insert_pair_audit(self, pair: Any) -> None:
+        """INSERT результата аудита пары. ``pair`` — PairAuditResult-подобный объект.
+
+        Числовые поля передаются как ``Decimal`` (asyncpg маппит их в NUMERIC
+        без потери точности). Перевод через ``str`` убирает двоичные артефакты
+        float — важно для DENT-масштабных цен (~0.0000277).
+        """
+
+        def _num(value: float | None) -> Decimal | None:
+            return None if value is None else Decimal(str(value))
+
+        query = """
+            INSERT INTO pair_audit
+                (source_ip_label, exchange, symbol, listed, last_price, bid, ask,
+                 spread_pct, depth_bid_2pct_usd, depth_ask_2pct_usd, vol_24h_usd,
+                 tick_size, min_order_usd, verdict, notes)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15);
+        """
+        await self.pool.execute(
+            query,
+            pair.source_ip_label, pair.exchange, pair.symbol, pair.listed,
+            _num(pair.last_price), _num(pair.bid), _num(pair.ask),
+            _num(pair.spread_pct), _num(pair.depth_bid_2pct_usd),
+            _num(pair.depth_ask_2pct_usd), _num(pair.vol_24h_usd),
+            _num(pair.tick_size), _num(pair.min_order_usd),
+            pair.verdict, pair.notes or None,
+        )
 
 
 def _ms_to_dt(ms: int | None) -> datetime:
