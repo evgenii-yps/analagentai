@@ -1,0 +1,25 @@
+# systemd-юнит автозапуска стека Agent Trade (§7 ТЗ 6.5).
+# Устанавливается в /etc/systemd/system/agent-trade.service установщиком
+# (deploy/install.sh), затем: systemctl daemon-reload && systemctl enable --now agent-trade
+#
+# Контейнеры имеют restart: unless-stopped, а этот юнит гарантирует, что после
+# перезагрузки сервера стек будет поднят (docker compose up -d) под нужным
+# пользователем.
+[Unit]
+Description=Agent Trade stack (docker compose)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/agent-trade
+User=agent
+Group=docker
+ExecStart=/usr/bin/docker compose up -d --remove-orphans
+ExecStop=/usr/bin/docker compose down
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target
