@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """Политика хранения данных (§9 ТЗ 6.5).
 
-Ограничивает рост БД: удаляет устаревшие «сырые» рыночные данные, сохраняя
-ценные аналитические таблицы (``signals``, ``signal_evaluations``,
-``agent_outputs`` хранятся дольше или бессрочно).
+Удаляет устаревшие «сырые» высокочастотные данные, НЕ трогая ценные таблицы:
 
-Удаление выполняется командами ``DELETE`` внутри контейнера postgres через
-``docker compose exec -T postgres psql`` — поэтому скрипту не нужны
-Python-драйверы БД на хосте (только стандартная библиотека). Запускается из
-cron под пользователем ``agent`` (входит в группу docker).
+* ``orderbook_snapshots`` — удаляются записи старше 30 дней;
+* ``trades``              — удаляются записи старше 30 дней;
+* ``ohlcv``, ``funding``, ``open_interest``, ``agent_outputs``, ``signals``,
+  ``signal_evaluations`` — НЕ удаляются никогда.
 
-Сроки хранения задаются переменными окружения (в днях), значения по умолчанию
-см. ниже. Значение 0 отключает удаление для таблицы.
+Удаление идёт батчами по 50 000 строк с паузой между батчами, чтобы не
+блокировать запись коллектора. После удаления по затронутым таблицам
+выполняется ``VACUUM ANALYZE`` (без ``FULL``). Число удалённых строк логируется.
+
+Работает через ``docker compose exec -T postgres psql`` (только стандартная
+библиотека Python). Запускается из cron под пользователем ``agent`` ежедневно
+в 03:40 UTC.
 """
 
 from __future__ import annotations
@@ -19,47 +22,48 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 from datetime import UTC, datetime
 
 APP_DIR = os.environ.get("APP_DIR", "/opt/agent-trade")
 
-# Таблица -> переменная окружения со сроком хранения и её значение по умолчанию.
-# Колонка времени во всех этих таблицах называется ts.
-RETENTION_RULES: list[tuple[str, str, int]] = [
-    ("orderbook_snapshots", "RETENTION_ORDERBOOK_DAYS", 7),
-    ("trades", "RETENTION_TRADES_DAYS", 14),
-    ("ohlcv", "RETENTION_OHLCV_DAYS", 90),
-    ("funding", "RETENTION_FUNDING_DAYS", 180),
-    ("open_interest", "RETENTION_OI_DAYS", 180),
-    ("agent_outputs", "RETENTION_AGENT_OUTPUTS_DAYS", 90),
-    # signals и signal_evaluations НЕ чистим — это результат работы системы.
+# Таблицы под очисткой: (имя, срок хранения в днях). Остальные не чистятся.
+RETENTION_RULES: list[tuple[str, int]] = [
+    ("orderbook_snapshots", int(os.environ.get("RETENTION_ORDERBOOK_DAYS", "30"))),
+    ("trades", int(os.environ.get("RETENTION_TRADES_DAYS", "30"))),
 ]
+
+BATCH = int(os.environ.get("RETENTION_BATCH", "50000"))
+PAUSE_SEC = float(os.environ.get("RETENTION_PAUSE_SEC", "0.5"))
 
 
 def _log(msg: str) -> None:
     print(f"[{datetime.now(UTC):%F %T}] {msg}", flush=True)
 
 
-def _load_env_file(path: str) -> dict[str, str]:
-    """Читает простой .env (KEY=value, без инлайновых комментариев)."""
-    env: dict[str, str] = {}
-    if not os.path.isfile(path):
-        return env
-    with open(path, encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            env[key.strip()] = value.strip()
-    return env
+def _env_value(key: str, default: str) -> str:
+    """Читает значение из окружения или из .env (KEY=value)."""
+    if key in os.environ:
+        return os.environ[key]
+    path = os.path.join(APP_DIR, ".env")
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith(f"{key}="):
+                    return line.split("=", 1)[1].strip()
+    return default
 
 
-def _psql(pg_user: str, pg_db: str, sql: str) -> str:
-    """Выполняет SQL внутри контейнера postgres, возвращает stdout (строкой)."""
+PG_USER = _env_value("POSTGRES_USER", "agenttrade")
+PG_DB = _env_value("POSTGRES_DB", "agenttrade")
+
+
+def _psql(sql: str) -> str:
+    """Выполняет SQL в контейнере postgres, возвращает stdout (обрезанный)."""
     cmd = [
         "docker", "compose", "exec", "-T", "postgres",
-        "psql", "-U", pg_user, "-d", pg_db, "-t", "-A", "-c", sql,
+        "psql", "-U", PG_USER, "-d", PG_DB, "-t", "-A", "-c", sql,
     ]
     result = subprocess.run(
         cmd, cwd=APP_DIR, capture_output=True, text=True, check=True
@@ -67,38 +71,55 @@ def _psql(pg_user: str, pg_db: str, sql: str) -> str:
     return result.stdout.strip()
 
 
+def _delete_in_batches(table: str, days: int) -> int:
+    """Удаляет из ``table`` записи старше ``days`` дней батчами. Возвращает всего."""
+    total = 0
+    # ctid-подзапрос с LIMIT — быстрый батч без блокировки всей таблицы.
+    sql = (
+        f"DELETE FROM {table} WHERE ctid IN ("
+        f"  SELECT ctid FROM {table} "
+        f"  WHERE ts < now() - interval '{days} days' "
+        f"  LIMIT {BATCH}"
+        f");"
+    )
+    while True:
+        out = _psql(sql)  # psql печатает 'DELETE <N>'
+        deleted = 0
+        if out.startswith("DELETE"):
+            try:
+                deleted = int(out.split()[-1])
+            except (ValueError, IndexError):
+                deleted = 0
+        total += deleted
+        if deleted < BATCH:
+            break
+        time.sleep(PAUSE_SEC)  # пауза, чтобы не мешать записи коллектора
+    return total
+
+
 def main() -> int:
     """Прогоняет правила хранения. Возвращает 0 при успехе, 1 при ошибке."""
-    _log("=== Политика хранения данных ===")
-    env_file = _load_env_file(os.path.join(APP_DIR, ".env"))
-    pg_user = os.environ.get("POSTGRES_USER", env_file.get("POSTGRES_USER", "agenttrade"))
-    pg_db = os.environ.get("POSTGRES_DB", env_file.get("POSTGRES_DB", "agenttrade"))
-
+    _log("=== Политика хранения данных (orderbook_snapshots, trades) ===")
     had_error = False
-    for table, env_var, default_days in RETENTION_RULES:
-        days = int(os.environ.get(env_var, str(default_days)))
-        if days <= 0:
-            _log(f"{table}: хранение отключено (0 дней) — пропуск.")
-            continue
-        sql = (
-            f"DELETE FROM {table} "
-            f"WHERE ts < now() - interval '{days} days';"
-        )
+    for table, days in RETENTION_RULES:
         try:
-            out = _psql(pg_user, pg_db, sql)
-            # psql печатает 'DELETE <N>'.
-            deleted = out.split()[-1] if out.startswith("DELETE") else "?"
-            _log(f"{table}: удалены записи старше {days} дн. (строк: {deleted}).")
+            deleted = _delete_in_batches(table, days)
+            _log(f"{table}: удалено строк старше {days} дн.: {deleted}.")
+            if deleted > 0:
+                _log(f"{table}: выполняю VACUUM ANALYZE…")
+                _psql(f"VACUUM ANALYZE {table};")
+                _log(f"{table}: VACUUM ANALYZE выполнен.")
+            else:
+                _log(f"{table}: удалять нечего — VACUUM ANALYZE пропущен.")
         except subprocess.CalledProcessError as exc:
             had_error = True
-            stderr = (exc.stderr or "").strip()
-            _log(f"ОШИБКА при очистке {table}: {stderr or exc}")
-        except Exception as exc:  # noqa: BLE001 — устойчивость важнее точности типа
+            _log(f"ОШИБКА при очистке {table}: {(exc.stderr or '').strip() or exc}")
+        except Exception as exc:  # noqa: BLE001
             had_error = True
             _log(f"ОШИБКА при очистке {table}: {exc}")
 
     if had_error:
-        _log("Завершено с ошибками (см. выше). Данные, где очистка не удалась, не тронуты.")
+        _log("Завершено с ошибками (см. выше).")
         return 1
     _log("Готово: политика хранения применена.")
     return 0

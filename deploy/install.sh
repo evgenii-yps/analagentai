@@ -28,6 +28,7 @@ EXPECTED_SERVICES=(postgres redis collector agents decision notify evaluator)
 
 OVERALL_FAIL=0
 CLONE_URL="$REPO_URL"   # для приватного репо будет заменён на URL с токеном
+BACKUP_VERIFY_RESULT="не выполнялась"
 
 # ---------------------------------------------------------------------------
 # Логирование: всё пишем и на экран, и в $LOG_FILE. Секреты сюда НЕ попадают —
@@ -426,17 +427,85 @@ setup_operations() {
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-# §8 Бэкап БД — ежедневно 03:00 UTC
-0 3 * * * ${APP_USER} ${APP_DIR}/scripts/backup_db.sh >> ${APP_DIR}/logs/backup.log 2>&1
-# §9 Политика хранения — ежедневно 03:30 UTC
-30 3 * * * ${APP_USER} /usr/bin/python3 ${APP_DIR}/scripts/retention.py >> ${APP_DIR}/logs/retention.log 2>&1
-# §10 Суточная сводка в Telegram — ежедневно 09:00 UTC
-0 9 * * * ${APP_USER} cd ${APP_DIR} && /usr/bin/docker compose exec -T evaluator python -m src.health.daily_report >> ${APP_DIR}/logs/daily_report.log 2>&1
-# §11 Вотчдог — каждые 5 минут
-*/5 * * * * ${APP_USER} /usr/bin/python3 ${APP_DIR}/scripts/watchdog.py >> ${APP_DIR}/logs/watchdog.log 2>&1
+# §8 Бэкап БД — ежедневно 03:10 UTC
+10 3 * * * ${APP_USER} ${APP_DIR}/scripts/backup_db.sh >> ${APP_DIR}/logs/backup.log 2>&1
+# §9 Политика хранения — ежедневно 03:40 UTC
+40 3 * * * ${APP_USER} /usr/bin/python3 ${APP_DIR}/scripts/retention.py >> ${APP_DIR}/logs/retention.log 2>&1
+# §10 Суточная сводка в Telegram — ежедневно 06:00 UTC (09:00 МСК)
+0 6 * * * ${APP_USER} cd ${APP_DIR} && /usr/bin/python3 ${APP_DIR}/src/health/daily_report.py >> ${APP_DIR}/logs/daily_report.log 2>&1
+# §11 Вотчдог — каждые 10 минут
+*/10 * * * * ${APP_USER} /usr/bin/python3 ${APP_DIR}/scripts/watchdog.py >> ${APP_DIR}/logs/watchdog.log 2>&1
 EOF
     chmod 644 /etc/cron.d/agent-trade
     log "Cron-задачи установлены (/etc/cron.d/agent-trade)."
+}
+
+# ===========================================================================
+# ШАГ 7.1. Первый бэкап и одноразовая проверка восстановления (§8).
+# ===========================================================================
+first_backup_and_verify() {
+    step "Первый бэкап БД и проверка восстановления (§8)"
+    cd "$APP_DIR"
+
+    # Проверка намеренно допускает ненулевые коды — отключаем errexit/ERR-trap.
+    trap - ERR
+    set +e
+
+    log "Создаю первый бэкап БД (от имени $APP_USER)…"
+    if sudo -u "$APP_USER" bash "$APP_DIR/scripts/backup_db.sh"; then
+        log "Первый бэкап создан."
+    else
+        log "ВНИМАНИЕ: первый бэкап не создан — проверка восстановления пропущена."
+        BACKUP_VERIFY_RESULT="бэкап не создан — проверка не выполнена"
+        set -e
+        trap 'rc=$?; [[ $rc -ne 0 ]] && log "ОШИБКА: команда завершилась с кодом $rc (строка $LINENO)."; ' ERR
+        return
+    fi
+
+    local dump
+    dump="$(ls -1t "$APP_DIR/backups/"agenttrade_*.dump.gz 2>/dev/null | head -1)"
+    if [[ -z "$dump" ]]; then
+        BACKUP_VERIFY_RESULT="файл бэкапа не найден — проверка не выполнена"
+    else
+        log "Проверяю восстановление дампа во временную БД: $(basename "$dump")"
+        docker compose exec -T postgres psql -U agenttrade -d postgres \
+            -c "DROP DATABASE IF EXISTS agenttrade_verify;" >/dev/null 2>&1
+        docker compose exec -T postgres createdb -U agenttrade agenttrade_verify >/dev/null 2>&1
+
+        if gunzip -c "$dump" | docker compose exec -T postgres \
+                pg_restore -U agenttrade -d agenttrade_verify --no-owner >/dev/null 2>&1; then
+            local tabs_main tabs_ver ntab nrows t c
+            tabs_main="$(docker compose exec -T postgres psql -U agenttrade -d agenttrade -tAc \
+                "SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY 1;" 2>/dev/null | tr -d '\r')"
+            tabs_ver="$(docker compose exec -T postgres psql -U agenttrade -d agenttrade_verify -tAc \
+                "SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY 1;" 2>/dev/null | tr -d '\r')"
+            if [[ -n "$tabs_ver" && "$tabs_main" == "$tabs_ver" ]]; then
+                ntab="$(printf '%s\n' "$tabs_ver" | grep -c .)"
+                nrows=0
+                while IFS= read -r t; do
+                    [[ -z "$t" ]] && continue
+                    c="$(docker compose exec -T postgres psql -U agenttrade -d agenttrade_verify -tAc \
+                        "SELECT count(*) FROM \"$t\";" 2>/dev/null | tr -d '[:space:]')"
+                    nrows=$(( nrows + ${c:-0} ))
+                done <<< "$tabs_ver"
+                BACKUP_VERIFY_RESULT="OK — дамп восстановлен во временную БД; таблиц: ${ntab} (список совпадает с рабочей БД), строк восстановлено: ${nrows}; временная БД удалена"
+                log "Проверка восстановления: OK (таблиц ${ntab}, строк ${nrows})."
+            else
+                BACKUP_VERIFY_RESULT="РАСХОЖДЕНИЕ: список таблиц восстановленной БД не совпал с рабочей"
+                log "Проверка восстановления: расхождение списка таблиц."
+            fi
+        else
+            BACKUP_VERIFY_RESULT="ОШИБКА восстановления дампа (pg_restore)"
+            log "Проверка восстановления: ошибка pg_restore."
+        fi
+
+        docker compose exec -T postgres psql -U agenttrade -d postgres \
+            -c "DROP DATABASE IF EXISTS agenttrade_verify;" >/dev/null 2>&1
+        log "Временная БД удалена."
+    fi
+
+    set -e
+    trap 'rc=$?; [[ $rc -ne 0 ]] && log "ОШИБКА: команда завершилась с кодом $rc (строка $LINENO)."; ' ERR
 }
 
 # ===========================================================================
@@ -518,6 +587,10 @@ write_report() {
         echo
         printf '%s\n' "${CHECK_LINES[@]}"
         echo
+        echo "## Проверка восстановления бэкапа (§8)"
+        echo
+        echo "${BACKUP_VERIFY_RESULT}"
+        echo
         echo "## Доступ к PostgreSQL (§13.4)"
         echo
         echo "Сохраните этот пароль — он показан один раз:"
@@ -587,6 +660,7 @@ main() {
     setup_os_security
     deploy_stack
     setup_operations
+    first_backup_and_verify
     self_check_and_report
     final_banner
 }
