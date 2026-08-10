@@ -84,9 +84,21 @@ CREATE TABLE IF NOT EXISTS signals (
     pnl_pct        DOUBLE PRECISION,
     drawdown_pct   DOUBLE PRECISION,
     success        BOOLEAN,
-    notified       BOOLEAN NOT NULL DEFAULT FALSE -- отправлено ли уведомление (Этап 5)
+    notified       BOOLEAN NOT NULL DEFAULT FALSE, -- признак «обработан» notify (Этап 5)
+    notified_at    TIMESTAMPTZ                     -- факт реальной отправки в Telegram (Этап 6.6)
 );
 CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals (ts DESC);
+
+-- Учёт выгрузок сигналов наружу (Этап 6.6). Отдельная строка на каждую цель:
+-- сбой выгрузки в Notion не блокирует повтор в Sheets и наоборот.
+CREATE TABLE IF NOT EXISTS signal_exports (
+    id          BIGSERIAL PRIMARY KEY,
+    signal_id   BIGINT NOT NULL REFERENCES signals(id),
+    target      TEXT NOT NULL,            -- 'sheets' | 'notion'
+    exported_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (signal_id, target)
+);
+CREATE INDEX IF NOT EXISTS idx_signal_exports_target ON signal_exports (target, signal_id);
 
 -- Оценка результатов сигналов фактом движения цены (Этап 6).
 CREATE TABLE IF NOT EXISTS signal_evaluations (

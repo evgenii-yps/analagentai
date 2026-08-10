@@ -9,8 +9,11 @@ services:
       - pg_data:/var/lib/postgresql/data
       # DDL применяется автоматически при первой инициализации БД.
       - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    # Порт публикуется ТОЛЬКО на localhost сервера (§6.3 ТЗ 6.5): наружу 5432
+    # закрыт навсегда (доступ к БД — только с самого сервера / из docker-сети).
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
+    restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-agenttrade} -d ${POSTGRES_DB:-agenttrade}"]
       interval: 5s
@@ -21,8 +24,11 @@ services:
     image: redis:7-alpine
     volumes:
       - redis_data:/data
+    # Порт публикуется ТОЛЬКО на localhost сервера (§6.3 ТЗ 6.5): наружу 6379
+    # закрыт навсегда.
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -118,6 +124,20 @@ services:
       timeout: 10s
       retries: 3
       start_period: 20s
+
+  # Этап 6.6: разовая выгрузка сигналов в Google Таблицу и Notion.
+  # profiles: ["tools"] — сервис НЕ поднимается обычным `docker compose up -d`
+  # (иначе появился бы лишний постоянный контейнер). Запускается вручную/из cron:
+  #   docker compose --profile tools run --rm --no-deps export
+  # restart: "no" — это разовая задача, а не сервис; код возврата пробрасывается
+  # наружу (cron видит 1 при ошибке выгрузки).
+  export:
+    build: .
+    env_file: .env
+    profiles: ["tools"]
+    depends_on: [postgres, redis]
+    command: ["python", "-m", "src.export_main"]
+    restart: "no"
 
 volumes:
   pg_data:
