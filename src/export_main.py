@@ -1,11 +1,17 @@
-#!/usr/bin/env python3
-"""Выгрузка закрытых сигналов в Google Таблицу и Notion (Этап 6.6).
+"""Выгрузка закрытых сигналов в Google Таблицу и Notion (Этап 6.6 / 6.6.1).
 
-Запускается на ХОСТЕ сервера (не в контейнере), обычно из cron:
-    cd /opt/agent-trade && python3 scripts/export_signals.py
+Запускается ВНУТРИ контейнера (тот же образ, что и остальные сервисы), обычно из
+cron на хосте командой:
 
-Алгоритм (см. §6 ТЗ):
-  1. Прочитать .env, применить идемпотентные миграции §4.
+    docker compose --profile tools run --rm --no-deps export
+
+Почему в контейнере, а не на хосте: скрипту нужны сторонние пакеты (asyncpg,
+httpx, structlog, pydantic) и сеть наружу — всё это есть в образе, но НЕ на
+хосте (ТЗ 6.6.1, дефект D-3). БД внутри сети compose видна как ``postgres:5432``
+(штатный ``settings.pg_dsn``), поэтому host-DSN и хак с sys.path больше не нужны.
+
+Алгоритм (см. §6 ТЗ 6.6):
+  1. Применить идемпотентные миграции §4.
   2. Sheets: закрытые сигналы без отметки target='sheets' → лист «Сигналы»
      (append) пачками; пересобрать «Сводка по дням» и «Независимые окна» (replace).
   3. Notion: закрытые сигналы с notified_at без отметки target='notion' → страницы.
@@ -13,34 +19,28 @@
      невыгруженное уйдёт на следующем запуске (данные не теряются).
 
 Скрипт идемпотентен: повторный запуск не создаёт дублей ни в таблице, ни в Notion.
+Код возврата 1 пробрасывается наружу через ``docker compose run`` — cron видит сбой.
 """
 
 from __future__ import annotations
 
 import asyncio
 import html
-import os
-import sys
-from datetime import UTC, datetime
 
 import asyncpg
 import structlog
 
-# Гарантируем импорт пакета src при запуске файла напрямую (python scripts/...):
-# добавляем корень репозитория (родитель каталога scripts/) в sys.path.
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from src.core.config import mask_secret, settings  # noqa: E402
-from src.core.logging import setup_logging  # noqa: E402
-from src.export import notion, queries, sheets  # noqa: E402
-from src.export.transform import (  # noqa: E402
+from src.core.config import mask_secret, settings
+from src.core.logging import setup_logging
+from src.export import notion, queries, sheets
+from src.export.transform import (
     SIGNALS_HEADER,
     SUMMARY_HEADER,
     build_notion_properties,
     build_signal_row,
     build_summary_row,
 )
-from src.notify.telegram import send_message  # noqa: E402
+from src.notify.telegram import send_message
 
 # Пауза между запросами к Notion (лимит API ~3 запр/сек) — §6.6.
 _NOTION_PAUSE = 0.35
@@ -67,22 +67,8 @@ async def _alert(text: str, log: structlog.types.WrappedLogger) -> None:
         log.warning("Не удалось отправить алерт в Telegram", alert=text)
 
 
-def _resolve_reliable_since(auto: datetime | None) -> datetime | None:
-    """Момент достоверности notified_at: из .env, иначе автоопределённый (MIN)."""
-    raw = settings.EXPORT_NOTIFIED_SINCE.strip()
-    if not raw:
-        return auto
-    try:
-        parsed = datetime.fromisoformat(raw)
-    except ValueError:
-        # Некорректная дата в .env — не валим выгрузку, откатываемся к авто.
-        return auto
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
-
-
 async def _export_sheets(
     conn: asyncpg.Connection,
-    reliable_since: datetime | None,
     log: structlog.types.WrappedLogger,
 ) -> int:
     """Выгружает лист «Сигналы» (append) пачками и пересобирает служебные листы.
@@ -102,7 +88,7 @@ async def _export_sheets(
         batch = await queries.fetch_unexported_for_sheets(conn, batch_size)
         if not batch:
             break
-        rows = [build_signal_row(sig, reliable_since) for sig in batch]
+        rows = [build_signal_row(sig) for sig in batch]
         result = await sheets.post_rows(
             url, secret, _SHEET_SIGNALS, "append", rows, header=SIGNALS_HEADER
         )
@@ -123,7 +109,7 @@ async def _export_sheets(
         raise ExportError(f"лист «Сводка по дням»: {res.error}")
 
     windows = await queries.fetch_independent_windows(conn)
-    window_rows = [build_signal_row(sig, reliable_since) for sig in windows]
+    window_rows = [build_signal_row(sig) for sig in windows]
     res = await sheets.post_rows(
         url, secret, _SHEET_WINDOWS, "replace", window_rows, header=SIGNALS_HEADER
     )
@@ -195,9 +181,9 @@ async def _run() -> int:
         batch_size=settings.EXPORT_BATCH_SIZE,
     )
 
-    # Подключение к БД (на хосте — по 127.0.0.1). Недоступность БД — алерт и выход.
+    # Подключение к БД (в сети compose — postgres:5432). Недоступность → алерт+выход.
     try:
-        conn = await asyncpg.connect(dsn=settings.host_pg_dsn)
+        conn = await asyncpg.connect(dsn=settings.pg_dsn)
     except Exception as exc:  # noqa: BLE001
         log.error("БД недоступна", error=str(exc))
         await _alert(f"БД недоступна: {exc}", log)
@@ -206,12 +192,10 @@ async def _run() -> int:
     errors: list[str] = []
     try:
         await queries.apply_migrations(conn)
-        auto_since = await queries.resolve_reliable_since(conn)
-        reliable_since = _resolve_reliable_since(auto_since)
 
         # Цель Sheets и цель Notion независимы: сбой одной не блокирует другую.
         try:
-            sheets_n = await _export_sheets(conn, reliable_since, log)
+            sheets_n = await _export_sheets(conn, log)
             log.info("Sheets: готово", exported=sheets_n)
         except ExportError as exc:
             errors.append(str(exc))
@@ -246,7 +230,11 @@ async def _run() -> int:
 
 
 def main() -> None:
-    """Точка входа: запускает сценарий и выставляет код возврата процесса."""
+    """Точка входа: запускает сценарий и выставляет код возврата процесса.
+
+    Код возврата пробрасывается через ``docker compose run`` наружу, поэтому
+    cron видит 1 при ошибке выгрузки.
+    """
     raise SystemExit(asyncio.run(_run()))
 
 

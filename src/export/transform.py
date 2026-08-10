@@ -95,22 +95,22 @@ def iso_utc(ts: datetime | None) -> str:
     return ts.astimezone(UTC).isoformat()
 
 
-def notified_cell(
-    notified_at: datetime | None,
-    ts: datetime,
-    reliable_since: datetime | None,
-) -> str:
-    """Значение колонки ``notified``: ``да`` / ``нет`` / ``нет данных``.
+def notified_cell(notified: bool | None, notified_at: datetime | None) -> str:
+    """Значение колонки ``notified``: ``да`` / ``поглощён`` / ``нет`` (ТЗ 6.6.1 §9).
 
-    ``нет данных`` — если сигнал возник до момента, с которого ``notified_at``
-    заполняется достоверно (правка §5). Отличать «нет» от «нет данных» важно:
-    первое — факт, второе — отсутствие информации по историческим сигналам.
+    * ``да`` — есть ``notified_at`` (уведомление реально ушло в Telegram);
+    * ``поглощён`` — ``notified = TRUE``, но ``notified_at`` пуст (дубль/cooldown
+      «поглощён» анти-спамом, отправки не было);
+    * ``нет`` — сигнал ещё не обрабатывался notify.
+
+    Историю до правки §5 не различаем: у старых сигналов ``notified=TRUE`` и
+    ``notified_at=NULL`` → «поглощён». Это ожидаемо и не костыляется (ТЗ §7).
     """
     if notified_at is not None:
         return "да"
-    if reliable_since is not None and ts.astimezone(UTC) >= reliable_since.astimezone(UTC):
-        return "нет"
-    return "нет данных"
+    if notified:
+        return "поглощён"
+    return "нет"
 
 
 def success_cell(success: bool | None) -> str:
@@ -185,7 +185,7 @@ def _payload_json(agents_payload: Any) -> str:
     return json.dumps(agents_payload, ensure_ascii=False)
 
 
-def build_signal_row(signal: dict[str, Any], reliable_since: datetime | None) -> list[Any]:
+def build_signal_row(signal: dict[str, Any]) -> list[Any]:
     """Собирает одну строку листа «Сигналы» (27 колонок) из записи БД.
 
     ``signal`` — плоский словарь с полями сигнала и приджойненными оценками
@@ -213,7 +213,7 @@ def build_signal_row(signal: dict[str, Any], reliable_since: datetime | None) ->
         signal.get("token") or "",
         signal.get("decision") or "",
         probability_cell,
-        notified_cell(signal.get("notified_at"), ts, reliable_since),
+        notified_cell(signal.get("notified"), signal.get("notified_at")),
         iso_utc(signal.get("notified_at")),
         len(_as_payload_list(signal.get("agents_payload"))),
         agents["market_signal"],

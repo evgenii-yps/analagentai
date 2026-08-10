@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Any
 
 import asyncpg
@@ -21,6 +20,7 @@ _SIGNAL_COLUMNS = """
     s.probability,
     s.status,
     s.rationale,
+    s.notified,
     s.notified_at,
     s.agents_payload::text AS agents_payload,
     i.base AS token,
@@ -134,7 +134,9 @@ async def fetch_daily_summary(
             count(*) FILTER (WHERE s.decision = 'sell') AS sell,
             count(*) FILTER (WHERE s.decision = 'wait') AS wait,
             count(*) FILTER (WHERE s.probability >= $1) AS candidates,
-            count(*) FILTER (WHERE s.notified_at IS NOT NULL) AS notified,
+            count(*) FILTER (
+                WHERE s.status = 'closed' AND s.notified_at IS NOT NULL
+            ) AS notified,
             count(*) FILTER (WHERE s.status = 'closed') AS closed_4h,
             avg(CASE WHEN s.decision = 'buy'  AND e4.success IS NOT NULL
                      THEN e4.success::int END) AS sr_buy,
@@ -167,11 +169,6 @@ async def mark_exported(
         "ON CONFLICT (signal_id, target) DO NOTHING;",
         [(sid, target) for sid in signal_ids],
     )
-
-
-async def resolve_reliable_since(conn: asyncpg.Connection) -> datetime | None:
-    """Момент, с которого notified_at достоверен: минимальный непустой notified_at."""
-    return await conn.fetchval("SELECT min(notified_at) FROM signals;")
 
 
 async def count_unexported(conn: asyncpg.Connection, target: str) -> int:

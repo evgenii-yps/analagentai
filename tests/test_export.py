@@ -37,6 +37,7 @@ def _signal(**overrides) -> dict:
         "probability": 0.8123,
         "status": "closed",
         "rationale": "market=bullish; балл=+0.40 → buy.",
+        "notified": False,
         "notified_at": None,
         "agents_payload": _PAYLOAD_FULL,
         "token": "BTC",
@@ -106,24 +107,21 @@ def test_agent_columns_accepts_json_string() -> None:
     assert cols["liquidity_signal"] == "bearish"
 
 
-# --- notified_cell (колонка 8) ---
+# --- notified_cell (колонка 8), три значения (ТЗ 6.6.1 §9) ---
 
 def test_notified_cell_sent() -> None:
-    assert notified_cell(_TS, _TS, None) == "да"
+    # Есть notified_at → «да» независимо от флага notified.
+    assert notified_cell(True, _TS) == "да"
 
 
-def test_notified_cell_not_sent_after_cutoff() -> None:
-    cutoff = datetime(2026, 8, 1, tzinfo=UTC)
-    assert notified_cell(None, _TS, cutoff) == "нет"
+def test_notified_cell_absorbed() -> None:
+    # notified=TRUE, notified_at пуст → поглощён анти-спамом.
+    assert notified_cell(True, None) == "поглощён"
 
 
-def test_notified_cell_no_data_before_cutoff() -> None:
-    cutoff = datetime(2026, 9, 1, tzinfo=UTC)  # сигнал раньше момента достоверности
-    assert notified_cell(None, _TS, cutoff) == "нет данных"
-
-
-def test_notified_cell_no_cutoff_is_no_data() -> None:
-    assert notified_cell(None, _TS, None) == "нет данных"
+def test_notified_cell_not_processed() -> None:
+    # notify ещё не трогал сигнал.
+    assert notified_cell(False, None) == "нет"
 
 
 # --- success_cell ---
@@ -137,12 +135,12 @@ def test_success_cell_variants() -> None:
 # --- build_signal_row ---
 
 def test_signal_row_length_matches_header() -> None:
-    row = build_signal_row(_signal(), None)
+    row = build_signal_row(_signal())
     assert len(row) == len(SIGNALS_HEADER) == 27
 
 
 def test_signal_row_core_fields() -> None:
-    row = build_signal_row(_signal(notified_at=_TS), None)
+    row = build_signal_row(_signal(notified_at=_TS))
     assert row[0] == 101                       # signal_id
     assert row[1] == "2026-08-10T13:47:00+00:00"  # ts_utc
     assert row[3] == "2026-08-10T12:00:00+00:00"  # window_4h_utc
@@ -154,27 +152,34 @@ def test_signal_row_core_fields() -> None:
     assert row[24] == "closed"                 # status
 
 
+def test_signal_row_notified_tristate() -> None:
+    # да (есть notified_at) / поглощён (notified без notified_at) / нет.
+    assert build_signal_row(_signal(notified=True, notified_at=_TS))[7] == "да"
+    assert build_signal_row(_signal(notified=True, notified_at=None))[7] == "поглощён"
+    assert build_signal_row(_signal(notified=False, notified_at=None))[7] == "нет"
+
+
 def test_signal_row_price_falls_back_to_1h() -> None:
     # Нет оценки 4h → price_at_signal берётся из 1h.
-    row = build_signal_row(_signal(p_signal_4h=None), None)
+    row = build_signal_row(_signal(p_signal_4h=None))
     assert row[16] == 60000.0
 
 
 def test_signal_row_missing_futures_columns_empty() -> None:
-    row = build_signal_row(_signal(agents_payload=_PAYLOAD_NO_FUTURES), None)
+    row = build_signal_row(_signal(agents_payload=_PAYLOAD_NO_FUTURES))
     assert row[14] == ""  # futures_signal
     assert row[15] == ""  # futures_confidence
     assert row[9] == 2    # agents_count
 
 
 def test_signal_row_rationale_truncated() -> None:
-    row = build_signal_row(_signal(rationale="x" * 3000), None)
+    row = build_signal_row(_signal(rationale="x" * 3000))
     assert len(row[25]) == 2000
 
 
 def test_signal_row_payload_json_passthrough_for_string() -> None:
     raw = '[{"agent": "market"}]'
-    row = build_signal_row(_signal(agents_payload=raw), None)
+    row = build_signal_row(_signal(agents_payload=raw))
     assert row[26] == raw
 
 

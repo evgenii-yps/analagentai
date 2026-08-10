@@ -83,12 +83,6 @@ class Settings(BaseSettings):
     # База «Журнал сигналов» — ID известен и зафиксирован в ТЗ.
     NOTION_SIGNALS_DB_ID: str = "dacf5b37-f606-40cb-b0b9-89c51762e464"
     EXPORT_NOTION_ONLY_NOTIFIED: bool = True  # в Notion только сигналы с notified_at
-    # Момент, с которого notified_at заполняется достоверно (деплой правки §5).
-    # ISO-8601. Пусто → определяется автоматически как MIN(notified_at) из БД.
-    EXPORT_NOTIFIED_SINCE: str = ""
-    # Хост/порт БД для запуска скрипта на самом сервере (вне контейнера).
-    EXPORT_PG_HOST: str = "127.0.0.1"
-    EXPORT_PG_PORT: int = 5432
 
     @property
     def eval_horizons_list(self) -> list[str]:
@@ -120,19 +114,6 @@ class Settings(BaseSettings):
         return (
             f"postgresql://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}"
             f"@{self.PG_HOST}:{self.PG_PORT}/{self.POSTGRES_DB}"
-        )
-
-    @property
-    def host_pg_dsn(self) -> str:
-        """DSN для скриптов, запускаемых на хосте (БД доступна по 127.0.0.1:5432).
-
-        Внутри контейнеров БД видна как ``postgres:5432`` (см. ``pg_dsn``), но
-        скрипты выгрузки и суточной сводки работают на самом сервере, где порт
-        проброшен на ``127.0.0.1``. Хост/порт настраиваются EXPORT_PG_HOST/PORT.
-        """
-        return (
-            f"postgresql://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}"
-            f"@{self.EXPORT_PG_HOST}:{self.EXPORT_PG_PORT}/{self.POSTGRES_DB}"
         )
 
 

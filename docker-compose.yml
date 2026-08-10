@@ -125,6 +125,20 @@ services:
       retries: 3
       start_period: 20s
 
+  # Этап 6.6: разовая выгрузка сигналов в Google Таблицу и Notion.
+  # profiles: ["tools"] — сервис НЕ поднимается обычным `docker compose up -d`
+  # (иначе появился бы лишний постоянный контейнер). Запускается вручную/из cron:
+  #   docker compose --profile tools run --rm --no-deps export
+  # restart: "no" — это разовая задача, а не сервис; код возврата пробрасывается
+  # наружу (cron видит 1 при ошибке выгрузки).
+  export:
+    build: .
+    env_file: .env
+    profiles: ["tools"]
+    depends_on: [postgres, redis]
+    command: ["python", "-m", "src.export_main"]
+    restart: "no"
+
 volumes:
   pg_data:
   redis_data:
