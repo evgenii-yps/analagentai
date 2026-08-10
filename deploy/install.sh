@@ -52,18 +52,34 @@ redact() { sed -E 's#(https://)[^@/ ]+@#\1***@#g'; }
 # поэтому обычный stdin занят телом скрипта). printf -v не печатает значение,
 # чтобы секрет не попал в лог.
 # ---------------------------------------------------------------------------
+# Нормализует секрет «на месте» (ТЗ 6.6.1 §8.1): срезает \r, ESC-последовательности
+# (в т.ч. маркеры bracketed-paste \e[200~ / \e[201~) и ведущие/замыкающие пробелы.
+# Причина — реальный инцидент: ввод токена через SSH из PowerShell искажался
+# управляющими символами, и установка падала при верных значениях.
+normalize_secret() {  # $1 = имя переменной
+    local __var="$1" __val="${!1:-}"
+    # tr убирает CR; sed вырезает любые CSI-последовательности \e[...<буква>.
+    __val="$(printf '%s' "$__val" | tr -d '\r' | sed -E 's/\x1b\[[0-9;?]*[A-Za-z~]//g')"
+    # Срезаем ведущие и замыкающие пробельные символы (POSIX-классы).
+    __val="${__val#"${__val%%[![:space:]]*}"}"
+    __val="${__val%"${__val##*[![:space:]]}"}"
+    printf -v "$__var" '%s' "$__val"
+}
+
 prompt_hidden() {  # $1 = имя переменной, $2 = текст приглашения
     local __var="$1" __text="$2" __val=""
     printf '%s' "$__text" > /dev/tty
     read -rs __val < /dev/tty
     printf '\n' > /dev/tty
     printf -v "$__var" '%s' "$__val"
+    normalize_secret "$__var"
 }
 prompt_visible() {  # $1 = имя переменной, $2 = текст приглашения
     local __var="$1" __text="$2" __val=""
     printf '%s' "$__text" > /dev/tty
     read -r __val < /dev/tty
     printf -v "$__var" '%s' "$__val"
+    normalize_secret "$__var"
 }
 tty_say() { printf '%s\n' "$*" > /dev/tty; }
 
@@ -179,12 +195,25 @@ geo_check() {
 collect_secrets() {
     step "4/8 Секреты (Telegram-токен, chat_id; пароль БД генерируется)"
 
+    # Штатная поддержка переменных окружения (ТЗ 6.6.1 §8.2): TELEGRAM_BOT_TOKEN и
+    # TELEGRAM_CHAT_ID можно задать до запуска в обход интерактивного ввода, напр.
+    #   TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... sudo -E bash deploy/install.sh
+    # Значения из окружения имеют приоритет над .env; запоминаем их ДО сорса .env.
+    local __env_bot="${TELEGRAM_BOT_TOKEN:-}" __env_chat="${TELEGRAM_CHAT_ID:-}"
+
     # Переиспользуем ранее сохранённые значения (идемпотентность): пароль БД
     # ОБЯЗАТЕЛЬНО должен совпадать с тем, что уже зашит в томе postgres.
     if [[ -f "$APP_DIR/.env" ]]; then
         # shellcheck disable=SC1091
         set -a; . "$APP_DIR/.env"; set +a
     fi
+
+    # Возвращаем приоритет переменным окружения, если они были заданы явно.
+    [[ -n "$__env_bot" ]]  && TELEGRAM_BOT_TOKEN="$__env_bot"
+    [[ -n "$__env_chat" ]] && TELEGRAM_CHAT_ID="$__env_chat"
+    # Нормализуем секреты из окружения/.env так же, как интерактивный ввод.
+    normalize_secret TELEGRAM_BOT_TOKEN
+    normalize_secret TELEGRAM_CHAT_ID
 
     if [[ -n "${POSTGRES_PASSWORD:-}" && "${POSTGRES_PASSWORD}" != "change_me" ]]; then
         log "Пароль PostgreSQL уже задан ранее — переиспользую (том БД уже инициализирован)."
@@ -390,6 +419,15 @@ EVAL_INTERVAL=300
 EVAL_HORIZONS=1h,4h
 EVAL_PRIMARY_HORIZON=4h
 STATS_LOG_INTERVAL=3600
+# --- Выгрузка сигналов (Этап 6.6). Уже заполненные значения сохраняются: они
+# приходят из окружения (сорс .env в collect_secrets), missing → дефолт (§8.6). ---
+EXPORT_ENABLED=${EXPORT_ENABLED:-true}
+EXPORT_BATCH_SIZE=${EXPORT_BATCH_SIZE:-500}
+SHEETS_WEBAPP_URL=${SHEETS_WEBAPP_URL:-}
+SHEETS_SHARED_SECRET=${SHEETS_SHARED_SECRET:-}
+NOTION_API_TOKEN=${NOTION_API_TOKEN:-}
+NOTION_SIGNALS_DB_ID=${NOTION_SIGNALS_DB_ID:-dacf5b37-f606-40cb-b0b9-89c51762e464}
+EXPORT_NOTION_ONLY_NOTIFIED=${EXPORT_NOTION_ONLY_NOTIFIED:-true}
 EOF
     chmod 600 "$APP_DIR/.env"
 }
@@ -435,9 +473,18 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 0 6 * * * ${APP_USER} cd ${APP_DIR} && /usr/bin/python3 ${APP_DIR}/src/health/daily_report.py >> ${APP_DIR}/logs/daily_report.log 2>&1
 # §11 Вотчдог — каждые 10 минут
 */10 * * * * ${APP_USER} /usr/bin/python3 ${APP_DIR}/scripts/watchdog.py >> ${APP_DIR}/logs/watchdog.log 2>&1
+# Этап 6.6 Выгрузка сигналов — ежедневно 06:20 UTC (внутри контейнера, D-3)
+20 6 * * * ${APP_USER} cd ${APP_DIR} && /usr/bin/docker compose --profile tools run --rm --no-deps export >> ${APP_DIR}/logs/export.log 2>&1
 EOF
     chmod 644 /etc/cron.d/agent-trade
     log "Cron-задачи установлены (/etc/cron.d/agent-trade)."
+
+    # Ротация лога выгрузки (ТЗ 6.6.1 §8.5), 14 дней.
+    if [[ -f "$APP_DIR/deploy/logrotate-agent-trade-export" ]]; then
+        install -m 644 "$APP_DIR/deploy/logrotate-agent-trade-export" \
+            /etc/logrotate.d/agent-trade-export
+        log "Logrotate выгрузки установлен (/etc/logrotate.d/agent-trade-export)."
+    fi
 }
 
 # ===========================================================================
@@ -555,7 +602,10 @@ self_check_and_report() {
     systemctl is-enabled --quiet docker; add_check "Docker включён в автозапуск" "$?"
     systemctl is-enabled --quiet agent-trade.service; add_check "Автозапуск стека (agent-trade.service) включён" "$?"
     swapon --show 2>/dev/null | grep -q '/swapfile'; add_check "Swap 2 ГБ активен" "$?"
-    [[ "$(cat /etc/timezone 2>/dev/null || timedatectl show -p Timezone --value)" == "UTC" ]]; add_check "Таймзона = UTC" "$?"
+    # Таймзона: timedatectl set-timezone UTC на Ubuntu пишет «Etc/UTC» — это тоже
+    # корректный UTC. Принимаем оба значения (ТЗ 6.6.1 §8.3), иначе ложный FAIL.
+    tz_actual="$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null)"
+    [[ "$tz_actual" == "UTC" || "$tz_actual" == "Etc/UTC" ]]; add_check "Таймзона = UTC (текущая: ${tz_actual:-неизвестно})" "$?"
     [[ -f /etc/cron.d/agent-trade ]]; add_check "Регламентные задачи (cron) установлены" "$?"
     [[ -f "$APP_DIR/.env" && "$(stat -c '%a' "$APP_DIR/.env")" == "600" ]]; add_check ".env существует и имеет права 600" "$?"
 
