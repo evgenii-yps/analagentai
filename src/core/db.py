@@ -350,10 +350,18 @@ class DB:
     # --- Уведомления (Этап 5) ---
 
     async def ensure_notify_schema(self) -> None:
-        """Идемпотентно добавляет колонку ``notified`` (на случай старого тома)."""
+        """Идемпотентно добавляет колонки ``notified`` и ``notified_at``.
+
+        ``notified`` (Этап 5) — служебный признак «сигнал обработан notify»
+        (защита от повторов и поглощение дублей). ``notified_at`` (Этап 6.6) —
+        отметка ФАКТИЧЕСКОЙ отправки в Telegram, нужна для честной статистики.
+        """
         await self.pool.execute(
             "ALTER TABLE signals "
             "ADD COLUMN IF NOT EXISTS notified BOOLEAN NOT NULL DEFAULT FALSE;"
+        )
+        await self.pool.execute(
+            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS notified_at TIMESTAMPTZ;"
         )
 
     async def get_unnotified_strong_signals(
@@ -373,7 +381,23 @@ class DB:
         return [dict(r) for r in rows]
 
     async def mark_signal_notified(self, signal_id: int) -> None:
-        """Помечает сигнал как отправленный (защита от повторов)."""
+        """Фиксирует ФАКТ отправки уведомления в Telegram.
+
+        Вызывается ТОЛЬКО после успешного ответа Telegram API. Проставляет
+        ``notified_at = now()`` (для статистики качества сигналов) и служебный
+        признак ``notified`` (защита от повторов).
+        """
+        await self.pool.execute(
+            "UPDATE signals SET notified = TRUE, notified_at = now() WHERE id = $1;",
+            signal_id,
+        )
+
+    async def mark_signal_absorbed(self, signal_id: int) -> None:
+        """Поглощает сигнал (дубль/в пределах cooldown), НЕ фиксируя отправку.
+
+        Уведомление в Telegram по нему не ушло, поэтому ``notified_at`` остаётся
+        пустым — иначе статистика «отправлено уведомлений» была бы завышена.
+        """
         await self.pool.execute(
             "UPDATE signals SET notified = TRUE WHERE id = $1;", signal_id
         )

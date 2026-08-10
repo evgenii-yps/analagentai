@@ -20,6 +20,12 @@
 - **Этап 6 (анализ результатов):** сервис-оценщик дооценивает сигналы фактом движения
   цены на горизонтах 1ч/4ч (pnl%, просадка, success) и пишет в `signal_evaluations`;
   по главному горизонту (4ч) заполняет сводку в `signals` и закрывает сигнал.
+- **Этап 6.6 (выгрузка сигналов):** суточная пакетная выгрузка закрытых сигналов
+  наружу — полный поток в Google Таблицу (лист «Сигналы» + служебные «Сводка по дням»
+  и «Независимые окна»), витрина сильных сигналов (с фактически отправленным
+  уведомлением) — в базу «Журнал сигналов» Notion. Host-скрипт `scripts/export_signals.py`
+  идемпотентен, ведёт учёт в `signal_exports`, при ошибке шлёт алерт в Telegram и не
+  теряет данные. Настройка приёмников и cron — в `EXPORT_REPORT.md`.
 
 ## Стек
 
@@ -37,7 +43,7 @@
 ├── .env.example            # пример переменных окружения
 ├── pyproject.toml          # метаданные, ruff, pytest
 ├── requirements.txt        # закреплённые версии для Docker/CI
-├── db/init.sql             # схема БД (9 таблиц + индексы)
+├── db/init.sql             # схема БД (10 таблиц + индексы)
 ├── src/
 │   ├── main.py             # точка входа — сервис-коллектор
 │   ├── agents_main.py      # точка входа — сервис агентов
@@ -71,10 +77,24 @@
 │   │   ├── telegram.py     # отправка в Telegram (httpx, async)
 │   │   ├── agent.py        # NotifyAgent + should_notify + формат сообщения
 │   │   └── runner.py       # планировщик уведомлений + graceful shutdown
-│   └── evaluator/
-│       ├── evaluator.py    # compute_evaluation + класс Evaluator
-│       └── runner.py       # планировщик оценки + graceful shutdown
-└── tests/                  # тесты конфига, коллекторов, агентов, агрегации, уведомлений, оценки
+│   ├── evaluator/
+│   │   ├── evaluator.py    # compute_evaluation + класс Evaluator
+│   │   └── runner.py       # планировщик оценки + graceful shutdown
+│   ├── export/             # выгрузка сигналов (Этап 6.6)
+│   │   ├── transform.py    # чистые функции: строки листов, окно 4ч, свойства Notion
+│   │   ├── queries.py      # SQL выборки/агрегатов/учёта выгрузок
+│   │   ├── sheets.py       # клиент Google Apps Script (redirect, повторы)
+│   │   └── notion.py       # клиент Notion REST API
+│   └── health/
+│       └── report.py       # чистые функции суточной сводки (§5.4, §13.3)
+├── scripts/
+│   ├── export_signals.py   # host-скрипт выгрузки в Sheets/Notion (cron 06:20 UTC)
+│   └── daily_report.py     # host-скрипт суточной сводки (cron 06:00 UTC)
+├── deploy/
+│   ├── apps_script.gs      # код приёмника Google Таблицы
+│   ├── agent-trade-export.cron        # cron-запись выгрузки
+│   └── logrotate-agent-trade-export   # ротация лога выгрузки
+└── tests/                  # тесты конфига, коллекторов, агентов, агрегации, уведомлений, оценки, выгрузки
 ```
 
 ## Сбор данных (Этап 2)

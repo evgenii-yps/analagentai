@@ -127,7 +127,8 @@ class NotifyAgent:
 
         if not should_notify(signal, last_decision, last_sent_ts, now, self.cfg):
             # Дубль/в пределах cooldown — «поглощаем» сигнал, чтобы не висел.
-            await db.mark_signal_notified(signal["id"])
+            # notified_at НЕ ставим: отправки в Telegram здесь не было.
+            await db.mark_signal_absorbed(signal["id"])
             return
 
         sent = await send_message(format_signal(signal, self.symbol, self.tz_name))
