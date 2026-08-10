@@ -1,0 +1,13 @@
+# Выгрузка сигналов Agent Trade (Этап 6.6).
+# Установка под пользователем agent:
+#   sudo cp deploy/agent-trade-export.cron /etc/cron.d/agent-trade-export
+#   sudo chmod 644 /etc/cron.d/agent-trade-export
+# Формат /etc/cron.d: обязательно поле пользователя (agent).
+#
+# 06:20 UTC — после суточной сводки (06:00), бэкапа (03:10) и ретенции (03:40).
+# Логи пишутся в /opt/agent-trade/logs/export.log (ротация — logrotate, 14 дней).
+
+SHELL=/bin/bash
+PATH=/usr/local/bin:/usr/bin:/bin
+
+20 6 * * * agent cd /opt/agent-trade && /usr/bin/python3 scripts/export_signals.py >> /opt/agent-trade/logs/export.log 2>&1

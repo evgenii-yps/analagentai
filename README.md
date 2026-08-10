@@ -20,6 +20,12 @@
 - **Этап 6 (анализ результатов):** сервис-оценщик дооценивает сигналы фактом движения
   цены на горизонтах 1ч/4ч (pnl%, просадка, success) и пишет в `signal_evaluations`;
   по главному горизонту (4ч) заполняет сводку в `signals` и закрывает сигнал.
+- **Этап 6.6 (выгрузка сигналов):** суточная пакетная выгрузка закрытых сигналов
+  наружу — полный поток в Google Таблицу (лист «Сигналы» + служебные «Сводка по дням»
+  и «Независимые окна»), витрина сильных сигналов (с фактически отправленным
+  уведомлением) — в базу «Журнал сигналов» Notion. Host-скрипт `scripts/export_signals.py`
+  идемпотентен, ведёт учёт в `signal_exports`, при ошибке шлёт алерт в Telegram и не
+  теряет данные. Настройка приёмников и cron — в `EXPORT_REPORT.md`.
 
 ## 🚀 Запуск установщика (развёртывание на сервере)
 
@@ -121,24 +127,26 @@ curl -fsSL https://raw.githubusercontent.com/evgenii-yps/analagentai/claude/depl
 ├── .env.example            # пример переменных окружения
 ├── pyproject.toml          # метаданные, ruff, pytest
 ├── requirements.txt        # закреплённые версии для Docker/CI
-├── db/init.sql             # схема БД (9 таблиц + индексы)
-├── deploy/                 # развёртывание на сервере (Этап 6.5/6.5.1)
+├── db/init.sql             # схема БД (10 таблиц + индексы)
+├── deploy/                 # развёртывание и эксплуатация
 │   ├── install.sh          # главный идемпотентный установщик
 │   ├── bootstrap           # команда-однострочник для запуска установщика
-│   └── agent-trade.service # systemd-юнит автозапуска стека
-├── scripts/                # вспомогательные скрипты эксплуатации
+│   ├── agent-trade.service # systemd-юнит автозапуска стека
+│   ├── apps_script.gs      # код приёмника Google Таблицы (выгрузка 6.6)
+│   ├── agent-trade-export.cron        # шаблон cron-записи выгрузки
+│   └── logrotate-agent-trade-export   # ротация лога выгрузки
+├── scripts/                # вспомогательные скрипты эксплуатации (хост, stdlib)
 │   ├── geo_check.py        # блокирующий гео-тест OKX (REST + WebSocket, stdlib)
 │   ├── backup_db.sh        # ежедневный бэкап БД с ротацией
 │   ├── retention.py        # политика хранения (очистка старых сырых данных)
 │   └── watchdog.py         # вотчдог: перезапуск упавших сервисов + алерт
 ├── src/
-│   ├── health/
-│   │   └── daily_report.py # суточная сводка о состоянии системы в Telegram
 │   ├── main.py             # точка входа — сервис-коллектор
 │   ├── agents_main.py      # точка входа — сервис агентов
 │   ├── decision_main.py    # точка входа — Decision Agent
 │   ├── notify_main.py      # точка входа — сервис уведомлений
 │   ├── evaluator_main.py   # точка входа — оценщик результатов
+│   ├── export_main.py      # точка входа — выгрузка сигналов (docker compose run)
 │   ├── healthcheck.py      # CLI-проверка PG и Redis
 │   ├── core/
 │   │   ├── config.py       # Settings (pydantic-settings)
@@ -146,30 +154,19 @@ curl -fsSL https://raw.githubusercontent.com/evgenii-yps/analagentai/claude/depl
 │   │   ├── redis_client.py # async-клиент Redis
 │   │   ├── exchange.py     # фабрика ccxt-клиента
 │   │   └── logging.py      # настройка structlog
-│   ├── collectors/
-│   │   ├── base.py         # базовый устойчивый цикл + heartbeat
-│   │   ├── ohlcv.py        # свечи по таймфреймам
-│   │   ├── orderbook.py    # снимки стакана
-│   │   ├── trades.py       # сделки (тики)
-│   │   ├── futures.py      # funding + open interest (swap)
-│   │   └── runner.py       # оркестрация + graceful shutdown
-│   ├── agents/
-│   │   ├── base.py         # BaseAgent + AgentOutput
-│   │   ├── market.py       # теханализ по OHLCV (EMA/RSI/ATR/MACD/ADX)
-│   │   ├── liquidity.py    # анализ стакана (дисбаланс, стенки)
-│   │   ├── futures.py      # funding + open interest
-│   │   └── runner.py       # планировщик агентов + graceful shutdown
-│   ├── decision/
-│   │   ├── agent.py        # DecisionAgent + чистая логика агрегации
-│   │   └── runner.py       # планировщик решений + graceful shutdown
-│   ├── notify/
-│   │   ├── telegram.py     # отправка в Telegram (httpx, async)
-│   │   ├── agent.py        # NotifyAgent + should_notify + формат сообщения
-│   │   └── runner.py       # планировщик уведомлений + graceful shutdown
-│   └── evaluator/
-│       ├── evaluator.py    # compute_evaluation + класс Evaluator
-│       └── runner.py       # планировщик оценки + graceful shutdown
-└── tests/                  # тесты конфига, коллекторов, агентов, агрегации, уведомлений, оценки
+│   ├── collectors/         # коллекторы OHLCV/стакан/сделки/funding+OI
+│   ├── agents/             # Market/Liquidity/Futures + BaseAgent
+│   ├── decision/           # DecisionAgent + логика агрегации
+│   ├── notify/             # NotifyAgent + should_notify + Telegram
+│   ├── evaluator/          # compute_evaluation + класс Evaluator
+│   ├── export/             # выгрузка сигналов (Этап 6.6)
+│   │   ├── transform.py    # чистые функции: строки листов, окно 4ч, свойства Notion
+│   │   ├── queries.py      # SQL выборки/агрегатов/учёта выгрузок
+│   │   ├── sheets.py       # клиент Google Apps Script (redirect, повторы)
+│   │   └── notion.py       # клиент Notion REST API
+│   └── health/
+│       └── daily_report.py # суточная сводка о состоянии системы (хост, stdlib)
+└── tests/                  # тесты конфига, коллекторов, агентов, решений, уведомлений, оценки, выгрузки
 ```
 
 ## Сбор данных (Этап 2)
