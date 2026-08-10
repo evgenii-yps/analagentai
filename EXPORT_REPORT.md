@@ -1,5 +1,14 @@
 # Отчёт по Этапу 6.6 — Выгрузка сигналов в Google Таблицу и Журнал сигналов Notion
 
+> **⚠️ Обновлено в Этапе 6.6.1.** Способ ЗАПУСКА выгрузки изменён: она работает не
+> host-скриптом, а внутри контейнера (`docker compose --profile tools run --rm
+> --no-deps export`, точка входа `python -m src.export_main`) — на хосте нет
+> сторонних пакетов (дефект D-3). Также колонка `notified` листа «Сигналы» стала
+> трёхзначной (`да` / `поглощён` / `нет`), а параметры `EXPORT_PG_HOST/PORT` и
+> `EXPORT_NOTIFIED_SINCE` удалены. Актуальные команды развёртывания и запуска —
+> в **`CONSOLIDATION_REPORT.md`**. Разделы ниже сохранены как история решений 6.6;
+> где они расходятся с 6.6.1 — приоритет у `CONSOLIDATION_REPORT.md`.
+
 Реализована пакетная суточная выгрузка закрытых сигналов в две внешние точки:
 полный поток — в Google Таблицу, витрина сильных сигналов — в базу «Журнал
 сигналов» Notion. Ниже — фактическая структура данных, инструкции для заказчика,
@@ -160,8 +169,11 @@ SHEETS_SHARED_SECRET=<из шага 5.1.4>
 NOTION_API_TOKEN=<из шага 5.2.4>
 NOTION_SIGNALS_DB_ID=dacf5b37-f606-40cb-b0b9-89c51762e464
 EXPORT_NOTION_ONLY_NOTIFIED=true
-EXPORT_NOTIFIED_SINCE=<дата/время деплоя правки §5, ISO-8601; можно оставить пустым>
 ```
+
+> В 6.6.1 на новом сервере эти ключи добавляет сам `install.sh`, не затирая уже
+> заполненные (§8.6). Ключ `EXPORT_NOTIFIED_SINCE` удалён — колонка `notified`
+> теперь трёхзначная и границы достоверности не требует.
 
 ### 5.4. Установить cron и ротацию лога (под root)
 
@@ -178,13 +190,13 @@ sudo -u agent mkdir -p /opt/agent-trade/logs
 
 ```bash
 # 1) Запустить выгрузку вручную (на сервере, от пользователя agent):
-cd /opt/agent-trade && python3 scripts/export_signals.py
+cd /opt/agent-trade && docker compose --profile tools run --rm --no-deps export
 
 # 2) Посмотреть лог выгрузки:
 tail -n 100 /opt/agent-trade/logs/export.log
 
 # 3) Сколько сигналов ещё не выгружено (Sheets и Notion):
-psql "host=127.0.0.1 port=5432 dbname=agenttrade user=agenttrade" -c \
+docker compose exec -T postgres psql -U agenttrade -d agenttrade -c \
 "SELECT
    (SELECT count(*) FROM signals s WHERE s.status='closed'
       AND NOT EXISTS (SELECT 1 FROM signal_exports x WHERE x.signal_id=s.id AND x.target='sheets')) AS sheets_pending,
@@ -282,9 +294,9 @@ psql "host=127.0.0.1 port=5432 dbname=agenttrade user=agenttrade" -c \
 | `src/export/queries.py` | SQL выборки/агрегатов/учёта выгрузок. |
 | `src/export/sheets.py` | Клиент Apps Script (redirect, таймаут 60с, повторы 5/15/45). |
 | `src/export/notion.py` | Клиент Notion REST (версия API `2022-06-28`). |
-| `scripts/export_signals.py` | Оркестратор выгрузки (host-скрипт). |
-| `scripts/daily_report.py` | Суточная сводка с двумя счётчиками и клампом heartbeat. |
-| `src/health/report.py` | Чистые функции суточной сводки. |
+| `scripts/export_signals.py` | Оркестратор выгрузки. **В 6.6.1 перенесён → `src/export_main.py`** (запуск в контейнере, D-3). |
+| `scripts/daily_report.py` | Суточная сводка. **В 6.6.1 удалён** (дубль; осталась `src/health/daily_report.py`). |
+| `src/health/report.py` | Чистые функции сводки. **В 6.6.1 удалён** (не использовался рабочей сводкой). |
 | `deploy/apps_script.gs` | Код приёмника Google Таблицы. |
 | `deploy/agent-trade-export.cron` | Cron 06:20 UTC под `agent`. |
 | `deploy/logrotate-agent-trade-export` | Ротация лога, 14 дней. |
