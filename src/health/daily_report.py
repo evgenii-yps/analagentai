@@ -80,6 +80,10 @@ PG_DB = os.environ.get("POSTGRES_DB", ENV.get("POSTGRES_DB", "agenttrade"))
 PRIMARY_HORIZON = os.environ.get(
     "EVAL_PRIMARY_HORIZON", ENV.get("EVAL_PRIMARY_HORIZON", "4h")
 )
+# Порог вероятности для счётчика «кандидатов» — берётся из .env, не зашивается.
+NOTIFY_MIN_PROBABILITY = os.environ.get(
+    "NOTIFY_MIN_PROBABILITY", ENV.get("NOTIFY_MIN_PROBABILITY", "0.7")
+)
 
 
 def _run(cmd: list[str], timeout: int = 60) -> str:
@@ -173,7 +177,9 @@ def section_heartbeats() -> list[str]:
             continue
         try:
             ts = datetime.fromisoformat(val)
-            age = (now - ts).total_seconds()
+            # Часы контейнера и хост-скрипта могут расходиться → отметка «в
+            # будущем» давала бы «-1 сек назад». Приводим к нулю (ТЗ 6.6.1 §8.4).
+            age = max(0.0, (now - ts).total_seconds())
             fresh = age <= 5 * interval
             mark = "🟢" if fresh else "🔴"
             lines.append(
@@ -222,10 +228,30 @@ def section_signals_24h() -> list[str]:
     else:
         lines.append("По решениям: нет")
 
-    notified = _psql(
-        "SELECT count(*) FROM signals WHERE notified AND ts > now() - interval '24 hours';"
+    # Три раздельных счётчика (ТЗ 6.6.1 §7): фактические отправки, поглощённые
+    # анти-спамом дубли/cooldown и кандидаты, прошедшие порог вероятности.
+    # Раньше выводилась одна строка по флагу `notified`, который ставится и при
+    # поглощении, — отсюда завышение (416 вместо 10–50 в сводке от 10.08.2026).
+    sent = _psql(
+        "SELECT count(*) FROM signals "
+        "WHERE notified_at > now() - interval '24 hours';"
     )
-    lines.append(f"Отправлено уведомлений: {notified or '0'}")
+    lines.append(f"Отправлено уведомлений: {sent or '0'}")
+
+    absorbed = _psql(
+        "SELECT count(*) FROM signals "
+        "WHERE notified AND notified_at IS NULL "
+        "AND ts > now() - interval '24 hours';"
+    )
+    lines.append(f"Поглощено анти-спамом: {absorbed or '0'}")
+
+    candidates = _psql(
+        "SELECT count(*) FROM signals "
+        "WHERE decision <> 'wait' "
+        f"AND probability >= {float(NOTIFY_MIN_PROBABILITY)} "
+        "AND ts > now() - interval '24 hours';"
+    )
+    lines.append(f"Кандидатов (вероятность ≥ порога): {candidates or '0'}")
 
     closed = _psql(
         "SELECT count(*) FROM signal_evaluations "
