@@ -26,19 +26,25 @@ def _verify() -> str | bool:
     return ca_file if ca_file else True
 
 
-async def send_message(text: str) -> bool:
+async def send_message(text: str, chat_id: str | None = None) -> bool:
     """Отправляет HTML-сообщение в чат. Возвращает True при успехе.
+
+    ``chat_id`` необязателен: по умолчанию берётся ``TELEGRAM_CHAT_ID`` из конфига
+    (поведение прежних вызовов не меняется). Бот-ответы адресуют конкретный чат,
+    передавая chat_id явно. Достаточно наличия токена — chat_id может прийти
+    аргументом, поэтому проверяем именно токен, а не ``telegram_configured``.
 
     Любые ошибки сети/Telegram ловятся и логируются — функция НЕ бросает
     исключений и возвращает False.
     """
-    if not settings.telegram_configured:
+    target_chat = chat_id if chat_id is not None else settings.TELEGRAM_CHAT_ID
+    if not settings.TELEGRAM_BOT_TOKEN or not target_chat:
         _log.warning("Telegram не настроен (нет токена/chat_id) — пропуск отправки")
         return False
 
     url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id": settings.TELEGRAM_CHAT_ID,
+        "chat_id": target_chat,
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,

@@ -368,9 +368,15 @@ class DB:
         self,
         min_probability: float,
     ) -> list[dict[str, Any]]:
-        """Неотправленные сильные сигналы (decision != wait, prob >= порога), ts ASC."""
+        """Неотправленные сильные сигналы (decision != wait, prob >= порога), ts ASC.
+
+        ``agents_payload`` включён для самодостаточного текста уведомления (ТЗ 6.7
+        §6): по нему форматтер показывает мнения агентов и пересчитывает
+        согласованность. Условия выборки (фильтры отправки) не изменены.
+        """
         query = """
-            SELECT id, instrument_id, ts, decision, probability, rationale
+            SELECT id, instrument_id, ts, decision, probability, rationale,
+                   agents_payload
             FROM signals
             WHERE notified = FALSE
               AND decision <> 'wait'

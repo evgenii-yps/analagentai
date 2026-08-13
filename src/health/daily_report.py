@@ -45,9 +45,10 @@ HEARTBEATS: list[tuple[str, str, int]] = [
     ("decision:heartbeat", "DECISION_INTERVAL", 60),
     ("notify:heartbeat", "NOTIFY_INTERVAL", 30),
     ("evaluator:heartbeat", "EVAL_INTERVAL", 300),
+    ("bot:heartbeat", "BOT_POLL_TIMEOUT", 30),
 ]
 
-CONTAINERS = ["postgres", "redis", "collector", "agents", "decision", "notify", "evaluator"]
+CONTAINERS = ["postgres", "redis", "collector", "agents", "decision", "notify", "evaluator", "bot"]
 
 # Потоки данных для проверки «тихой» поломки: (подпись, таблица).
 DATA_STREAMS = [

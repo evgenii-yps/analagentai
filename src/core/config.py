@@ -84,6 +84,35 @@ class Settings(BaseSettings):
     NOTION_SIGNALS_DB_ID: str = "dacf5b37-f606-40cb-b0b9-89c51762e464"
     EXPORT_NOTION_ONLY_NOTIFIED: bool = True  # в Notion только сигналы с notified_at
 
+    # --- Телеграм-бот только на чтение (Этап 6.7) ---
+    BOT_ENABLED: bool = True          # выключатель сервиса бота
+    BOT_POLL_TIMEOUT: int = 30        # сек, таймаут long polling getUpdates
+    # Белый список chat_id через запятую. Пусто → берётся TELEGRAM_CHAT_ID.
+    BOT_ALLOWED_CHAT_IDS: str = ""
+    BOT_MAX_ROWS: int = 20            # потолок строк в /last
+    BOT_RATE_LIMIT_SEC: int = 3       # мин. пауза между командами одного чата
+    # Пароль роли БД только на чтение (agenttrade_ro). Генерируется установщиком;
+    # пусто → сервис бота простаивает (не подключается основным пользователем).
+    POSTGRES_RO_PASSWORD: str = ""
+
+    @property
+    def bot_allowed_chat_ids(self) -> set[str]:
+        """Белый список chat_id (строки). По умолчанию — единственный чат владельца.
+
+        Значения хранятся строками: chat_id из Telegram приходит числом, но
+        сравнение ведём по строковому представлению, чтобы не зависеть от типа.
+        """
+        raw = self.BOT_ALLOWED_CHAT_IDS.strip() or self.TELEGRAM_CHAT_ID
+        return {part.strip() for part in raw.split(",") if part.strip()}
+
+    @property
+    def pg_dsn_ro(self) -> str:
+        """DSN подключения ролью только на чтение (agenttrade_ro)."""
+        return (
+            f"postgresql://agenttrade_ro:{self.POSTGRES_RO_PASSWORD}"
+            f"@{self.PG_HOST}:{self.PG_PORT}/{self.POSTGRES_DB}"
+        )
+
     @property
     def eval_horizons_list(self) -> list[str]:
         """Разбирает строку EVAL_HORIZONS в список горизонтов."""

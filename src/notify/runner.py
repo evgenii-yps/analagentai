@@ -39,6 +39,7 @@ async def run() -> None:
             cooldown_sec=settings.NOTIFY_COOLDOWN_SEC,
             symbol=settings.SYMBOL,
             tz_name=settings.NOTIFY_TIMEZONE,
+            primary_horizon=settings.EVAL_PRIMARY_HORIZON,
         )
         tasks = [asyncio.create_task(agent.run(), name="notify")]
 

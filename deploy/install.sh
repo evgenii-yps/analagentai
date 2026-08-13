@@ -24,7 +24,7 @@ APP_USER="agent"
 LOG_FILE="/var/log/agent-trade-install.log"
 
 # Сервисы приложения, которые должны быть подняты.
-EXPECTED_SERVICES=(postgres redis collector agents decision notify evaluator)
+EXPECTED_SERVICES=(postgres redis collector agents decision notify evaluator bot)
 
 OVERALL_FAIL=0
 CLONE_URL="$REPO_URL"   # для приватного репо будет заменён на URL с токеном
@@ -220,6 +220,16 @@ collect_secrets() {
     else
         POSTGRES_PASSWORD="$(gen_password)"
         log "Сгенерирован новый пароль PostgreSQL (32 символа)."
+    fi
+
+    # Пароль роли только на чтение (agenttrade_ro) для сервиса бота (Этап 6.7).
+    # Генерируется один раз и переиспользуется; сервис бота синхронизирует его с
+    # ролью при старте (ALTER ROLE), поэтому смена значения безопасна.
+    if [[ -n "${POSTGRES_RO_PASSWORD:-}" ]]; then
+        log "Пароль роли agenttrade_ro уже задан ранее — переиспользую."
+    else
+        POSTGRES_RO_PASSWORD="$(gen_password)"
+        log "Сгенерирован новый пароль роли agenttrade_ro (32 символа)."
     fi
 
     if [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]] \
@@ -428,6 +438,15 @@ SHEETS_SHARED_SECRET=${SHEETS_SHARED_SECRET:-}
 NOTION_API_TOKEN=${NOTION_API_TOKEN:-}
 NOTION_SIGNALS_DB_ID=${NOTION_SIGNALS_DB_ID:-dacf5b37-f606-40cb-b0b9-89c51762e464}
 EXPORT_NOTION_ONLY_NOTIFIED=${EXPORT_NOTION_ONLY_NOTIFIED:-true}
+# --- Телеграм-бот только на чтение (Этап 6.7). Недостающие ключи добавляются
+# с дефолтами; уже заполненные значения приходят из окружения (сорс .env) и
+# сохраняются — существующий .env не затирается (§9). ---
+BOT_ENABLED=${BOT_ENABLED:-true}
+BOT_POLL_TIMEOUT=${BOT_POLL_TIMEOUT:-30}
+BOT_ALLOWED_CHAT_IDS=${BOT_ALLOWED_CHAT_IDS:-}
+BOT_MAX_ROWS=${BOT_MAX_ROWS:-20}
+BOT_RATE_LIMIT_SEC=${BOT_RATE_LIMIT_SEC:-3}
+POSTGRES_RO_PASSWORD=${POSTGRES_RO_PASSWORD}
 EOF
     chmod 600 "$APP_DIR/.env"
 }

@@ -28,7 +28,7 @@ from datetime import UTC, datetime
 
 APP_DIR = os.environ.get("APP_DIR", "/opt/agent-trade")
 
-CONTAINERS = ["postgres", "redis", "collector", "agents", "decision", "notify", "evaluator"]
+CONTAINERS = ["postgres", "redis", "collector", "agents", "decision", "notify", "evaluator", "bot"]
 
 # heartbeat-ключ -> (env интервала, дефолт, имя контейнера-владельца).
 HEARTBEATS: list[tuple[str, str, int, str]] = [
@@ -42,6 +42,7 @@ HEARTBEATS: list[tuple[str, str, int, str]] = [
     ("decision:heartbeat", "DECISION_INTERVAL", 60, "decision"),
     ("notify:heartbeat", "NOTIFY_INTERVAL", 30, "notify"),
     ("evaluator:heartbeat", "EVAL_INTERVAL", 300, "evaluator"),
+    ("bot:heartbeat", "BOT_POLL_TIMEOUT", 30, "bot"),
 ]
 
 DISK_MIN_FREE_PCT = float(os.environ.get("WATCHDOG_DISK_MIN_FREE_PCT", "15"))

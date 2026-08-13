@@ -24,6 +24,18 @@ from src.notify.telegram import send_message
 # TTL heartbeat-ключа (секунды).
 _HEARTBEAT_TTL = 300
 
+# Порядок агентов, участвующих в решении (совпадает с src.decision.agent.AGENTS).
+AGENT_ORDER: tuple[str, ...] = ("market", "liquidity", "futures")
+
+# Русские имена агентов для текста сообщения (ТЗ §6).
+AGENT_RU = {"market": "Теханализ", "liquidity": "Ликвидность", "futures": "Деривативы"}
+
+# Русская расшифровка мнения агента (ТЗ §6).
+OPINION_RU = {"bullish": "за рост", "bearish": "за падение", "neutral": "нейтрально"}
+
+# Числовое направление сигнала — та же таблица, что в src.decision.agent.
+SIGNAL_VALUE = {"bullish": 1, "bearish": -1, "neutral": 0}
+
 
 @dataclass
 class NotifyConfig:
@@ -31,6 +43,15 @@ class NotifyConfig:
 
     min_probability: float
     cooldown_sec: float
+
+
+@dataclass
+class SignalFormatConfig:
+    """Параметры форматирования сообщения о сигнале (без обращений к сети/БД)."""
+
+    symbol: str
+    tz_name: str
+    primary_horizon: str
 
 
 def should_notify(
@@ -63,13 +84,113 @@ def should_notify(
 # Короткие метки для часто используемых зон (иначе берём abbr из самой зоны).
 _TZ_LABELS = {"Europe/Moscow": "МСК"}
 
+# Заключительная строка сообщения — обязательна и неизменна (ТЗ §6).
+_CLOSING_LINE = "Решение за вами. Система не торгует сама."
 
-def format_signal(signal: dict[str, Any], symbol: str, tz_name: str) -> str:
-    """Форматирует сигнал в HTML-сообщение на русском.
 
-    Время сигnala переводится из UTC в ``tz_name`` (напр. Europe/Moscow → МСК).
+def normalize_payload(agents_payload: Any) -> list[dict[str, Any]]:
+    """Приводит ``agents_payload`` (JSON-строка / список / None) к списку словарей.
+
+    asyncpg возвращает JSONB строкой, поэтому строку разбираем через json.loads.
     """
-    base = symbol.split("/")[0]
+    if agents_payload is None:
+        return []
+    if isinstance(agents_payload, str):
+        try:
+            parsed = json.loads(agents_payload)
+        except (ValueError, TypeError):
+            return []
+    else:
+        parsed = agents_payload
+    if not isinstance(parsed, list):
+        return []
+    return [e for e in parsed if isinstance(e, dict)]
+
+
+def compute_agreement(agents_payload: Any) -> float | None:
+    """Пересчитывает согласованность из ``agents_payload`` ТОЙ ЖЕ формулой, что и
+    Decision Agent (src.decision.agent.make_decision):
+
+        directions = [SIGNAL_VALUE[o["signal"]] for o in fresh]
+        agreement = abs(pos - neg) / len(fresh)
+
+    Парсинг rationale регуляркой ЗАПРЕЩЁН (ТЗ §6): формат текстовый и может
+    измениться. Здесь только чтение payload, логика решений не затрагивается.
+    Возвращает None, если ни одного направленного мнения нет.
+    """
+    directions = [
+        SIGNAL_VALUE[e["signal"]]
+        for e in normalize_payload(agents_payload)
+        if e.get("signal") in SIGNAL_VALUE
+    ]
+    if not directions:
+        return None
+    pos = sum(1 for d in directions if d > 0)
+    neg = sum(1 for d in directions if d < 0)
+    return abs(pos - neg) / len(directions)
+
+
+def agreement_wording(agreement: float) -> str:
+    """Словесная расшифровка согласованности (ТЗ §6)."""
+    if agreement >= 0.9:
+        return "агенты единодушны"
+    if agreement >= 0.5:
+        return "агенты скорее согласны"
+    return "мнения расходятся"
+
+
+def horizon_ru(horizon: str) -> str:
+    """Человекочитаемый горизонт: ``4h`` → «4 часа», ``1h`` → «1 час»."""
+    horizon = horizon.strip().lower()
+    if horizon.endswith("h") and horizon[:-1].isdigit():
+        n = int(horizon[:-1])
+        # Русские окончания: 1 час, 2-4 часа, 5+ часов (без спец. случаев 11-14 —
+        # горизонты малы, но обрабатываем корректно).
+        if n % 10 == 1 and n % 100 != 11:
+            word = "час"
+        elif n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
+            word = "часа"
+        else:
+            word = "часов"
+        return f"{n} {word}"
+    return horizon
+
+
+def format_price(price: float, quote: str) -> str:
+    """Цена с разделением тысяч пробелом: ``64210.0`` → ``64 210 USDT``."""
+    grouped = f"{round(float(price)):,}".replace(",", " ")
+    return f"{grouped} {quote}"
+
+
+def _split_symbol(symbol: str) -> tuple[str, str]:
+    """base/quote из символа: ``BTC/USDT`` → (``BTC``, ``USDT``)."""
+    if "/" in symbol:
+        base, quote = symbol.split("/", 1)
+        return base, quote.split(":", 1)[0]
+    return symbol, "USDT"
+
+
+def _agent_line(entry: dict[str, Any]) -> str:
+    """Строка мнения присутствующего агента."""
+    name = AGENT_RU.get(entry.get("agent"), entry.get("agent", "?"))
+    opinion = OPINION_RU.get(entry.get("signal"), entry.get("signal", "?"))
+    confidence = float(entry.get("confidence", 0.0))
+    return f"• {name}: {opinion} (уверенность {confidence:.2f})"
+
+
+def format_signal_message(
+    signal: dict[str, Any],
+    price: float | None,
+    cfg: SignalFormatConfig,
+) -> str:
+    """Самодостаточное HTML-сообщение о сигнале (ТЗ §6). Чистая функция.
+
+    Показывает мнение каждого агента, ЯВНО отмечает отсутствующих (сигнал на
+    двух агентах из трёх слабее — человек должен это видеть), пересчитанную
+    согласованность, цену на момент сигнала, горизонт оценки. Если цены нет —
+    строка про цену пропускается, сообщение всё равно формируется.
+    """
+    base, quote = _split_symbol(cfg.symbol)
     decision = signal["decision"]
     if decision == "buy":
         emoji, action = "🟢", "ПОКУПАТЬ"
@@ -77,18 +198,46 @@ def format_signal(signal: dict[str, Any], symbol: str, tz_name: str) -> str:
         emoji, action = "🔴", "ПРОДАВАТЬ"
     probability = round(float(signal["probability"]) * 100)
 
-    ts: datetime = signal["ts"]
-    local_ts = ts.astimezone(ZoneInfo(tz_name))
-    label = _TZ_LABELS.get(tz_name) or local_ts.tzname() or tz_name
-    when = local_ts.strftime("%Y-%m-%d %H:%M")
+    payload = normalize_payload(signal.get("agents_payload"))
+    present = {e.get("agent") for e in payload}
 
-    rationale = signal.get("rationale") or "—"
-    return (
-        f"{emoji} <b>СИГНАЛ: {action} {base}</b>\n"
-        f"Вероятность: <b>{probability}%</b>\n"
-        f"Почему: {rationale}\n"
-        f"Время: {when} {label}"
-    )
+    lines = [
+        f"{emoji} <b>СИГНАЛ: {action} {base}</b>",
+        f"Вероятность: <b>{probability}%</b>",
+    ]
+    if price is not None:
+        lines.append(f"Цена сейчас: {format_price(price, quote)}")
+
+    lines.append("")
+    lines.append("Мнения агентов:")
+    for name in AGENT_ORDER:
+        entry = next((e for e in payload if e.get("agent") == name), None)
+        if entry is not None:
+            lines.append(_agent_line(entry))
+    # Отсутствующие агенты — отдельными явными строками (важнее всего прочего).
+    for name in AGENT_ORDER:
+        if name not in present:
+            lines.append(
+                f"• {AGENT_RU[name]}: нет данных, в решении не участвовал"
+            )
+
+    agreement = compute_agreement(payload)
+    lines.append("")
+    if agreement is not None:
+        lines.append(
+            f"Согласованность: {agreement:.2f} — {agreement_wording(agreement)}"
+        )
+    lines.append(f"Горизонт оценки: {horizon_ru(cfg.primary_horizon)}")
+
+    ts: datetime = signal["ts"]
+    local_ts = ts.astimezone(ZoneInfo(cfg.tz_name))
+    label = _TZ_LABELS.get(cfg.tz_name) or local_ts.tzname() or cfg.tz_name
+    when = local_ts.strftime("%d.%m.%Y %H:%M")
+    lines.append(f"Сигнал #{signal['id']} · {when} {label}")
+
+    lines.append("")
+    lines.append(_CLOSING_LINE)
+    return "\n".join(lines)
 
 
 class NotifyAgent:
@@ -101,11 +250,13 @@ class NotifyAgent:
         cooldown_sec: float,
         symbol: str,
         tz_name: str,
+        primary_horizon: str,
     ) -> None:
         self.interval = interval
         self.cfg = NotifyConfig(min_probability, cooldown_sec)
         self.symbol = symbol
         self.tz_name = tz_name
+        self.fmt_cfg = SignalFormatConfig(symbol, tz_name, primary_horizon)
         self._log = structlog.get_logger().bind(component="notify")
 
     async def process_once(self) -> None:
@@ -131,7 +282,10 @@ class NotifyAgent:
             await db.mark_signal_absorbed(signal["id"])
             return
 
-        sent = await send_message(format_signal(signal, self.symbol, self.tz_name))
+        # Цена на момент сигнала — переиспользуем готовый get_price_at (ТЗ §6).
+        # Чтение цены не влияет на условия отправки; при отсутствии — None.
+        price = await db.get_price_at(instrument_id, signal["ts"])
+        sent = await send_message(format_signal_message(signal, price, self.fmt_cfg))
         if sent:
             await db.mark_signal_notified(signal["id"])
             await self._set_last_state(instrument_id, signal["decision"], now)
