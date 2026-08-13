@@ -376,12 +376,24 @@ def render_stats(
     block5: dict[str, Any],
     period: str,
     now: datetime,
+    logic_version: int | None = None,
+    mixed_versions: bool = False,
 ) -> str:
     """/stats: пять блоков — честная выборка, все подряд, пояснение, предупреждение,
     фильтрация уведомлений. Бот НЕ выдаёт суждений «хорошо/плохо» — только цифры.
+
+    Статистика считается по ОДНОЙ версии логики (§D.4). ``logic_version`` — версия,
+    по которой посчитано; ``mixed_versions`` — в периоде встречались обе версии.
     """
     label = STATS_PERIODS.get(period, period)
-    lines = [f"<b>📊 Статистика {label}</b>", ""]
+    version_note = f" (версия логики {logic_version})" if logic_version is not None else ""
+    lines = [f"<b>📊 Статистика {label}{version_note}</b>", ""]
+    if mixed_versions:
+        lines.append(
+            "⚠️ В периоде смешаны две версии логики, статистика недостоверна. "
+            "Ниже — только по последней версии."
+        )
+        lines.append("")
 
     lines.append("<b>Блок 1 — честная выборка (независимые 4-часовые окна)</b>")
     lines.extend(_stats_body(block1))

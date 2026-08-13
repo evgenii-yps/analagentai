@@ -28,6 +28,8 @@ async def run() -> None:
     # 1. Инфраструктура: БД и Redis.
     await db.connect()
     get_redis()  # прогрев клиента (агенты пишут heartbeat)
+    # Идемпотентно гарантируем таблицу учёта сбоев (Задача B, на старом томе).
+    await db.ensure_agent_failure_schema()
 
     tasks: list[asyncio.Task[None]] = []
     try:

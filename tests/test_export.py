@@ -51,6 +51,7 @@ def _signal(**overrides) -> dict:
         "pnl_4h": 1.0,
         "dd_4h": 0.3,
         "succ_4h": True,
+        "logic_version": 2,
     }
     base.update(overrides)
     return base
@@ -136,7 +137,15 @@ def test_success_cell_variants() -> None:
 
 def test_signal_row_length_matches_header() -> None:
     row = build_signal_row(_signal())
-    assert len(row) == len(SIGNALS_HEADER) == 27
+    assert len(row) == len(SIGNALS_HEADER) == 28
+
+
+def test_signal_row_logic_version_is_last() -> None:
+    # logic_version — последняя колонка (§D.3), существующие не сдвинуты.
+    assert SIGNALS_HEADER[-1] == "logic_version"
+    assert build_signal_row(_signal(logic_version=2))[27] == 2
+    # Отсутствие поля → версия 1 (исторические сигналы «до» правок).
+    assert build_signal_row(_signal(logic_version=None))[27] == 1
 
 
 def test_signal_row_core_fields() -> None:
@@ -202,6 +211,7 @@ def test_summary_row_empty_cells_not_zero() -> None:
             "avg_pnl_sell": None,
             "avg_dd": 0.3,
             "avg_prob": 0.6543,
+            "logic_version_dominant": 2,
         }
     )
     assert row[0] == "2026-08-10"
@@ -209,6 +219,7 @@ def test_summary_row_empty_cells_not_zero() -> None:
     assert row[9] == ""       # success_rate_sell_4h пусто (не было sell)
     assert row[11] == ""      # avg_pnl_sell_4h пусто
     assert row[13] == 0.6543  # avg_probability
+    assert row[14] == 2       # logic_version_dominant (последняя колонка)
 
 
 # --- participating_agents / build_notion_properties (§9.3) ---

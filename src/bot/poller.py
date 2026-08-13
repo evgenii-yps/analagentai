@@ -245,10 +245,17 @@ class BotPoller:
     async def _cmd_stats(self, args: list[str], now: datetime) -> str:
         period = handlers.parse_stats_period(args)
         period_sec = PERIOD_SECONDS[period]
-        block1 = await self.queries.stats_block(period_sec, independent=True)
-        block2 = await self.queries.stats_block(period_sec, independent=False)
-        block5 = await self.queries.notify_filter_counts(period_sec)
-        return handlers.render_stats(block1, block2, block5, period, now)
+        # §D.4: считаем ровно по одной версии логики (по умолчанию — последней),
+        # смешивать «до» и «после» правок Этапа 7.0 нельзя.
+        versions = await self.queries.stats_versions(period_sec)
+        target_version = max(versions) if versions else None
+        mixed = len(versions) > 1
+        block1 = await self.queries.stats_block(period_sec, True, target_version)
+        block2 = await self.queries.stats_block(period_sec, False, target_version)
+        block5 = await self.queries.notify_filter_counts(period_sec, target_version)
+        return handlers.render_stats(
+            block1, block2, block5, period, now, target_version, mixed
+        )
 
     async def _cmd_summary(self, now: datetime) -> str:
         hb_rows = await self._read_heartbeats()

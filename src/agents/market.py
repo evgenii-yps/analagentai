@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import pandas as pd
@@ -20,8 +21,15 @@ from src.agents.base import (
     SIGNAL_NEUTRAL,
     AgentOutput,
     BaseAgent,
+    normalize_confidence,
 )
 from src.core.db import db
+
+# Характеристический масштаб уверенности (Задача A). У Market Agent сырая
+# уверенность по природе нормирована (доля голосов), её теоретический и
+# практический максимум = 1.0, поэтому нормировка — тождество. Масштаб задан
+# явно, чтобы правило «делим на максимум агента» было единым для трёх агентов.
+CONFIDENCE_SCALE = 1.0
 
 # Периоды индикаторов (фиксированы по ТЗ).
 _EMA_FAST, _EMA_MID, _EMA_SLOW = 20, 50, 200
@@ -118,8 +126,15 @@ def adx(
 
 
 def _round(value: float, digits: int = 6) -> float:
-    """Округление с защитой от NaN/inf (для JSON-метрик)."""
-    if value is None or pd.isna(value):
+    """Округление с защитой от NaN/inf (для JSON-метрик).
+
+    Задача B.5 (Этап 7.0): раньше ``inf`` проходил сквозь guard (``pd.isna`` его
+    не ловит), попадал в metrics, и ``json.dumps`` выдавал невалидный для JSONB
+    ``Infinity`` → ``INSERT`` падал, а вывод агента терялся молча. Теперь ``inf``/
+    ``-inf`` приводятся к 0.0 наравне с NaN. Это защита записи, направление и
+    величину «нормального» сигнала не меняет.
+    """
+    if value is None or pd.isna(value) or not math.isfinite(float(value)):
         return 0.0
     return round(float(value), digits)
 
@@ -195,15 +210,15 @@ def analyze_ohlcv(
     adx_factor = min(adx_val / 40.0, 1.0)
 
     # Слабый тренд (низкий ADX) и нет сильного перевеса голосов → нейтрально.
+    # Направление сигнала НЕ меняется — нормируется только величина уверенности.
     weak_trend = adx_val < _ADX_TREND_MIN and abs(score) < 3
     if score == 0 or weak_trend:
         signal = SIGNAL_NEUTRAL
-        confidence = _round(agreement * 0.3 * (0.5 + 0.5 * adx_factor), 4)
+        confidence_raw = _round(agreement * 0.3 * (0.5 + 0.5 * adx_factor), 4)
     else:
         signal = SIGNAL_BULLISH if score > 0 else SIGNAL_BEARISH
-        confidence = _round(
-            min(agreement * (0.4 + 0.6 * adx_factor), 1.0), 4
-        )
+        confidence_raw = _round(min(agreement * (0.4 + 0.6 * adx_factor), 1.0), 4)
+    confidence = normalize_confidence(confidence_raw, CONFIDENCE_SCALE)
 
     metrics: dict[str, Any] = {
         "n_candles": n,
@@ -224,6 +239,9 @@ def analyze_ohlcv(
         "resistance": _round(resistance, 2),
         "votes": votes,
         "score": score,
+        # Сырое значение уверенности до нормировки (Задача A) — для сравнения
+        # старого и нового режимов.
+        "confidence_raw": confidence_raw,
     }
 
     rationale = (

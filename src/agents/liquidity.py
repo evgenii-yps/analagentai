@@ -16,8 +16,17 @@ from src.agents.base import (
     SIGNAL_NEUTRAL,
     AgentOutput,
     BaseAgent,
+    normalize_confidence,
 )
 from src.core.db import db
+
+# Характеристический масштаб уверенности (Задача A). Сырой дисбаланс стакана BTC
+# у топа книги интринзически мал: теоретический максимум strength = 1.0
+# недостижим, эмпирический максимум ≈ 0.15 (ANALYSIS_REPORT.md §3.1). Нормируем
+# на него, чтобы полный диапазон [0,1] реально использовался и шкала стала
+# сопоставима с market. Значение — калибровка по наблюдениям, уточняется
+# запросом C1 из ANALYSIS_REPORT.md; см. STAGE_7_0_REPORT.md.
+CONFIDENCE_SCALE = 0.15
 
 # Сколько последних снимков анализировать и минимум для решения.
 _SNAPSHOTS_LIMIT = 20
@@ -97,12 +106,14 @@ def analyze_orderbook(
         rationale_dir = "баланс сторон"
 
     # Уверенность: сила дисбаланса × его устойчивость (низкий разброс).
+    # Направление сигнала НЕ меняется — нормируется только величина уверенности.
     strength = (abs(current) + abs(avg_imbalance)) / 2.0
     consistency = max(0.0, 1.0 - imbalance_std)
     if signal == SIGNAL_NEUTRAL:
-        confidence = round(min(strength * 0.3 * consistency, 1.0), 4)
+        confidence_raw = round(min(strength * 0.3 * consistency, 1.0), 4)
     else:
-        confidence = round(min(strength * (0.5 + 0.5 * consistency), 1.0), 4)
+        confidence_raw = round(min(strength * (0.5 + 0.5 * consistency), 1.0), 4)
+    confidence = normalize_confidence(confidence_raw, CONFIDENCE_SCALE)
 
     metrics: dict[str, Any] = {
         "n_snapshots": n,
@@ -115,6 +126,7 @@ def analyze_orderbook(
         "imbalance_std": round(imbalance_std, 4),
         "bid_wall_ratio": round(bid_wall, 2),
         "ask_wall_ratio": round(ask_wall, 2),
+        "confidence_raw": confidence_raw,
     }
     rationale = (
         f"{rationale_dir}: дисбаланс={current:+.2f} (средн. {avg_imbalance:+.2f}), "
