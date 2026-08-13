@@ -30,6 +30,12 @@ DECISION_BUY = "buy"
 DECISION_SELL = "sell"
 DECISION_WAIT = "wait"
 
+# Версия логики агентов/агрегации (Задача D, Этап 7.0). Это свойство КОДА, а не
+# настройки, поэтому константа здесь, а не в .env. Инкрементируется при правках,
+# делающих сигналы несравнимыми с прежними. Версия 2 = после приведения шкал
+# уверенности (Задача A), симметрии Futures (Задача C) и защиты записи (Задача B).
+LOGIC_VERSION = 2
+
 
 def _is_fresh(output: dict[str, Any], freshness_sec: float, now: datetime) -> bool:
     """Свежий ли вывод (по возрасту ts)."""
@@ -155,7 +161,12 @@ class DecisionAgent:
             now=datetime.now(UTC),
         )
         await db.save_signal(
-            self.instrument_id, decision, probability, payload, rationale
+            self.instrument_id,
+            decision,
+            probability,
+            payload,
+            rationale,
+            logic_version=LOGIC_VERSION,
         )
         self._log.info(
             "Решение сохранено",

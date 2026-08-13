@@ -183,11 +183,34 @@ class BotQueries:
 
     # --- /stats ---
 
-    async def stats_block(self, period_sec: int, independent: bool) -> dict[str, Any]:
-        """Агрегаты по закрытым сигналам за период.
+    async def stats_versions(self, period_sec: int) -> list[int]:
+        """Версии логики (logic_version), встречающиеся у закрытых сигналов периода.
+
+        Нужно, чтобы /stats считал статистику по ОДНОЙ версии (§D.4): смешивать
+        сигналы «до» и «после» правок Этапа 7.0 статистически некорректно.
+        """
+        rows = await self._pool.fetch(
+            """
+            SELECT DISTINCT logic_version FROM signals
+            WHERE status = 'closed'
+              AND ($1 = 0 OR ts > now() - $1 * interval '1 second')
+            ORDER BY logic_version;
+            """,
+            period_sec,
+        )
+        return [int(r["logic_version"]) for r in rows]
+
+    async def stats_block(
+        self,
+        period_sec: int,
+        independent: bool,
+        logic_version: int | None,
+    ) -> dict[str, Any]:
+        """Агрегаты по закрытым сигналам за период И одну версию логики.
 
         ``independent=True`` — по одному (самому раннему) сигналу на каждое
         4-часовое окно (честная выборка). Иначе — по всей массе подряд.
+        ``logic_version=None`` → без фильтра версии (когда закрытых сигналов нет).
         """
         if independent:
             query = f"""
@@ -200,6 +223,7 @@ class BotQueries:
                            ON e4.signal_id = s.id AND e4.horizon = '4h'
                     WHERE s.status = 'closed'
                       AND ($1 = 0 OR s.ts > now() - $1 * interval '1 second')
+                      AND ($2::smallint IS NULL OR s.logic_version = $2)
                     ORDER BY win, s.ts ASC
                 )
                 SELECT
@@ -232,22 +256,29 @@ class BotQueries:
                 LEFT JOIN signal_evaluations e4
                        ON e4.signal_id = s.id AND e4.horizon = '4h'
                 WHERE s.status = 'closed'
-                  AND ($1 = 0 OR s.ts > now() - $1 * interval '1 second');
+                  AND ($1 = 0 OR s.ts > now() - $1 * interval '1 second')
+                  AND ($2::smallint IS NULL OR s.logic_version = $2);
             """
-        row = await self._pool.fetchrow(query, period_sec)
+        row = await self._pool.fetchrow(query, period_sec, logic_version)
         return dict(row) if row else {}
 
-    async def notify_filter_counts(self, period_sec: int) -> dict[str, Any]:
-        """Блок 5 /stats: сколько отправлено и сколько поглощено за период."""
+    async def notify_filter_counts(
+        self,
+        period_sec: int,
+        logic_version: int | None,
+    ) -> dict[str, Any]:
+        """Блок 5 /stats: сколько отправлено и поглощено за период (одна версия)."""
         row = await self._pool.fetchrow(
             """
             SELECT
                 count(*) FILTER (WHERE notified_at IS NOT NULL) AS sent,
                 count(*) FILTER (WHERE notified AND notified_at IS NULL) AS absorbed
             FROM signals s
-            WHERE ($1 = 0 OR s.ts > now() - $1 * interval '1 second');
+            WHERE ($1 = 0 OR s.ts > now() - $1 * interval '1 second')
+              AND ($2::smallint IS NULL OR s.logic_version = $2);
             """,
             period_sec,
+            logic_version,
         )
         return dict(row) if row else {"sent": 0, "absorbed": 0}
 

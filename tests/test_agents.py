@@ -7,9 +7,11 @@
 import numpy as np
 import pandas as pd
 
+from src.agents.base import normalize_confidence
 from src.agents.futures import analyze_futures
+from src.agents.liquidity import CONFIDENCE_SCALE as LIQ_SCALE
 from src.agents.liquidity import analyze_orderbook
-from src.agents.market import analyze_ohlcv, ema, rsi
+from src.agents.market import _round, analyze_ohlcv, ema, rsi
 
 
 def _make_ohlcv(closes: list[float]) -> pd.DataFrame:
@@ -160,3 +162,90 @@ def test_futures_flat_oi_is_neutral() -> None:
 def test_futures_is_deterministic() -> None:
     args = ([{"rate": 0.0001}], _oi(1000.0, 1100.0))
     assert analyze_futures(*args) == analyze_futures(*args)
+
+
+# --- Задача A: приведение шкал уверенности (Этап 7.0) ---
+
+def test_normalize_confidence_basic() -> None:
+    # market: масштаб 1.0 → тождество.
+    assert normalize_confidence(0.5, 1.0) == 0.5
+    # liquidity: 0.057/0.15 ≈ 0.38.
+    assert normalize_confidence(0.057, 0.15) == 0.38
+    # насыщение на 1.0.
+    assert normalize_confidence(0.2, 0.1) == 1.0
+    # отрицательное/некорректный масштаб → 0.0.
+    assert normalize_confidence(-1.0, 0.15) == 0.0
+    assert normalize_confidence(0.5, 0.0) == 0.0
+
+
+def test_market_saves_confidence_raw_and_identity_scale() -> None:
+    signal, confidence, metrics, _ = analyze_ohlcv(_uptrend(), min_candles=200)
+    assert signal == "bullish"
+    assert "confidence_raw" in metrics
+    # У market масштаб 1.0 → нормировка тождественна.
+    assert confidence == metrics["confidence_raw"]
+
+
+def test_liquidity_saves_confidence_raw_and_amplifies() -> None:
+    signal, confidence, metrics, _ = analyze_orderbook(_snapshots(100, 50))
+    assert signal == "bullish"                       # направление НЕ изменилось
+    assert "confidence_raw" in metrics
+    # Нормировка = сырое/scale с насыщением — усиливает мелкую сырую уверенность.
+    assert confidence == normalize_confidence(metrics["confidence_raw"], LIQ_SCALE)
+    assert confidence >= metrics["confidence_raw"]
+
+
+def test_futures_saves_confidence_raw() -> None:
+    _, _, metrics, _ = analyze_futures(
+        funding=[{"rate": 0.0001}], open_interest=_oi(1000.0, 1100.0)
+    )
+    assert "confidence_raw" in metrics
+
+
+def test_normalization_preserves_direction_on_fixed_inputs() -> None:
+    # Направление не должно зависеть от нормировки уверенности (критерий приёмки).
+    assert analyze_ohlcv(_uptrend(), 200)[0] == "bullish"
+    assert analyze_ohlcv(_downtrend(), 200)[0] == "bearish"
+    assert analyze_orderbook(_snapshots(100, 50))[0] == "bullish"
+    assert analyze_orderbook(_snapshots(50, 100))[0] == "bearish"
+
+
+# --- Задача B.5: _round гасит inf (иначе JSONB отвергал INSERT) ---
+
+def test_round_clamps_inf_and_nan() -> None:
+    assert _round(float("inf")) == 0.0
+    assert _round(float("-inf")) == 0.0
+    assert _round(float("nan")) == 0.0
+    assert _round(1.23456, 2) == 1.23
+
+
+# --- Задача C: симметрия Futures — медвежьи ветки достижимы ---
+
+def test_futures_negative_funding_rising_oi_is_bearish() -> None:
+    # Реалистичный отрицательный funding (распродажа) + рост OI → продолжение вниз.
+    signal, _, _, _ = analyze_futures(
+        funding=[{"rate": -0.0002}], open_interest=_oi(1000.0, 1100.0)
+    )
+    assert signal == "bearish"
+
+
+def test_futures_positive_extreme_is_bearish_at_new_threshold() -> None:
+    # При новом пороге 0.0003 реалистичный всплеск 0.0004 → ветка разворота (bearish).
+    signal, _, metrics, _ = analyze_futures(
+        funding=[{"rate": 0.0004}],
+        open_interest=_oi(1000.0, 1000.0),
+        extreme_threshold=0.0003,
+    )
+    assert signal == "bearish"
+    assert metrics["funding_extreme"] is True
+
+
+def test_futures_extreme_threshold_is_configurable() -> None:
+    # То же значение funding при старом пороге 0.0005 экстремумом НЕ считается.
+    signal, _, metrics, _ = analyze_futures(
+        funding=[{"rate": 0.0004}],
+        open_interest=_oi(1000.0, 1000.0),
+        extreme_threshold=0.0005,
+    )
+    assert signal == "neutral"
+    assert metrics["funding_extreme"] is False

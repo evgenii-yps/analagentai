@@ -266,6 +266,27 @@ def test_stats_five_blocks_and_small_sample_warning() -> None:
     assert "Реально отправлено: 12" in text
 
 
+def test_stats_mixed_versions_warning() -> None:
+    block = {"n": 40, "buy": 20, "sell": 20, "wait": 0, "sr_buy": 0.6,
+             "sr_sell": 0.5, "avg_pnl": 0.4, "avg_dd": 0.2}
+    text = handlers.render_stats(
+        block, block, {"sent": 1, "absorbed": 2}, "7d", _NOW,
+        logic_version=2, mixed_versions=True,
+    )
+    assert "смешаны две версии логики" in text
+    assert "версия логики 2" in text
+
+
+def test_stats_single_version_no_warning() -> None:
+    block = {"n": 40, "buy": 20, "sell": 20, "wait": 0, "sr_buy": 0.6,
+             "sr_sell": 0.5, "avg_pnl": 0.4, "avg_dd": 0.2}
+    text = handlers.render_stats(
+        block, block, {"sent": 1, "absorbed": 2}, "7d", _NOW,
+        logic_version=2, mixed_versions=False,
+    )
+    assert "смешаны две версии" not in text
+
+
 def test_stats_no_warning_when_enough_sample() -> None:
     block = {"n": 40, "buy": 20, "sell": 20, "wait": 0, "sr_buy": 0.6,
              "sr_sell": 0.5, "avg_pnl": 0.4, "avg_dd": 0.2}

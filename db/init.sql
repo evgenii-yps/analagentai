@@ -85,7 +85,8 @@ CREATE TABLE IF NOT EXISTS signals (
     drawdown_pct   DOUBLE PRECISION,
     success        BOOLEAN,
     notified       BOOLEAN NOT NULL DEFAULT FALSE, -- признак «обработан» notify (Этап 5)
-    notified_at    TIMESTAMPTZ                     -- факт реальной отправки в Telegram (Этап 6.6)
+    notified_at    TIMESTAMPTZ,                    -- факт реальной отправки в Telegram (Этап 6.6)
+    logic_version  SMALLINT NOT NULL DEFAULT 1     -- версия логики агентов/агрегации (Этап 7.0)
 );
 CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals (ts DESC);
 
@@ -113,6 +114,18 @@ CREATE TABLE IF NOT EXISTS signal_evaluations (
     evaluated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (signal_id, horizon)
 );
+
+-- Учёт сбоев итераций агентов (Этап 7.0). Раньше сбой терялся молча — теперь
+-- каждый фиксируется строкой, чтобы его было видно в суточной сводке.
+CREATE TABLE IF NOT EXISTS agent_failures (
+    id         BIGSERIAL PRIMARY KEY,
+    agent      TEXT NOT NULL,
+    ts         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    error_type TEXT NOT NULL,                 -- compute | db_write
+    exc_type   TEXT,
+    detail     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_agent_failures ON agent_failures (agent, ts DESC);
 
 -- Заключения аналитических агентов (Этап 3).
 CREATE TABLE IF NOT EXISTS agent_outputs (

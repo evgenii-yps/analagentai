@@ -52,6 +52,7 @@ SIGNALS_HEADER: list[str] = [
     "status",
     "rationale",
     "agents_payload_json",
+    "logic_version",
 ]
 
 # Заголовок листа «Сводка по дням» — порядок из §7.2.
@@ -70,6 +71,7 @@ SUMMARY_HEADER: list[str] = [
     "avg_pnl_sell_4h",
     "avg_drawdown_4h",
     "avg_probability",
+    "logic_version_dominant",
 ]
 
 # Ограничения длины текста (Google Таблица / Notion).
@@ -233,6 +235,8 @@ def build_signal_row(signal: dict[str, Any]) -> list[Any]:
         signal.get("status") or "",
         rationale,
         _payload_json(signal.get("agents_payload")),
+        # Версия логики последней колонкой, чтобы не сдвигать существующие (§D.3).
+        int(signal["logic_version"]) if signal.get("logic_version") is not None else 1,
     ]
 
 
@@ -264,6 +268,8 @@ def build_summary_row(row: dict[str, Any]) -> list[Any]:
         _num(_round_or_none(row.get("avg_pnl_sell"), 4)),
         _num(_round_or_none(row.get("avg_dd"), 4)),
         _rate(row.get("avg_prob")),
+        # Преобладающая версия логики за сутки (§D.3).
+        int(row["logic_version_dominant"]) if row.get("logic_version_dominant") is not None else 1,
     ]
 
 

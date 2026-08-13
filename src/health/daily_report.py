@@ -263,6 +263,43 @@ def section_signals_24h() -> list[str]:
     return lines
 
 
+def section_agent_failures() -> list[str]:
+    """Сбои итераций агентов за 24 часа (Этап 7.0, Задача B).
+
+    Раньше сбой агента терялся молча (только warning в лог) — так 14% выводов
+    Market Agent пропали незаметно. Теперь каждый сбой — строка в agent_failures,
+    и здесь виден их счётчик по агентам с разбивкой compute/db_write.
+    """
+    lines = ["<b>🩺 Сбои агентов за 24 часа</b>"]
+    out = _psql(
+        "SELECT agent, "
+        "count(*) FILTER (WHERE error_type='compute'), "
+        "count(*) FILTER (WHERE error_type='db_write'), "
+        "count(*) "
+        "FROM agent_failures WHERE ts > now() - interval '24 hours' "
+        "GROUP BY agent ORDER BY agent;"
+    )
+    if not out:
+        lines.append("🟢 Сбоев не зафиксировано.")
+        return lines
+    total = 0
+    for row in out.splitlines():
+        parts = row.split("|")
+        if len(parts) < 4:
+            continue
+        agent, compute, db_write, cnt = parts[0], parts[1], parts[2], parts[3]
+        try:
+            total += int(cnt)
+        except ValueError:
+            pass
+        lines.append(
+            f"🔴 {_esc(agent)}: {cnt} (расчёт {compute}, запись в БД {db_write})"
+        )
+    if total == 0:
+        return ["<b>🩺 Сбои агентов за 24 часа</b>", "🟢 Сбоев не зафиксировано."]
+    return lines
+
+
 def section_db_and_errors() -> list[str]:
     lines = ["<b>🗄 БД и ошибки</b>"]
     size = _psql("SELECT pg_size_pretty(pg_database_size(current_database()));")
@@ -287,6 +324,7 @@ def build_message() -> str:
         "\n".join(section_heartbeats()),
         "\n".join(section_data_24h()),
         "\n".join(section_signals_24h()),
+        "\n".join(section_agent_failures()),
         "\n".join(section_db_and_errors()),
     ]
     return "\n\n".join(blocks)

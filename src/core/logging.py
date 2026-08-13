@@ -25,6 +25,13 @@ def setup_logging() -> None:
         level=level,
     )
 
+    # Дефект D-5: httpx на уровне INFO печатает полный URL запроса, а у Telegram
+    # Bot API токен зашит прямо в URL (…/bot<TOKEN>/sendMessage). Поднимаем порог
+    # логгера httpx до WARNING, чтобы токен не утекал в логи сервисов bot/notify/
+    # export (и любых других, использующих httpx). Секреты — только в .env.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
     # Читаемый рендер для терминала, JSON — для прода (когда stdout не TTY).
     is_tty = sys.stdout.isatty()
     renderer: structlog.types.Processor = (

@@ -289,6 +289,53 @@ class DB:
         """
         return await self.pool.fetch(query, instrument_id, limit)
 
+    async def ensure_agent_failure_schema(self) -> None:
+        """Идемпотентно создаёт таблицу учёта сбоев агентов (Этап 7.0, Задача B).
+
+        Сбой итерации агента раньше терялся молча (только warning в лог). Теперь
+        каждый сбой — строка здесь, чтобы его можно было посчитать за период
+        (суточная сводка) и отличить ошибку расчёта от ошибки записи в БД.
+        """
+        await self.pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_failures (
+                id         BIGSERIAL PRIMARY KEY,
+                agent      TEXT NOT NULL,
+                ts         TIMESTAMPTZ NOT NULL DEFAULT now(),
+                error_type TEXT NOT NULL,   -- 'compute' | 'db_write'
+                exc_type   TEXT,            -- имя класса исключения
+                detail     TEXT             -- усечённое сообщение (без секретов)
+            );
+            """
+        )
+        await self.pool.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_failures "
+            "ON agent_failures (agent, ts DESC);"
+        )
+
+    async def record_agent_failure(
+        self,
+        agent: str,
+        error_type: str,
+        exc_type: str,
+        detail: str,
+    ) -> None:
+        """INSERT записи о сбое агента.
+
+        Для ошибок записи в БД (``error_type='db_write'``) сам этот INSERT может
+        не пройти (БД недоступна) — вызывающий код обязан обернуть его в
+        try/except и не падать. Такой сбой всё равно виден по устаревшему
+        heartbeat и другим ошибкам БД.
+        """
+        await self.pool.execute(
+            "INSERT INTO agent_failures (agent, error_type, exc_type, detail) "
+            "VALUES ($1, $2, $3, $4);",
+            agent,
+            error_type,
+            exc_type,
+            detail[:300],
+        )
+
     async def save_agent_output(self, output: AgentOutput) -> None:
         """INSERT заключения агента в ``agent_outputs``."""
         query = """
@@ -324,6 +371,18 @@ class DB:
         row = await self.pool.fetchrow(query, agent, instrument_id)
         return dict(row) if row is not None else None
 
+    async def ensure_signals_logic_version(self) -> None:
+        """Идемпотентно добавляет колонку ``logic_version`` (Этап 7.0, Задача D).
+
+        Граница режимов: сигналы «до» правок Этапа 7.0 остаются с версией 1
+        (DEFAULT), новые Decision Agent пишет с версией из константы кода. Старые
+        и новые сигналы статистически несравнимы — версия позволяет их разделять.
+        """
+        await self.pool.execute(
+            "ALTER TABLE signals "
+            "ADD COLUMN IF NOT EXISTS logic_version SMALLINT NOT NULL DEFAULT 1;"
+        )
+
     async def save_signal(
         self,
         instrument_id: int,
@@ -331,12 +390,18 @@ class DB:
         probability: float,
         agents_payload: list[dict[str, Any]],
         rationale: str,
+        logic_version: int,
     ) -> None:
-        """INSERT итогового решения в ``signals`` (status остаётся 'open')."""
+        """INSERT итогового решения в ``signals`` (status остаётся 'open').
+
+        ``logic_version`` — версия логики агрегации/агентов (константа кода
+        Decision Agent, а не настройка), фиксирует границу режимов Этапа 7.0.
+        """
         query = """
             INSERT INTO signals
-                (instrument_id, decision, probability, agents_payload, rationale)
-            VALUES ($1, $2, $3, $4::jsonb, $5);
+                (instrument_id, decision, probability, agents_payload, rationale,
+                 logic_version)
+            VALUES ($1, $2, $3, $4::jsonb, $5, $6);
         """
         await self.pool.execute(
             query,
@@ -345,6 +410,7 @@ class DB:
             float(probability),
             json.dumps(agents_payload),
             rationale,
+            int(logic_version),
         )
 
     # --- Уведомления (Этап 5) ---

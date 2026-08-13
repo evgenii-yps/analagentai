@@ -33,7 +33,8 @@ _SIGNAL_COLUMNS = """
     e4.price_at_close  AS p_close_4h,
     e4.pnl_pct         AS pnl_4h,
     e4.drawdown_pct    AS dd_4h,
-    e4.success         AS succ_4h
+    e4.success         AS succ_4h,
+    s.logic_version    AS logic_version
 """
 
 _SIGNAL_JOINS = """
@@ -145,7 +146,8 @@ async def fetch_daily_summary(
             avg(CASE WHEN s.decision = 'buy'  THEN e4.pnl_pct END) AS avg_pnl_buy,
             avg(CASE WHEN s.decision = 'sell' THEN e4.pnl_pct END) AS avg_pnl_sell,
             avg(e4.drawdown_pct) AS avg_dd,
-            avg(s.probability)   AS avg_prob
+            avg(s.probability)   AS avg_prob,
+            mode() WITHIN GROUP (ORDER BY s.logic_version) AS logic_version_dominant
         FROM signals s
         LEFT JOIN signal_evaluations e4
                ON e4.signal_id = s.id AND e4.horizon = '4h'
