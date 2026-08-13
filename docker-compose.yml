@@ -3,17 +3,23 @@ services:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-agenttrade}
+      # Без дефолта: пароль генерируется scripts/init_env.sh и берётся из .env.
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB:-agenttrade}
     volumes:
       - pg_data:/var/lib/postgresql/data
       # DDL применяется автоматически при первой инициализации БД.
       - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+claude/local-stack-exchange-audit-so6rjz
+    # Порт НЕ публикуется на хост: PostgreSQL доступен только внутри Docker-сети
+    # (сервер с публичным IP). Для локальной отладки — override-compose.
+=======
     # Порт публикуется ТОЛЬКО на localhost сервера (§6.3 ТЗ 6.5): наружу 5432
     # закрыт навсегда (доступ к БД — только с самого сервера / из docker-сети).
     ports:
       - "127.0.0.1:5432:5432"
     restart: unless-stopped
+claude/agent-trade-infra-stage-1-7hb1p0
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-agenttrade} -d ${POSTGRES_DB:-agenttrade}"]
       interval: 5s
@@ -22,22 +28,37 @@ services:
 
   redis:
     image: redis:7-alpine
+    # requirepass — defense in depth: даже внутри Docker-сети Redis требует auth.
+    # Пустой пароль (нет .env) → requirepass "" = без пароля.
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}"]
+    environment:
+      # redis-cli автоматически берёт пароль из REDISCLI_AUTH (пусто → без auth).
+      REDISCLI_AUTH: ${REDIS_PASSWORD}
     volumes:
       - redis_data:/data
+claude/local-stack-exchange-audit-so6rjz
+    # Порт НЕ публикуется на хост: Redis доступен только внутри Docker-сети.
+=======
     # Порт публикуется ТОЛЬКО на localhost сервера (§6.3 ТЗ 6.5): наружу 6379
     # закрыт навсегда.
     ports:
       - "127.0.0.1:6379:6379"
     restart: unless-stopped
+claude/agent-trade-infra-stage-1-7hb1p0
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
       interval: 5s
       timeout: 5s
       retries: 5
 
   collector:
     build: .
-    env_file: .env
+    # .env необязателен: без него применяются согласованные дефолты из
+    # src/core/config.py, поэтому стек стартует в ноль ручных шагов. Если .env
+    # присутствует (реальные секреты/Telegram-токен на сервере) — он переопределяет.
+    env_file:
+      - path: .env
+        required: false
     depends_on:
       postgres:
         condition: service_healthy
@@ -55,7 +76,12 @@ services:
 
   agents:
     build: .
-    env_file: .env
+    # .env необязателен: без него применяются согласованные дефолты из
+    # src/core/config.py, поэтому стек стартует в ноль ручных шагов. Если .env
+    # присутствует (реальные секреты/Telegram-токен на сервере) — он переопределяет.
+    env_file:
+      - path: .env
+        required: false
     depends_on:
       postgres:
         condition: service_healthy
@@ -73,7 +99,12 @@ services:
 
   decision:
     build: .
-    env_file: .env
+    # .env необязателен: без него применяются согласованные дефолты из
+    # src/core/config.py, поэтому стек стартует в ноль ручных шагов. Если .env
+    # присутствует (реальные секреты/Telegram-токен на сервере) — он переопределяет.
+    env_file:
+      - path: .env
+        required: false
     depends_on:
       postgres:
         condition: service_healthy
@@ -91,7 +122,12 @@ services:
 
   notify:
     build: .
-    env_file: .env
+    # .env необязателен: без него применяются согласованные дефолты из
+    # src/core/config.py, поэтому стек стартует в ноль ручных шагов. Если .env
+    # присутствует (реальные секреты/Telegram-токен на сервере) — он переопределяет.
+    env_file:
+      - path: .env
+        required: false
     depends_on:
       postgres:
         condition: service_healthy
@@ -109,7 +145,12 @@ services:
 
   evaluator:
     build: .
-    env_file: .env
+    # .env необязателен: без него применяются согласованные дефолты из
+    # src/core/config.py, поэтому стек стартует в ноль ручных шагов. Если .env
+    # присутствует (реальные секреты/Telegram-токен на сервере) — он переопределяет.
+    env_file:
+      - path: .env
+        required: false
     depends_on:
       postgres:
         condition: service_healthy
@@ -125,6 +166,27 @@ services:
       retries: 3
       start_period: 20s
 
+ claude/local-stack-exchange-audit-so6rjz
+  # Этап 6.4: разовый аудит доступности бирж и ликвидности пар.
+  # Не поднимается автоматически (profile). Запуск одной командой:
+  #   docker compose run --rm audit
+  # Результат — в таблицах exchange_audit/pair_audit и в reports/ (том смонтирован).
+  audit:
+    build: .
+    # .env необязателен: без него применяются согласованные дефолты из
+    # src/core/config.py, поэтому стек стартует в ноль ручных шагов. Если .env
+    # присутствует (реальные секреты/Telegram-токен на сервере) — он переопределяет.
+    env_file:
+      - path: .env
+        required: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles: ["audit"]
+    volumes:
+      - ./reports:/app/reports
+    command: ["python", "-m", "scripts.exchange_audit", "--source-ip-label", "local"]
+
   # Этап 6.6: разовая выгрузка сигналов в Google Таблицу и Notion.
   # profiles: ["tools"] — сервис НЕ поднимается обычным `docker compose up -d`
   # (иначе появился бы лишний постоянный контейнер). Запускается вручную/из cron:
@@ -138,6 +200,7 @@ services:
     depends_on: [postgres, redis]
     command: ["python", "-m", "src.export_main"]
     restart: "no"
+ claude/agent-trade-infra-stage-1-7hb1p0
 
 volumes:
   pg_data:

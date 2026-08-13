@@ -17,8 +17,10 @@ class Settings(BaseSettings):
 
     # --- PostgreSQL ---
     POSTGRES_USER: str = "agenttrade"
-    # Пароль обязателен: при его отсутствии приложение падает на старте
-    # с понятной ошибкой валидации (field required).
+    # Дефолта НЕТ намеренно: константный пароль в коде недопустим для сервера с
+    # публичным IP. Секрет генерируется криптографически при первом старте
+    # (scripts/init_env.sh) и передаётся через .env. Без него приложение падает
+    # на старте с понятной ошибкой валидации (field required).
     POSTGRES_PASSWORD: str
     POSTGRES_DB: str = "agenttrade"
     PG_HOST: str = "postgres"
@@ -27,12 +29,15 @@ class Settings(BaseSettings):
     # --- Redis ---
     REDIS_HOST: str = "redis"
     REDIS_PORT: int = 6379
+    # Пароль Redis (defense in depth). Генерируется тем же scripts/init_env.sh.
+    # Пусто → подключение без пароля (порт при этом не публикуется наружу).
+    REDIS_PASSWORD: str = ""
 
     # --- Логирование ---
     LOG_LEVEL: str = "INFO"
 
     # --- Сбор данных (Этап 2) ---
-    EXCHANGE: str = "binance"
+    EXCHANGE: str = "okx"               # пилотная биржа (Binance/Bybit отдают 451 из EU)
     SYMBOL: str = "BTC/USDT"            # спотовый символ
     SWAP_SYMBOL: str = "BTC/USDT:USDT"  # бессрочный фьючерс (swap)
     TIMEFRAMES: str = "1m,5m,15m,1h"    # таймфреймы свечей через запятую

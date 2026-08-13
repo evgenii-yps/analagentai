@@ -17,6 +17,8 @@ def get_redis() -> redis.Redis:
         _client = redis.Redis(
             host=settings.REDIS_HOST,
             port=settings.REDIS_PORT,
+            # Пароль опционален: пусто → без auth (см. config.REDIS_PASSWORD).
+            password=settings.REDIS_PASSWORD or None,
             decode_responses=True,
         )
     return _client

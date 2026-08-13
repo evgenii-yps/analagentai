@@ -11,8 +11,9 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Затем исходный код.
+# Затем исходный код и служебные скрипты (аудит бирж запускается из образа).
 COPY src/ ./src/
+COPY scripts/ ./scripts/
 
 # По умолчанию запускаем точку входа приложения.
 CMD ["python", "-m", "src.main"]
