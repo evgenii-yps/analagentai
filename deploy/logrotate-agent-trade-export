@@ -1,0 +1,15 @@
+# Ротация лога выгрузки сигналов Agent Trade (Этап 6.6), 14 дней.
+# Установка:
+#   sudo cp deploy/logrotate-agent-trade-export /etc/logrotate.d/agent-trade-export
+#   sudo chmod 644 /etc/logrotate.d/agent-trade-export
+
+/opt/agent-trade/logs/export.log {
+    daily
+    rotate 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su agent agent
+}

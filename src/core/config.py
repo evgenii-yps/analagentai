@@ -75,6 +75,20 @@ class Settings(BaseSettings):
     EVAL_PRIMARY_HORIZON: str = "4h"  # главный горизонт (сводка в signals)
     STATS_LOG_INTERVAL: int = 3600    # сек между логами статистики
 
+    # --- Выгрузка сигналов (Этап 6.6) ---
+    # Секреты без значения по умолчанию заданы пустой строкой умышленно: это
+    # позволяет остальным сервисам стека и CI импортировать Settings без их
+    # наличия. Обязательность проверяется в самом скрипте выгрузки в рантайме
+    # (пустое значение → алерт и выход, «значение по умолчанию» не подставляется).
+    EXPORT_ENABLED: bool = True       # общий выключатель выгрузки
+    EXPORT_BATCH_SIZE: int = 500      # строк в одном запросе к Google Таблице
+    SHEETS_WEBAPP_URL: str = ""       # URL веб-приложения Apps Script (обязателен)
+    SHEETS_SHARED_SECRET: str = ""    # общий секрет Apps Script ↔ .env (обязателен)
+    NOTION_API_TOKEN: str = ""        # внутренний токен интеграции Notion (обязателен)
+    # База «Журнал сигналов» — ID известен и зафиксирован в ТЗ.
+    NOTION_SIGNALS_DB_ID: str = "dacf5b37-f606-40cb-b0b9-89c51762e464"
+    EXPORT_NOTION_ONLY_NOTIFIED: bool = True  # в Notion только сигналы с notified_at
+
     @property
     def eval_horizons_list(self) -> list[str]:
         """Разбирает строку EVAL_HORIZONS в список горизонтов."""
@@ -106,6 +120,19 @@ class Settings(BaseSettings):
             f"postgresql://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}"
             f"@{self.PG_HOST}:{self.PG_PORT}/{self.POSTGRES_DB}"
         )
+
+
+def mask_secret(value: str) -> str:
+    """Маскирует секрет, оставляя видимыми только последние 4 символа.
+
+    Пустая строка → ``<пусто>``. Короткие значения (≤4) маскируются целиком,
+    чтобы не раскрывать их полностью в логах и отчёте.
+    """
+    if not value:
+        return "<пусто>"
+    if len(value) <= 4:
+        return "*" * len(value)
+    return "*" * (len(value) - 4) + value[-4:]
 
 
 # Глобальный синглтон конфигурации.

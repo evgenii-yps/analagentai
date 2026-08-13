@@ -1,0 +1,12 @@
+# Agent Trade — команда запуска установщика на сервере.
+#
+# Репозиторий ПУБЛИЧНЫЙ, поэтому установщик скачивается по HTTPS без секретов
+# (в коде секретов нет — они только в .env, который в репозиторий не попадает).
+#
+# Заказчик открывает веб-консоль сервера (Hetzner: Servers → agent-trade →
+# Console), входит под root и вставляет ОДНУ строку ниже, затем жмёт Enter:
+
+curl -fsSL https://raw.githubusercontent.com/evgenii-yps/analagentai/claude/deployment-installer-script-k9e6t4/deploy/install.sh | sudo bash
+
+# Дальше установщик сам спросит TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID,
+# проверит их, всё развернёт и в конце покажет пароль PostgreSQL — сохраните его.

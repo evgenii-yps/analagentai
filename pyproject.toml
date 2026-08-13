@@ -40,4 +40,8 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
+claude/local-stack-exchange-audit-so6rjz
 packages = ["src", "src.core", "src.collectors", "src.agents", "src.decision", "src.notify", "src.evaluator", "scripts"]
+
+packages = ["src", "src.core", "src.collectors", "src.agents", "src.decision", "src.notify", "src.evaluator", "src.export", "src.health"]
+claude/agent-trade-infra-stage-1-7hb1p0
