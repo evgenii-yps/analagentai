@@ -125,6 +125,22 @@ services:
       retries: 3
       start_period: 20s
 
+  # Этап 6.7: телеграм-бот только на чтение (long polling getUpdates).
+  # Постоянный сервис БЕЗ profiles — поднимается обычным `docker compose up -d`.
+  # Наружу порты НЕ пробрасываются (long polling работает через исходящее
+  # соединение). Сокет Docker в контейнер НЕ пробрасывается (§3.4).
+  bot:
+    build: .
+    env_file: .env
+    depends_on: [postgres, redis]
+    command: ["python", "-m", "src.bot_main"]
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   # Этап 6.6: разовая выгрузка сигналов в Google Таблицу и Notion.
   # profiles: ["tools"] — сервис НЕ поднимается обычным `docker compose up -d`
   # (иначе появился бы лишний постоянный контейнер). Запускается вручную/из cron:

@@ -122,7 +122,7 @@ curl -fsSL https://raw.githubusercontent.com/evgenii-yps/analagentai/claude/depl
 
 ```
 .
-├── docker-compose.yml      # postgres + redis + collector + agents + decision + notify + evaluator
+├── docker-compose.yml      # postgres + redis + collector + agents + decision + notify + evaluator + bot
 ├── Dockerfile              # образ приложения (python:3.12-slim)
 ├── .env.example            # пример переменных окружения
 ├── pyproject.toml          # метаданные, ruff, pytest
@@ -147,6 +147,7 @@ curl -fsSL https://raw.githubusercontent.com/evgenii-yps/analagentai/claude/depl
 │   ├── notify_main.py      # точка входа — сервис уведомлений
 │   ├── evaluator_main.py   # точка входа — оценщик результатов
 │   ├── export_main.py      # точка входа — выгрузка сигналов (docker compose run)
+│   ├── bot_main.py         # точка входа — телеграм-бот только на чтение (Этап 6.7)
 │   ├── healthcheck.py      # CLI-проверка PG и Redis
 │   ├── core/
 │   │   ├── config.py       # Settings (pydantic-settings)
@@ -158,6 +159,7 @@ curl -fsSL https://raw.githubusercontent.com/evgenii-yps/analagentai/claude/depl
 │   ├── agents/             # Market/Liquidity/Futures + BaseAgent
 │   ├── decision/           # DecisionAgent + логика агрегации
 │   ├── notify/             # NotifyAgent + should_notify + Telegram
+│   ├── bot/                # телеграм-бот на чтение: poller/handlers/queries/runner
 │   ├── evaluator/          # compute_evaluation + класс Evaluator
 │   ├── export/             # выгрузка сигналов (Этап 6.6)
 │   │   ├── transform.py    # чистые функции: строки листов, окно 4ч, свойства Notion
