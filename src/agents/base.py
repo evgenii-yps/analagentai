@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import traceback
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -252,13 +253,21 @@ class BaseAgent(abc.ABC):
         затяжной сбой рано или поздно проявится и устареванием heartbeat.
         """
         exc_type = type(exc).__name__
-        detail = str(exc)
+        message = str(exc)
         self._log.warning(
             "Сбой итерации агента",
             error_type=error_type,
             exc_type=exc_type,
-            error=detail[:300],
+            error=message[:300],
         )
+
+        # В agent_failures.detail пишем ПОЛНУЮ ТРАССИРОВКУ (а не дубль сообщения):
+        # без неё «No numeric types to aggregate» не показывает, где именно упало.
+        # Берём traceback из самого исключения (exc.__traceback__), а не из
+        # sys.exc_info(), чтобы вложенные try/except ниже его не «затёрли».
+        detail = "".join(
+            traceback.format_exception(type(exc), exc, exc.__traceback__)
+        ) or message
 
         # Строка в БД — для подсчёта за период (суточная сводка). Для db_write
         # сам INSERT может не пройти (БД недоступна) — не падаем из-за этого.

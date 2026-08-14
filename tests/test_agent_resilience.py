@@ -96,6 +96,33 @@ async def test_non_empty_read_resets_empty_streak(patched) -> None:
     assert patched["reconnect"] == 0
 
 
+async def test_record_failure_writes_full_traceback(monkeypatch) -> None:
+    # В agent_failures.detail должна попасть ТРАССИРОВКА, а не дубль сообщения.
+    captured: dict[str, str] = {}
+
+    async def fake_record(agent, error_type, exc_type, detail) -> None:
+        captured["exc_type"] = exc_type
+        captured["detail"] = detail
+
+    async def fake_bump() -> None:
+        return None
+
+    monkeypatch.setattr(base.db, "record_agent_failure", fake_record)
+    agent = _DummyAgent()
+    monkeypatch.setattr(agent, "_bump_failure_streak", fake_bump)
+
+    try:
+        raise ValueError("No numeric types to aggregate")
+    except ValueError as exc:
+        await agent._record_failure(base.FAILURE_COMPUTE, exc)
+
+    assert captured["exc_type"] == "ValueError"
+    # Признаки трассировки, а не просто текста сообщения.
+    assert "Traceback (most recent call last)" in captured["detail"]
+    assert "ValueError: No numeric types to aggregate" in captured["detail"]
+    assert "test_agent_resilience.py" in captured["detail"]
+
+
 async def test_success_resets_failure_streak(patched) -> None:
     agent = _DummyAgent()
     agent._consecutive_failures = 7
