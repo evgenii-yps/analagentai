@@ -120,7 +120,15 @@ def adx(
     plus_di = 100.0 * plus_dm.ewm(alpha=1.0 / period, adjust=False).mean() / atr_w
     minus_di = 100.0 * minus_dm.ewm(alpha=1.0 / period, adjust=False).mean() / atr_w
 
-    di_sum = (plus_di + minus_di).replace(0.0, pd.NA)
+    # Деление на ноль там, где plus_di + minus_di == 0 (нет направленного
+    # движения: постоянные high/low). Раньше 0 заменялся на ``pd.NA`` — и это
+    # был корень инцидента: ``pd.NA`` во float-ряду делает его dtype=object, а
+    # следующий ``ewm().mean()`` на object-ряде падает («No numeric types to
+    # aggregate» / ``float()`` от ``NAType``). Пропуск помечаем ``np.nan`` (не
+    # ``pd.NA``): ряд остаётся float, nan штатно протягивается ``ewm`` и гасится
+    # финальным ``fillna(0.0)``. ``where(cond)`` без ``other`` подставляет np.nan.
+    di_sum = plus_di + minus_di
+    di_sum = di_sum.where(di_sum != 0.0)
     dx = 100.0 * (plus_di - minus_di).abs() / di_sum
     adx_series = dx.ewm(alpha=1.0 / period, adjust=False).mean().fillna(0.0)
     return adx_series, plus_di.fillna(0.0), minus_di.fillna(0.0)
@@ -193,6 +201,23 @@ def analyze_ohlcv(
     atr_series = atr(high, low, close)
     macd_line, macd_signal, macd_hist = macd(close)
     adx_series, plus_di, minus_di = adx(high, low, close)
+
+    # Защита ПОСЛЕ промежуточных шагов (Этап 7.2, доработка A1): корень инцидента
+    # был не на входе (вход чистый — 250 float64-свечей), а ВНУТРИ вычислений —
+    # pd.NA превращал промежуточный ряд в object. Проверяем, что каждый расчётный
+    # ряд остался числовым; если нет — insufficient_data, а НЕ исключение на
+    # последующих .iloc[-1]/агрегациях. Это ловит и будущие регрессии такого рода.
+    _intermediate = (
+        ema_fast, ema_mid, ema_slow, rsi_series, atr_series,
+        macd_line, macd_signal, macd_hist, adx_series, plus_di, minus_di,
+    )
+    if any(not is_numeric_dtype(s) for s in _intermediate):
+        return (
+            "insufficient_data",
+            0.0,
+            {"n_candles": n, "min_candles": min_candles},
+            "Промежуточный ряд расчёта перестал быть числовым — вывод отложен.",
+        )
 
     support = float(low.rolling(_SR_LOOKBACK).min().iloc[-1])
     resistance = float(high.rolling(_SR_LOOKBACK).max().iloc[-1])

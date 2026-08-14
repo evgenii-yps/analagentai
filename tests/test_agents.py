@@ -6,12 +6,13 @@
 
 import numpy as np
 import pandas as pd
+from pandas.api.types import is_numeric_dtype
 
 from src.agents.base import normalize_confidence
 from src.agents.futures import analyze_futures
 from src.agents.liquidity import CONFIDENCE_SCALE as LIQ_SCALE
 from src.agents.liquidity import analyze_orderbook
-from src.agents.market import _round, analyze_ohlcv, ema, rsi
+from src.agents.market import _round, adx, analyze_ohlcv, ema, rsi
 
 
 def _make_ohlcv(closes: list[float]) -> pd.DataFrame:
@@ -276,3 +277,45 @@ def test_market_missing_columns_dataframe_is_insufficient_not_exception() -> Non
     signal, confidence, _, _ = analyze_ohlcv(df, min_candles=200)
     assert signal == "insufficient_data"
     assert confidence == 0.0
+
+
+# --- Задача 7.2 (доработка): pd.NA внутри adx() → object → крах ewm() ---
+
+def _flat_hl_ohlcv(n: int = 60) -> pd.DataFrame:
+    """OHLCV с ПОСТОЯННЫМИ high/low (нет направленного движения), но tr>0.
+
+    high.diff()==0 и low.diff()==0 → plus_dm=minus_dm=0 → plus_di=minus_di=0 →
+    plus_di+minus_di == 0. Раньше это заменялось на pd.NA, dx становился object,
+    и adx()'s ewm().mean() падал (TypeError NAType / «No numeric types to aggregate»).
+    """
+    close = np.full(n, 100.0)
+    return pd.DataFrame(
+        {
+            "open": close,
+            "high": np.full(n, 105.0),  # постоянный high
+            "low": np.full(n, 95.0),    # постоянный low
+            "close": close,
+            "volume": np.full(n, 10.0),
+        }
+    )
+
+
+def test_adx_zero_di_sum_does_not_crash() -> None:
+    # Прямой вызов adx() на участке plus_di+minus_di == 0. Тест ОБЯЗАН падать на
+    # текущем коде (pd.NA → object → ewm крашится) и проходить после правки.
+    df = _flat_hl_ohlcv(60)
+    adx_series, plus_di, minus_di = adx(df["high"], df["low"], df["close"])
+    assert is_numeric_dtype(adx_series)
+    assert is_numeric_dtype(plus_di)
+    assert is_numeric_dtype(minus_di)
+    # Нет направленного движения → ADX и оба DI должны быть 0, без NaN/исключений.
+    assert float(adx_series.iloc[-1]) == 0.0
+
+
+def test_market_flat_high_low_is_insufficient_or_neutral_not_exception() -> None:
+    # Тот же вырожденный вход, но через полный analyze_ohlcv (≥200 свечей): не
+    # должно быть исключения — либо neutral, либо insufficient_data.
+    df = _flat_hl_ohlcv(260)
+    signal, confidence, _, _ = analyze_ohlcv(df, min_candles=200)
+    assert signal in {"neutral", "insufficient_data"}
+    assert 0.0 <= confidence <= 1.0

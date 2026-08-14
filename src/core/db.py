@@ -18,6 +18,11 @@ if TYPE_CHECKING:
     # Импорт только для аннотаций — без циклической зависимости в рантайме.
     from src.agents.base import AgentOutput
 
+# Потолок длины agent_failures.detail. Теперь туда пишется полная трассировка
+# (Этап 7.2), а не короткое сообщение, поэтому держим больше и сохраняем ХВОСТ
+# (нижние кадры трассировки = место падения). Столбец TEXT, жёсткого лимита нет.
+_FAILURE_DETAIL_MAX = 4000
+
 
 class DB:
     """Обёртка над ``asyncpg.Pool`` с методами доступа к данным."""
@@ -362,14 +367,21 @@ class DB:
         ``error_type`` — ``'compute'`` | ``'db_write'`` | ``'auto_reset'`` (Этап
         7.2: факт самовосстановления агента). ``exc_type`` может быть ``None``
         (например, для ``auto_reset`` — это не исключение, а служебное событие).
+
+        ``detail`` — обычно ПОЛНАЯ ТРАССИРОВКА исключения (для compute/db_write),
+        поэтому обрезаем не в 300 символов (это резало трассировку), а держим
+        последние ``_FAILURE_DETAIL_MAX`` символов: у трассировки самое полезное —
+        нижние кадры (место падения), они как раз в хвосте.
         """
+        if len(detail) > _FAILURE_DETAIL_MAX:
+            detail = detail[-_FAILURE_DETAIL_MAX:]
         await self.pool.execute(
             "INSERT INTO agent_failures (agent, error_type, exc_type, detail) "
             "VALUES ($1, $2, $3, $4);",
             agent,
             error_type,
             exc_type,
-            detail[:300],
+            detail,
         )
 
     async def save_agent_output(self, output: AgentOutput) -> None:
