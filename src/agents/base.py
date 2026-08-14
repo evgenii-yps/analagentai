@@ -12,7 +12,7 @@ import structlog
 
 from src.core.config import settings
 from src.core.db import db
-from src.core.redis_client import get_redis
+from src.core.redis_client import close_redis, get_redis
 from src.notify.telegram import send_message
 
 # TTL heartbeat-ключа агента в Redis (секунды).
@@ -27,6 +27,9 @@ SIGNAL_INSUFFICIENT = "insufficient_data"
 # Типы сбоя итерации (Задача B): ошибка расчёта vs ошибка записи в БД.
 FAILURE_COMPUTE = "compute"
 FAILURE_DB_WRITE = "db_write"
+# Служебное событие самовосстановления (Этап 7.2, Задача A1): не ошибка итерации,
+# а факт того, что агент сам сбросил состояние после серии сбоев.
+FAILURE_AUTO_RESET = "auto_reset"
 
 
 def normalize_confidence(raw: float, scale: float) -> float:
@@ -94,11 +97,52 @@ class BaseAgent(abc.ABC):
         self.interval = interval
         self.instrument_id = instrument_id
         self._log = structlog.get_logger().bind(agent=name)
+        # Серия сбоев подряд В ПАМЯТИ процесса (Этап 7.2). Отдельно от счётчика в
+        # Redis (тот — для алерта): самовосстановление НЕ должно зависеть от Redis,
+        # ведь испорченным может быть как раз внешнее состояние.
+        self._consecutive_failures = 0
+        # Серия ПУСТЫХ выборок подряд при живом сервисе. Это ровно симптом
+        # инцидента 14.08 (полная БД, но пустой ответ) — а он НЕ вызывает
+        # исключения (штатный insufficient_data), поэтому счётчик сбоев его не
+        # ловит. Отдельный счётчик доводит и этот симптом до самовосстановления.
+        self._empty_read_streak = 0
 
     @abc.abstractmethod
     async def analyze(self, instrument_id: int) -> AgentOutput:
         """Читает свои данные, считает показатели и возвращает заключение."""
         raise NotImplementedError
+
+    async def reset_state(self) -> None:
+        """Сбрасывает внутреннее состояние агента (Этап 7.2, Задача A1).
+
+        Хук самовосстановления: вызывается при серии сбоев подряд. Базовые агенты
+        состояния между итерациями НЕ хранят (выборка строится от ``now()`` каждый
+        раз заново), поэтому по умолчанию сбрасывать нечего — метод существует как
+        явная точка расширения и как контракт «состояние можно обнулить».
+        """
+        return None
+
+    async def _note_read(self, is_empty: bool) -> None:
+        """Учитывает пустую/непустую выборку для самовосстановления (Этап 7.2).
+
+        Пустой ответ при живом сервисе — это симптом инцидента 14.08 (полная БД,
+        но выборка пуста). Он НЕ бросает исключения (агент штатно отдаёт
+        insufficient_data), поэтому счётчик сбоев его не увидит и авто-сброс не
+        сработает — агент молчал бы до внешнего вмешательства. Здесь серия пустых
+        ответов подряд доводится до того же ``_auto_reset`` (проверка живости и
+        переоткрытие соединения), что и серия сбоев.
+        """
+        if not is_empty:
+            self._empty_read_streak = 0
+            return
+        self._empty_read_streak += 1
+        threshold = settings.AGENT_AUTO_RESET_STREAK
+        if threshold > 0 and self._empty_read_streak >= threshold:
+            self._log.warning(
+                "Пустая выборка подряд при живом сервисе — самовосстановление",
+                streak=self._empty_read_streak,
+            )
+            await self._auto_reset(self._empty_read_streak)
 
     async def run(self) -> None:
         """Бесконечный цикл: analyze → сохранить → heartbeat → пауза.
@@ -127,6 +171,7 @@ class BaseAgent(abc.ABC):
             raise
         except Exception as exc:  # noqa: BLE001 — фиксируем и продолжаем
             await self._record_failure(FAILURE_COMPUTE, exc)
+            await self._after_failure()
             return
 
         # 2. Запись (ошибка здесь = временная недоступность БД).
@@ -136,6 +181,7 @@ class BaseAgent(abc.ABC):
             raise
         except Exception as exc:  # noqa: BLE001
             await self._record_failure(FAILURE_DB_WRITE, exc)
+            await self._after_failure()
             return
 
         # 3. Успех: сбрасываем серию сбоев, обновляем heartbeat, логируем.
@@ -146,6 +192,58 @@ class BaseAgent(abc.ABC):
             signal=output.signal,
             confidence=output.confidence,
         )
+
+    async def _after_failure(self) -> None:
+        """Обслуживает серию сбоев подряд: при достижении порога — самосброс.
+
+        Инцидент 14.08: система 8 часов ждала внешнего вмешательства (перезапуск
+        контейнера вотчдогом). Здесь агент восстанавливается сам — при
+        ``AGENT_AUTO_RESET_STREAK`` сбоях подряд сбрасывает внутреннее состояние и
+        переоткрывает долгоживущие соединения (пул БД + клиент Redis), в которых и
+        может «залипнуть» испорченное состояние процесса.
+        """
+        self._consecutive_failures += 1
+        threshold = settings.AGENT_AUTO_RESET_STREAK
+        if threshold > 0 and self._consecutive_failures >= threshold:
+            await self._auto_reset(self._consecutive_failures)
+
+    async def _auto_reset(self, streak: int) -> None:
+        """Сбрасывает состояние агента и переоткрывает соединения (Этап 7.2).
+
+        Записывает событие в ``agent_failures`` (``error_type='auto_reset'``),
+        чтобы самовосстановление было видно в суточной сводке. Сам НЕ бросает:
+        любая ошибка сброса логируется, счётчик обнуляется в любом случае — иначе
+        авто-сброс срабатывал бы каждую итерацию.
+        """
+        self._log.warning("Самовосстановление агента: сброс состояния", streak=streak)
+        # 1. Сброс внутреннего состояния агента (хук; у базовых агентов пусто).
+        try:
+            await self.reset_state()
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning("Ошибка сброса состояния агента", error=str(exc))
+        # 2. Переоткрытие пула БД — «мягкий перезапуск» доступа к данным.
+        try:
+            await db.reconnect()
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning("Не удалось переоткрыть пул БД", error=str(exc))
+        # 3. Переоткрытие клиента Redis (следующий вызов get_redis() создаст новый).
+        try:
+            await close_redis()
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning("Не удалось закрыть клиент Redis", error=str(exc))
+        # 4. Фиксируем факт авто-сброса в БД (после reconnect пул уже новый).
+        try:
+            await db.record_agent_failure(
+                self.name,
+                FAILURE_AUTO_RESET,
+                None,
+                f"Автосброс после {streak} сбоев подряд (переоткрыты пул БД и Redis).",
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning("Не удалось записать авто-сброс в БД", error=str(exc))
+        # 5. Обнуляем счётчики: серия «погашена» попыткой восстановления.
+        self._consecutive_failures = 0
+        self._empty_read_streak = 0
 
     async def _record_failure(self, error_type: str, exc: Exception) -> None:
         """Делает сбой видимым: лог с типом, строка в БД, серия сбоев в Redis, алерт.
@@ -195,6 +293,9 @@ class BaseAgent(abc.ABC):
 
     async def _on_success(self) -> None:
         """Сбрасывает серию сбоев после успешной итерации."""
+        # В памяти — для самовосстановления (Этап 7.2).
+        self._consecutive_failures = 0
+        # В Redis — для алерта о серии сбоев.
         try:
             await get_redis().delete(f"agent:failures:streak:{self.name}")
         except Exception as exc:  # noqa: BLE001

@@ -146,6 +146,8 @@ class LiquidityAgent(BaseAgent):
     async def analyze(self, instrument_id: int) -> AgentOutput:
         """Читает снимки стакана и формирует заключение по ликвидности."""
         rows = await db.get_recent_orderbook(instrument_id, _SNAPSHOTS_LIMIT)
+        # Пустой ответ при живом сервисе доводится до самовосстановления (Этап 7.2).
+        await self._note_read(is_empty=(len(rows) == 0))
         snapshots: list[dict[str, Any]] = []
         for r in rows:
             d = dict(r)

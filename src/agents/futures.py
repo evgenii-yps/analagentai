@@ -140,6 +140,8 @@ class FuturesAgent(BaseAgent):
             dict(r)
             for r in await db.get_recent_open_interest(instrument_id, _OI_LIMIT)
         ]
+        # Обе выборки пусты при живом сервисе → доводим до самовосстановления (7.2).
+        await self._note_read(is_empty=(not funding and not oi))
 
         # Цена — только для контекста в метриках (может отсутствовать у swap).
         price: float | None = None

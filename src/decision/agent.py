@@ -30,11 +30,15 @@ DECISION_BUY = "buy"
 DECISION_SELL = "sell"
 DECISION_WAIT = "wait"
 
-# Версия логики агентов/агрегации (Задача D, Этап 7.0). Это свойство КОДА, а не
-# настройки, поэтому константа здесь, а не в .env. Инкрементируется при правках,
-# делающих сигналы несравнимыми с прежними. Версия 2 = после приведения шкал
-# уверенности (Задача A), симметрии Futures (Задача C) и защиты записи (Задача B).
-LOGIC_VERSION = 2
+# Версия логики агентов/агрегации (Задача D). Это свойство КОДА, а не настройки,
+# поэтому константа здесь, а не в .env. Инкрементируется при правках, делающих
+# сигналы несравнимыми с прежними.
+#   v1 — исходная логика.
+#   v2 (Этап 7.0) — приведение шкал уверенности, симметрия Futures, защита записи.
+#   v3 (Этап 7.2) — знаменатель согласованности = полное число агентов (Задача B1):
+#       выпадение агента ПОНИЖАЕТ согласованность (и вероятность). Меняет
+#       probability → статистика v2 и v3 несравнима, окно наблюдения обнуляется.
+LOGIC_VERSION = 3
 
 
 def _is_fresh(output: dict[str, Any], freshness_sec: float, now: datetime) -> bool:
@@ -51,13 +55,21 @@ def make_decision(
     min_agents: int,
     freshness_sec: float,
     now: datetime,
+    total_agents: int | None = None,
 ) -> tuple[str, float, list[dict[str, Any]], str]:
     """Чистая функция агрегации → (decision, probability, agents_payload, rationale).
 
     ``outputs`` — последние выводы агентов (могут быть None / устаревшие /
     ``insufficient_data``). Детерминирована: одинаковый ввод и ``now`` →
     одинаковый результат.
+
+    ``total_agents`` (Задача B1, Этап 7.2) — полное число настроенных агентов
+    (по умолчанию ``len(AGENTS)`` = 3). Согласованность считается относительно
+    ПОЛНОГО состава, а не только свежих: выпадение агента механически понижает
+    согласованность, а не повышает её (как было при знаменателе ``len(fresh)``).
     """
+    if total_agents is None:
+        total_agents = len(AGENTS)
     # 1–2. Отбрасываем отсутствующие, устаревшие и insufficient_data.
     fresh: list[dict[str, Any]] = []
     for output in outputs:
@@ -106,10 +118,13 @@ def make_decision(
         decision = DECISION_WAIT
 
     # 6. Вероятность: |балл| усиленный согласованностью направлений.
+    # Знаменатель согласованности — ПОЛНОЕ число агентов (Задача B1), а не число
+    # свежих: иначе выпадение агента механически завышало бы согласованность
+    # (напр. #8205: |1-0|/2=0.50 вместо |1-0|/3=0.33 → prob 0.72 вместо ≈0.64).
     directions = [_SIGNAL_VALUE[o["signal"]] for o in fresh]
     pos = sum(1 for d in directions if d > 0)
     neg = sum(1 for d in directions if d < 0)
-    agreement = abs(pos - neg) / len(fresh)
+    agreement = abs(pos - neg) / total_agents if total_agents > 0 else 0.0
     probability = round(min(abs(score) * (0.5 + 0.5 * agreement), 1.0), 4)
 
     # 7. Объяснение.
@@ -159,7 +174,12 @@ class DecisionAgent:
             min_agents=self.min_agents,
             freshness_sec=self.freshness_sec,
             now=datetime.now(UTC),
+            total_agents=len(AGENTS),
         )
+        # Деградация (Задача A2): в решении участвовало меньше полного состава.
+        # payload содержит РОВНО свежие содержательные выводы (insufficient_data и
+        # устаревшие уже отфильтрованы), поэтому его длина = число «живых» агентов.
+        degraded = len(payload) < len(AGENTS)
         await db.save_signal(
             self.instrument_id,
             decision,
@@ -167,12 +187,14 @@ class DecisionAgent:
             payload,
             rationale,
             logic_version=LOGIC_VERSION,
+            degraded=degraded,
         )
         self._log.info(
             "Решение сохранено",
             decision=decision,
             probability=probability,
             agents=len(payload),
+            degraded=degraded,
         )
 
     async def run(self) -> None:

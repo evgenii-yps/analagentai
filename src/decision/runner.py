@@ -25,8 +25,10 @@ async def run() -> None:
 
     await db.connect()
     get_redis()  # прогрев клиента (пишется heartbeat)
-    # Идемпотентно гарантируем колонку logic_version (Задача D, на старом томе).
+    # Идемпотентно гарантируем колонки logic_version (Задача D) и degraded
+    # (Задача A2, Этап 7.2) на старом томе — init.sql на нём уже не выполнится.
     await db.ensure_signals_logic_version()
+    await db.ensure_signals_degraded()
 
     tasks: list[asyncio.Task[None]] = []
     try:

@@ -260,6 +260,15 @@ def section_signals_24h() -> list[str]:
         "AND evaluated_at > now() - interval '24 hours';"
     )
     lines.append(f"Закрыто оценщиком (горизонт {PRIMARY_HORIZON}): {closed or '0'}")
+
+    # Деградированные циклы за сутки (Этап 7.2, Задача A2): решение принято при
+    # неполном составе агентов (<3). По таким сигналам уведомление не отправлялось.
+    degraded = _psql(
+        "SELECT count(*) FROM signals "
+        "WHERE degraded AND ts > now() - interval '24 hours';"
+    )
+    mark = "🔴" if (degraded or "0") not in ("", "0") else "🟢"
+    lines.append(f"{mark} Деградированных циклов (агентов < 3): {degraded or '0'}")
     return lines
 
 

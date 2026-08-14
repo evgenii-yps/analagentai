@@ -165,3 +165,45 @@ def test_format_message_time_in_moscow() -> None:
     # _NOW = 12:00 UTC → 15:00 МСК (UTC+3).
     assert "15:00 МСК" in text
     assert "#1" in text
+
+
+# --- Задача A2 (Этап 7.2): подсчёт содержательных агентов для порога отправки ---
+
+def test_count_meaningful_agents_counts_directional_and_neutral() -> None:
+    from src.notify.agent import count_meaningful_agents
+
+    payload = _payload(
+        ("market", "bullish", 0.7),
+        ("liquidity", "neutral", 0.1),
+        ("futures", "bullish", 0.5),
+    )
+    assert count_meaningful_agents(payload) == 3
+
+
+def test_count_meaningful_agents_excludes_insufficient() -> None:
+    from src.notify.agent import count_meaningful_agents
+
+    # insufficient_data содержательным НЕ считается (ТЗ A2).
+    payload = _payload(
+        ("market", "bullish", 0.7),
+        ("liquidity", "insufficient_data", 0.0),
+    )
+    assert count_meaningful_agents(payload) == 1
+
+
+def test_count_meaningful_agents_empty() -> None:
+    from src.notify.agent import count_meaningful_agents
+
+    assert count_meaningful_agents([]) == 0
+    assert count_meaningful_agents(None) == 0
+
+
+# --- Задача B1 (Этап 7.2): согласованность в тексте — знаменатель = 3 агента ---
+
+def test_compute_agreement_uses_total_agents_denominator() -> None:
+    from src.notify.agent import compute_agreement
+
+    # Два агента из трёх, оба bullish. Было |2-0|/2 = 1.0; стало |2-0|/3 ≈ 0.667 —
+    # выпадение агента понижает согласованность (та же формула, что у Decision).
+    payload = _payload(("market", "bullish", 0.7), ("futures", "bullish", 0.6))
+    assert abs(compute_agreement(payload) - 2 / 3) < 1e-9

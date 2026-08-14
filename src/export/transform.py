@@ -53,6 +53,7 @@ SIGNALS_HEADER: list[str] = [
     "rationale",
     "agents_payload_json",
     "logic_version",
+    "degraded",
 ]
 
 # Заголовок листа «Сводка по дням» — порядок из §7.2.
@@ -72,6 +73,7 @@ SUMMARY_HEADER: list[str] = [
     "avg_drawdown_4h",
     "avg_probability",
     "logic_version_dominant",
+    "degraded_count",
 ]
 
 # Ограничения длины текста (Google Таблица / Notion).
@@ -237,6 +239,9 @@ def build_signal_row(signal: dict[str, Any]) -> list[Any]:
         _payload_json(signal.get("agents_payload")),
         # Версия логики последней колонкой, чтобы не сдвигать существующие (§D.3).
         int(signal["logic_version"]) if signal.get("logic_version") is not None else 1,
+        # degraded новой колонкой в самом конце — тем же приёмом, чтобы не сдвигать
+        # уже выгруженные столбцы (Этап 7.2, Задача A2). «да»/«нет».
+        "да" if signal.get("degraded") else "нет",
     ]
 
 
@@ -270,6 +275,8 @@ def build_summary_row(row: dict[str, Any]) -> list[Any]:
         _rate(row.get("avg_prob")),
         # Преобладающая версия логики за сутки (§D.3).
         int(row["logic_version_dominant"]) if row.get("logic_version_dominant") is not None else 1,
+        # Число деградированных циклов за сутки (Этап 7.2, Задача A2).
+        int(row.get("degraded_count") or 0),
     ]
 
 

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -24,6 +25,9 @@ class DB:
     def __init__(self) -> None:
         # Пул создаётся лениво в connect(); до этого он отсутствует.
         self._pool: asyncpg.Pool | None = None
+        # Сериализует пересоздание пула (самовосстановление агента, Этап 7.2):
+        # два агента в одном процессе не должны пересоздавать пул одновременно.
+        self._reconnect_lock = asyncio.Lock()
 
     @property
     def pool(self) -> asyncpg.Pool:
@@ -55,6 +59,34 @@ class DB:
             return result == 1
         except Exception:
             return False
+
+    async def reconnect(self) -> None:
+        """Пересоздаёт пул соединений — «мягкий перезапуск» доступа к БД (Этап 7.2).
+
+        Единственное долгоживущее состояние процесса агентов между итерациями —
+        это пул asyncpg (и клиент Redis). Инцидент 14.08 (полная БД, но пустая
+        выборка, лечится ТОЛЬКО перезапуском контейнера) указывает на испорченное
+        состояние именно здесь. Метод даёт агенту способ восстановиться самому,
+        не дожидаясь вотчдога: открываем новый пул ДО закрытия старого (без окна
+        ``_pool is None``), атомарно подменяем ссылку, затем гасим старый пул.
+        Сериализован ``_reconnect_lock``: параллельные агенты не пересоздают пул
+        одновременно.
+        """
+        async with self._reconnect_lock:
+            old = self._pool
+            new = await asyncpg.create_pool(
+                dsn=settings.pg_dsn,
+                min_size=2,
+                max_size=10,
+            )
+            self._pool = new
+            if old is not None:
+                try:
+                    await old.close()
+                except Exception:
+                    # Старый пул мог быть уже нерабочим — это и есть причина
+                    # пересоздания; ошибку закрытия глотаем, новый пул уже активен.
+                    pass
 
     async def get_or_create_instrument(
         self,
@@ -317,7 +349,7 @@ class DB:
         self,
         agent: str,
         error_type: str,
-        exc_type: str,
+        exc_type: str | None,
         detail: str,
     ) -> None:
         """INSERT записи о сбое агента.
@@ -326,6 +358,10 @@ class DB:
         не пройти (БД недоступна) — вызывающий код обязан обернуть его в
         try/except и не падать. Такой сбой всё равно виден по устаревшему
         heartbeat и другим ошибкам БД.
+
+        ``error_type`` — ``'compute'`` | ``'db_write'`` | ``'auto_reset'`` (Этап
+        7.2: факт самовосстановления агента). ``exc_type`` может быть ``None``
+        (например, для ``auto_reset`` — это не исключение, а служебное событие).
         """
         await self.pool.execute(
             "INSERT INTO agent_failures (agent, error_type, exc_type, detail) "
@@ -383,6 +419,19 @@ class DB:
             "ADD COLUMN IF NOT EXISTS logic_version SMALLINT NOT NULL DEFAULT 1;"
         )
 
+    async def ensure_signals_degraded(self) -> None:
+        """Идемпотентно добавляет колонку ``degraded`` (Этап 7.2, Задача A2).
+
+        ``degraded`` взводится, когда в решении участвовало меньше полного числа
+        агентов (сейчас 3): сигнал построен на неполной картине. Миграция НЕ
+        пересчитывает старые записи — у них остаётся DEFAULT false (граница режимов
+        фиксируется через ``logic_version``, а не через этот флаг).
+        """
+        await self.pool.execute(
+            "ALTER TABLE signals "
+            "ADD COLUMN IF NOT EXISTS degraded BOOLEAN NOT NULL DEFAULT FALSE;"
+        )
+
     async def save_signal(
         self,
         instrument_id: int,
@@ -391,17 +440,20 @@ class DB:
         agents_payload: list[dict[str, Any]],
         rationale: str,
         logic_version: int,
+        degraded: bool = False,
     ) -> None:
         """INSERT итогового решения в ``signals`` (status остаётся 'open').
 
         ``logic_version`` — версия логики агрегации/агентов (константа кода
-        Decision Agent, а не настройка), фиксирует границу режимов Этапа 7.0.
+        Decision Agent, а не настройка), фиксирует границу режимов Этапа 7.0/7.2.
+        ``degraded`` (Этап 7.2) — участвовало меньше полного числа агентов;
+        по такому сигналу уведомление НЕ отправляется, но сам сигнал сохраняется.
         """
         query = """
             INSERT INTO signals
                 (instrument_id, decision, probability, agents_payload, rationale,
-                 logic_version)
-            VALUES ($1, $2, $3, $4::jsonb, $5, $6);
+                 logic_version, degraded)
+            VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7);
         """
         await self.pool.execute(
             query,
@@ -411,6 +463,7 @@ class DB:
             json.dumps(agents_payload),
             rationale,
             int(logic_version),
+            bool(degraded),
         )
 
     # --- Уведомления (Этап 5) ---

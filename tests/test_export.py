@@ -137,15 +137,24 @@ def test_success_cell_variants() -> None:
 
 def test_signal_row_length_matches_header() -> None:
     row = build_signal_row(_signal())
-    assert len(row) == len(SIGNALS_HEADER) == 28
+    assert len(row) == len(SIGNALS_HEADER) == 29
 
 
-def test_signal_row_logic_version_is_last() -> None:
-    # logic_version — последняя колонка (§D.3), существующие не сдвинуты.
-    assert SIGNALS_HEADER[-1] == "logic_version"
+def test_signal_row_logic_version_then_degraded_last() -> None:
+    # logic_version — предпоследняя, degraded — последняя (Этап 7.2): новые
+    # колонки добавлены в конец, существующие не сдвинуты (§D.3 / A2).
+    assert SIGNALS_HEADER[-2] == "logic_version"
+    assert SIGNALS_HEADER[-1] == "degraded"
     assert build_signal_row(_signal(logic_version=2))[27] == 2
     # Отсутствие поля → версия 1 (исторические сигналы «до» правок).
     assert build_signal_row(_signal(logic_version=None))[27] == 1
+
+
+def test_signal_row_degraded_cell() -> None:
+    assert build_signal_row(_signal(degraded=True))[28] == "да"
+    assert build_signal_row(_signal(degraded=False))[28] == "нет"
+    # Отсутствие поля (старый сигнал) → «нет».
+    assert build_signal_row(_signal())[28] == "нет"
 
 
 def test_signal_row_core_fields() -> None:
@@ -212,11 +221,15 @@ def test_summary_row_empty_cells_not_zero() -> None:
             "avg_dd": 0.3,
             "avg_prob": 0.6543,
             "logic_version_dominant": 2,
+            "degraded_count": 7,
         }
     )
     assert row[0] == "2026-08-10"
     assert row[8] == 0.5      # success_rate_buy_4h
     assert row[9] == ""       # success_rate_sell_4h пусто (не было sell)
+    assert row[14] == 2       # logic_version_dominant
+    assert row[15] == 7       # degraded_count (последняя колонка, Этап 7.2)
+    assert len(row) == 16
     assert row[11] == ""      # avg_pnl_sell_4h пусто
     assert row[13] == 0.6543  # avg_probability
     assert row[14] == 2       # logic_version_dominant (последняя колонка)
