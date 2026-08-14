@@ -43,6 +43,8 @@ class NotifyConfig:
 
     min_probability: float
     cooldown_sec: float
+    # Минимум агентов со свежим содержательным выводом для отправки (Задача A2).
+    min_agents: int = 3
 
 
 @dataclass
@@ -107,16 +109,32 @@ def normalize_payload(agents_payload: Any) -> list[dict[str, Any]]:
     return [e for e in parsed if isinstance(e, dict)]
 
 
+def count_meaningful_agents(agents_payload: Any) -> int:
+    """Число агентов со свежим СОДЕРЖАТЕЛЬНЫМ выводом в payload (Задача A2).
+
+    payload формирует Decision Agent уже из свежих не-``insufficient_data``
+    выводов, но проверяем ещё раз по сигналу: содержательным считаем
+    bullish/bearish/neutral, но НЕ insufficient_data/неизвестное.
+    """
+    return sum(
+        1
+        for e in normalize_payload(agents_payload)
+        if e.get("signal") in SIGNAL_VALUE
+    )
+
+
 def compute_agreement(agents_payload: Any) -> float | None:
     """Пересчитывает согласованность из ``agents_payload`` ТОЙ ЖЕ формулой, что и
-    Decision Agent (src.decision.agent.make_decision):
+    Decision Agent (src.decision.agent.make_decision, Задача B1):
 
         directions = [SIGNAL_VALUE[o["signal"]] for o in fresh]
-        agreement = abs(pos - neg) / len(fresh)
+        agreement = abs(pos - neg) / TOTAL_AGENTS
 
-    Парсинг rationale регуляркой ЗАПРЕЩЁН (ТЗ §6): формат текстовый и может
-    измениться. Здесь только чтение payload, логика решений не затрагивается.
-    Возвращает None, если ни одного направленного мнения нет.
+    Знаменатель — ПОЛНОЕ число агентов (len(AGENT_ORDER)), а не число свежих:
+    так согласованность в уведомлении совпадает с той, что использовал Decision
+    Agent (выпадение агента её понижает). Парсинг rationale регуляркой ЗАПРЕЩЁН
+    (ТЗ §6): формат текстовый и может измениться. Здесь только чтение payload,
+    логика решений не затрагивается. Возвращает None, если направленных мнений нет.
     """
     directions = [
         SIGNAL_VALUE[e["signal"]]
@@ -127,7 +145,7 @@ def compute_agreement(agents_payload: Any) -> float | None:
         return None
     pos = sum(1 for d in directions if d > 0)
     neg = sum(1 for d in directions if d < 0)
-    return abs(pos - neg) / len(directions)
+    return abs(pos - neg) / len(AGENT_ORDER)
 
 
 def agreement_wording(agreement: float) -> str:
@@ -251,9 +269,10 @@ class NotifyAgent:
         symbol: str,
         tz_name: str,
         primary_horizon: str,
+        min_agents: int = 3,
     ) -> None:
         self.interval = interval
-        self.cfg = NotifyConfig(min_probability, cooldown_sec)
+        self.cfg = NotifyConfig(min_probability, cooldown_sec, min_agents)
         self.symbol = symbol
         self.tz_name = tz_name
         self.fmt_cfg = SignalFormatConfig(symbol, tz_name, primary_horizon)
@@ -273,6 +292,22 @@ class NotifyAgent:
     async def _process_signal(self, signal: dict[str, Any]) -> None:
         """Решает, слать ли конкретный сигнал, и при необходимости шлёт."""
         instrument_id = signal["instrument_id"]
+
+        # Деградированный режим (Задача A2): агентов со свежим содержательным
+        # выводом меньше порога → уведомление НЕ шлём. Сигнал уже сохранён и
+        # помечен degraded (статистика не теряется) — «поглощаем» его, чтобы он не
+        # висел в очереди, но notified_at НЕ ставим: отправки не было.
+        n_agents = count_meaningful_agents(signal.get("agents_payload"))
+        if n_agents < self.cfg.min_agents:
+            await db.mark_signal_absorbed(signal["id"])
+            self._log.info(
+                "Уведомление подавлено: деградированный режим",
+                signal_id=signal["id"],
+                agents=n_agents,
+                min_agents=self.cfg.min_agents,
+            )
+            return
+
         last_decision, last_sent_ts = await self._get_last_state(instrument_id)
         now = datetime.now(UTC)
 

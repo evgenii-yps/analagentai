@@ -146,3 +146,48 @@ def test_is_deterministic() -> None:
         _out("futures", "bullish", 0.5),
     ]
     assert _decide(outputs) == _decide(outputs)
+
+
+# --- Задача B1 (Этап 7.2): знаменатель согласованности = полное число агентов ---
+
+def test_agreement_denominator_is_total_agents_signal_8205() -> None:
+    # Воспроизводим сигнал #8205: Market отсутствует, Liquidity нейтрально (0.05),
+    # Futures за рост (1.00). Решение принимают 2 агента из 3.
+    outputs = [
+        _out("liquidity", "neutral", 0.05),
+        _out("futures", "bullish", 1.00),
+    ]
+    decision, probability, payload, _ = _decide(outputs)  # total_agents по умолч. = 3
+    assert decision == "buy"
+    assert len(payload) == 2
+    # Было (знаменатель len(fresh)=2): agreement 0.50, probability ≈ 0.72 (уходило
+    # пользователю). Стало (знаменатель 3): agreement 0.33, probability ≈ 0.64 —
+    # ниже порога уведомления 0.7.
+    assert abs(probability - 0.6349) < 0.01
+    assert probability < 0.7
+
+
+def test_dropping_agent_lowers_agreement_and_probability() -> None:
+    # Тот же расклад, но сравниваем новый знаменатель (3) со старым (len(fresh)=2).
+    outputs = [
+        _out("liquidity", "neutral", 0.05),
+        _out("futures", "bullish", 1.00),
+    ]
+    common = dict(
+        weights=_WEIGHTS, threshold=0.3, min_agents=2, freshness_sec=300, now=_NOW
+    )
+    _, prob_new, _, _ = make_decision(outputs, total_agents=3, **common)
+    _, prob_old, _, _ = make_decision(outputs, total_agents=2, **common)
+    # Выпадение агента ПОНИЖАЕТ согласованность → новая вероятность строго ниже.
+    assert prob_new < prob_old
+
+
+def test_full_house_unanimous_agreement_is_one() -> None:
+    # Полный состав, единодушны → agreement = |3-0|/3 = 1.0 (не меняется).
+    outputs = [
+        _out("market", "bullish", 0.8),
+        _out("liquidity", "bullish", 0.8),
+        _out("futures", "bullish", 0.8),
+    ]
+    _, probability, _, _ = _decide(outputs)
+    assert probability == 1.0

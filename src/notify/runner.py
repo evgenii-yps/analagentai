@@ -40,6 +40,7 @@ async def run() -> None:
             symbol=settings.SYMBOL,
             tz_name=settings.NOTIFY_TIMEZONE,
             primary_horizon=settings.EVAL_PRIMARY_HORIZON,
+            min_agents=settings.NOTIFY_MIN_AGENTS,
         )
         tasks = [asyncio.create_task(agent.run(), name="notify")]
 

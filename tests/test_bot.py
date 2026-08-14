@@ -146,8 +146,10 @@ def test_agreement_opposed() -> None:
 
 def test_agreement_from_json_string() -> None:
     # asyncpg отдаёт JSONB строкой — согласованность должна считаться и по строке.
+    # Знаменатель = полное число агентов (Задача B1, Этап 7.2): один свежий агент
+    # из трёх даёт |1-0|/3 ≈ 0.33, а не 1.0 (выпадение агентов понижает согласие).
     payload = '[{"agent":"market","signal":"bullish","confidence":0.7}]'
-    assert compute_agreement(payload) == pytest.approx(1.0)
+    assert compute_agreement(payload) == pytest.approx(1 / 3)
 
 
 def test_agreement_empty_is_none() -> None:

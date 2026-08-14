@@ -86,7 +86,8 @@ CREATE TABLE IF NOT EXISTS signals (
     success        BOOLEAN,
     notified       BOOLEAN NOT NULL DEFAULT FALSE, -- признак «обработан» notify (Этап 5)
     notified_at    TIMESTAMPTZ,                    -- факт реальной отправки в Telegram (Этап 6.6)
-    logic_version  SMALLINT NOT NULL DEFAULT 1     -- версия логики агентов/агрегации (Этап 7.0)
+    logic_version  SMALLINT NOT NULL DEFAULT 1,    -- версия логики агентов/агрегации (Этап 7.0/7.2)
+    degraded       BOOLEAN NOT NULL DEFAULT FALSE  -- решение при неполном составе агентов (<3), Этап 7.2
 );
 CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals (ts DESC);
 
@@ -121,7 +122,7 @@ CREATE TABLE IF NOT EXISTS agent_failures (
     id         BIGSERIAL PRIMARY KEY,
     agent      TEXT NOT NULL,
     ts         TIMESTAMPTZ NOT NULL DEFAULT now(),
-    error_type TEXT NOT NULL,                 -- compute | db_write
+    error_type TEXT NOT NULL,                 -- compute | db_write | auto_reset (Этап 7.2)
     exc_type   TEXT,
     detail     TEXT
 );

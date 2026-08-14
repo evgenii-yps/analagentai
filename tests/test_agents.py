@@ -249,3 +249,30 @@ def test_futures_extreme_threshold_is_configurable() -> None:
     )
     assert signal == "neutral"
     assert metrics["funding_extreme"] is False
+
+
+# --- Задача A1 (Этап 7.2): пустой/нечисловой кадр → insufficient_data, НЕ DataError ---
+
+def test_market_empty_dataframe_is_insufficient_not_exception() -> None:
+    # Именно это (пустая выборка) валило Market как DataError 8 часов 14.08.
+    signal, confidence, metrics, _ = analyze_ohlcv(pd.DataFrame(), min_candles=200)
+    assert signal == "insufficient_data"
+    assert confidence == 0.0
+    assert metrics["n_candles"] == 0
+
+
+def test_market_object_columns_dataframe_is_insufficient_not_exception() -> None:
+    # Нечисловые (object) колонки — вторая версия причины DataError. Должно быть
+    # insufficient_data без исключения (проверка перед агрегацией).
+    df = pd.DataFrame({c: ["x"] * 250 for c in ("open", "high", "low", "close", "volume")})
+    signal, confidence, _, _ = analyze_ohlcv(df, min_candles=200)
+    assert signal == "insufficient_data"
+    assert confidence == 0.0
+
+
+def test_market_missing_columns_dataframe_is_insufficient_not_exception() -> None:
+    # Кадр без нужных колонок (битая выборка) не должен падать KeyError/DataError.
+    df = pd.DataFrame({"foo": [1.0] * 250})
+    signal, confidence, _, _ = analyze_ohlcv(df, min_candles=200)
+    assert signal == "insufficient_data"
+    assert confidence == 0.0

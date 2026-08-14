@@ -34,7 +34,8 @@ _SIGNAL_COLUMNS = """
     e4.pnl_pct         AS pnl_4h,
     e4.drawdown_pct    AS dd_4h,
     e4.success         AS succ_4h,
-    s.logic_version    AS logic_version
+    s.logic_version    AS logic_version,
+    s.degraded         AS degraded
 """
 
 _SIGNAL_JOINS = """
@@ -69,6 +70,13 @@ async def apply_migrations(conn: asyncpg.Connection) -> None:
     )
     await conn.execute(
         "ALTER TABLE signals ADD COLUMN IF NOT EXISTS notified_at TIMESTAMPTZ;"
+    )
+    # Колонка degraded (Этап 7.2, Задача A2). Выгрузка держит собственный пул и
+    # может стартовать раньше, чем Decision Agent добавит колонку, — гарантируем
+    # её и здесь, чтобы SELECT s.degraded не падал на старом томе.
+    await conn.execute(
+        "ALTER TABLE signals ADD COLUMN IF NOT EXISTS degraded BOOLEAN NOT NULL "
+        "DEFAULT FALSE;"
     )
 
 
@@ -147,7 +155,8 @@ async def fetch_daily_summary(
             avg(CASE WHEN s.decision = 'sell' THEN e4.pnl_pct END) AS avg_pnl_sell,
             avg(e4.drawdown_pct) AS avg_dd,
             avg(s.probability)   AS avg_prob,
-            mode() WITHIN GROUP (ORDER BY s.logic_version) AS logic_version_dominant
+            mode() WITHIN GROUP (ORDER BY s.logic_version) AS logic_version_dominant,
+            count(*) FILTER (WHERE s.degraded) AS degraded_count
         FROM signals s
         LEFT JOIN signal_evaluations e4
                ON e4.signal_id = s.id AND e4.horizon = '4h'

@@ -14,6 +14,7 @@ import math
 from typing import Any
 
 import pandas as pd
+from pandas.api.types import is_numeric_dtype
 
 from src.agents.base import (
     SIGNAL_BEARISH,
@@ -150,19 +151,35 @@ def analyze_ohlcv(
     """
     # Приводим столбцы к числам и отбрасываем «грязные» строки (NULL/NaN),
     # чтобы расчёт был корректным, а не падал на object-типах.
-    if not df.empty:
+    required = ("open", "high", "low", "close")
+    if not df.empty and all(c in df.columns for c in ("open", "high", "low", "close", "volume")):
         df = df.copy()
         for col in ("open", "high", "low", "close", "volume"):
             df[col] = pd.to_numeric(df[col], errors="coerce")
         df = df.dropna(subset=["open", "high", "low", "close"])
+    else:
+        # Нет нужных колонок (пустая/битая выборка) — гарантируем пустой кадр,
+        # чтобы явная проверка ниже дала insufficient_data, а не KeyError.
+        df = df.iloc[0:0].copy()
 
+    # Явная защита ПЕРЕД агрегацией (Этап 7.2, Задача A1). Именно
+    # «No numeric types to aggregate» (DataError на нечисловом/пустом кадре) валил
+    # Market 8 часов 14.08. Теперь пустой ИЛИ нечисловой кадр — это штатный вывод
+    # insufficient_data с confidence=0 (строка в agent_outputs пишется), а НЕ
+    # исключение, срывающее итерацию без записи.
+    numeric_ok = not df.empty and all(is_numeric_dtype(df[c]) for c in required)
     n = len(df)
-    if n < min_candles:
+    if not numeric_ok or n < min_candles:
+        reason = (
+            f"Недостаточно свечей: {n} < {min_candles}."
+            if numeric_ok
+            else "Пустая или нечисловая выборка свечей — агрегация невозможна."
+        )
         return (
             "insufficient_data",
             0.0,
             {"n_candles": n, "min_candles": min_candles},
-            f"Недостаточно свечей: {n} < {min_candles}.",
+            reason,
         )
 
     close = df["close"].astype(float)
@@ -267,10 +284,19 @@ class MarketAgent(BaseAgent):
         self.min_candles = min_candles
 
     async def analyze(self, instrument_id: int) -> AgentOutput:
-        """Читает свечи и формирует заключение по техническому анализу."""
+        """Читает свечи и формирует заключение по техническому анализу.
+
+        Состояние между итерациями НЕ переносится (Этап 7.2): выборка строится
+        заново на каждой итерации по последним ``limit`` свечам (ORDER BY ts DESC
+        LIMIT), без запомненного ``last_ts``, курсора или кэша DataFrame. Граница
+        выборки не может «уйти в будущее»: она вообще не строится от какого-либо
+        сохранённого значения времени — берутся просто самые свежие свечи.
+        """
         # Берём с запасом, чтобы EMA200 успела «прогреться».
         limit = max(self.min_candles, _EMA_SLOW) + 50
         rows = await db.get_ohlcv(instrument_id, self.timeframe, limit)
+        # Полностью пустой ответ при живом сервисе = симптом инцидента 14.08.
+        await self._note_read(is_empty=(len(rows) == 0))
         df = pd.DataFrame([dict(r) for r in rows])
 
         signal, confidence, metrics, rationale = analyze_ohlcv(df, self.min_candles)
