@@ -6,6 +6,12 @@
 ранняя доступная точка, фактический потолок частоты запросов и интервал между
 записями funding определяются ЭМПИРИЧЕСКИ.
 
+HTTP-клиент — httpx СО ШТАТНОЙ ПОДПИСЬЮ (``python-httpx/<версия>``): проверкой
+из контейнера установлено, что на неё OKX отвечает 200, тогда как подпись
+``urllib`` блокируется. Браузерная подпись (Mozilla/...) не подставляется.
+Первым делом зонд печатает фактическую подпись клиента и код ответа — чтобы
+отказ по подписи был виден сразу, а не выглядел «нет истории».
+
 Запуск (внутри контейнера, на хосте pip-пакетов нет — правило D-3):
 
     docker compose --profile backtest run --rm backtest \\
@@ -24,8 +30,12 @@ import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from src.core.config import settings
-from src.core.exchange import create_exchange
+from backtest.loader import (
+    OKX_BASE_URL,
+    PATH_FUNDING_HISTORY,
+    PATH_HISTORY_CANDLES,
+    create_http_client,
+)
 
 RATE_LIMIT_CODE = "50011"
 
@@ -48,21 +58,31 @@ def to_dt(value: Any) -> datetime:
     return datetime.fromtimestamp(int(value) / 1000, tz=UTC)
 
 
-async def _call(exchange: Any, method: str, params: dict[str, Any]) -> dict[str, Any]:
-    """Один вызов эндпоинта. Возвращает разобранный ответ или описание ошибки."""
+async def _call(client: Any, path: str, params: dict[str, Any]) -> dict[str, Any]:
+    """Один запрос к эндпоинту. Возвращает тело ответа или описание ошибки.
+
+    Зонд обязан пережить любую ошибку и напечатать её: он для того и нужен,
+    чтобы отличить «нет истории» от «нас не пустили».
+    """
     try:
-        response = await getattr(exchange, method)(params)
-    except Exception as exc:  # noqa: BLE001 — зонд обязан пережить любую ошибку
+        response = await client.get(path, params=params)
+    except Exception as exc:  # noqa: BLE001
         return {"code": "exception", "msg": str(exc), "data": []}
-    return response
+    if response.status_code != 200:
+        return {
+            "code": f"HTTP {response.status_code}",
+            "msg": response.text[:200],
+            "data": [],
+        }
+    return response.json()
 
 
-async def probe_limit(exchange: Any, method: str, base: dict[str, Any]) -> tuple[int, int]:
+async def probe_limit(client: Any, path: str, base: dict[str, Any]) -> tuple[int, int]:
     """Максимальный фактически отдаваемый limit → (запрошено, получено)."""
     for candidate in LIMIT_CANDIDATES:
         params = dict(base)
         params["limit"] = str(candidate)
-        response = await _call(exchange, method, params)
+        response = await _call(client, path, params)
         data = response.get("data") or []
         if str(response.get("code")) == "0" and data:
             return candidate, len(data)
@@ -71,16 +91,16 @@ async def probe_limit(exchange: Any, method: str, base: dict[str, Any]) -> tuple
 
 
 async def probe_pagination(
-    exchange: Any, method: str, base: dict[str, Any], ts_key: str
+    client: Any, path: str, base: dict[str, Any], ts_key: str
 ) -> str:
     """Семантика параметра пагинации: проверяется, что `after` идёт НАЗАД по времени."""
-    first = await _call(exchange, method, {**base, "limit": "5"})
+    first = await _call(client, path, {**base, "limit": "5"})
     data = first.get("data") or []
     if not data:
         return "не определена (пустой первый ответ)"
     oldest = min(int(_ts_of(row, ts_key)) for row in data)
     await asyncio.sleep(0.3)
-    second = await _call(exchange, method, {**base, "limit": "5", "after": str(oldest)})
+    second = await _call(client, path, {**base, "limit": "5", "after": str(oldest)})
     data2 = second.get("data") or []
     if not data2:
         return "after: страница пуста (вероятно, достигнут край истории)"
@@ -95,7 +115,7 @@ def _ts_of(row: Any, ts_key: str) -> Any:
 
 
 async def probe_earliest(
-    exchange: Any, method: str, base: dict[str, Any], ts_key: str, pause: float
+    client: Any, path: str, base: dict[str, Any], ts_key: str, pause: float
 ) -> datetime | None:
     """Самая ранняя доступная метка времени: идём назад страницами до пустого ответа."""
     cursor: int | None = None
@@ -104,7 +124,7 @@ async def probe_earliest(
         params = {**base, "limit": "100"}
         if cursor is not None:
             params["after"] = str(cursor)
-        response = await _call(exchange, method, params)
+        response = await _call(client, path, params)
         data = response.get("data") or []
         if str(response.get("code")) != "0" or not data:
             break
@@ -117,7 +137,7 @@ async def probe_earliest(
     return earliest
 
 
-async def probe_pace(exchange: Any, method: str, base: dict[str, Any]) -> dict[str, Any]:
+async def probe_pace(client: Any, path: str, base: dict[str, Any]) -> dict[str, Any]:
     """Фактический потолок частоты: наращиваем темп до первого кода 50011."""
     last_ok_ms: int | None = None
     first_fail_ms: int | None = None
@@ -125,7 +145,7 @@ async def probe_pace(exchange: Any, method: str, base: dict[str, Any]) -> dict[s
         hit_limit = False
         started = time.monotonic()
         for _ in range(PACE_BURST):
-            response = await _call(exchange, method, {**base, "limit": "1"})
+            response = await _call(client, path, {**base, "limit": "1"})
             if str(response.get("code")) == RATE_LIMIT_CODE or (
                 RATE_LIMIT_CODE in str(response.get("msg", ""))
             ):
@@ -148,12 +168,12 @@ async def probe_pace(exchange: Any, method: str, base: dict[str, Any]) -> dict[s
 
 
 async def probe_funding_interval(
-    exchange: Any, inst_id: str
+    client: Any, inst_id: str
 ) -> tuple[str, list[timedelta]]:
     """Фактический интервал между записями funding — подтверждается, а не берётся из ТЗ."""
     response = await _call(
-        exchange,
-        "publicGetPublicFundingRateHistory",
+        client,
+        PATH_FUNDING_HISTORY,
         {"instId": inst_id, "limit": "20"},
     )
     data = response.get("data") or []
@@ -165,21 +185,21 @@ async def probe_funding_interval(
     return f"интервалы, ч: {unique}; записей в сутки ≈ {24 / (unique[0] or 1):.1f}", deltas
 
 
-async def probe_instrument(exchange: Any, inst_id: str, bar: str) -> list[str]:
+async def probe_instrument(client: Any, inst_id: str, bar: str) -> list[str]:
     """Полный зонд по одному инструменту. Возвращает строки отчёта."""
     out: list[str] = [f"\n=== {inst_id} ==="]
 
     candles_base = {"instId": inst_id, "bar": bar}
     funding_base = {"instId": inst_id}
 
-    asked, got = await probe_limit(exchange, "publicGetMarketHistoryCandles", candles_base)
+    asked, got = await probe_limit(client, PATH_HISTORY_CANDLES, candles_base)
     out.append(f"  свечи: максимальный limit — запрошено {asked}, получено {got}")
     pagination = await probe_pagination(
-        exchange, "publicGetMarketHistoryCandles", candles_base, "ts"
+        client, PATH_HISTORY_CANDLES, candles_base, "ts"
     )
     out.append(f"  свечи: пагинация — {pagination}")
 
-    pace = await probe_pace(exchange, "publicGetMarketHistoryCandles", candles_base)
+    pace = await probe_pace(client, PATH_HISTORY_CANDLES, candles_base)
     out.append(
         f"  свечи: темп — без 50011 при паузе {pace['last_ok_pause_ms']} мс, "
         f"первый отказ при {pace['first_fail_pause_ms']} мс, "
@@ -188,7 +208,7 @@ async def probe_instrument(exchange: Any, inst_id: str, bar: str) -> list[str]:
 
     pause = (pace["safe_pause_ms"] or 400) / 1000.0
     earliest = await probe_earliest(
-        exchange, "publicGetMarketHistoryCandles", candles_base, "ts", pause
+        client, PATH_HISTORY_CANDLES, candles_base, "ts", pause
     )
     if earliest is None:
         out.append("  свечи: самая ранняя точка НЕ ОПРЕДЕЛЕНА")
@@ -201,13 +221,13 @@ async def probe_instrument(exchange: Any, inst_id: str, bar: str) -> list[str]:
         )
 
     asked_f, got_f = await probe_limit(
-        exchange, "publicGetPublicFundingRateHistory", funding_base
+        client, PATH_FUNDING_HISTORY, funding_base
     )
     out.append(f"  funding: максимальный limit — запрошено {asked_f}, получено {got_f}")
-    interval, _deltas = await probe_funding_interval(exchange, inst_id)
+    interval, _deltas = await probe_funding_interval(client, inst_id)
     out.append(f"  funding: {interval}")
     earliest_f = await probe_earliest(
-        exchange, "publicGetPublicFundingRateHistory", funding_base, "fundingTime", pause
+        client, PATH_FUNDING_HISTORY, funding_base, "fundingTime", pause
     )
     out.append(
         "  funding: самая ранняя точка "
@@ -220,22 +240,48 @@ async def probe_instrument(exchange: Any, inst_id: str, bar: str) -> list[str]:
     return out
 
 
+async def probe_client_signature(client: Any) -> list[str]:
+    """Подпись клиента и код ответа — печатается ПЕРВОЙ.
+
+    Отказ по подписи выглядит как «истории нет», и без этой проверки его легко
+    принять за отсутствие данных. Здесь видно и то, чем мы представились, и что
+    ответила биржа.
+    """
+    user_agent = client.headers.get("user-agent", "<не задан>")
+    out = [f"  подпись клиента (User-Agent): {user_agent}"]
+    try:
+        response = await client.get(
+            PATH_HISTORY_CANDLES, params={"instId": "BTC-USDT-SWAP", "bar": "1H", "limit": "1"}
+        )
+        out.append(f"  ответ OKX на пробный запрос: HTTP {response.status_code}")
+        if response.status_code != 200:
+            out.append(f"  тело ответа: {response.text[:200]}")
+            out.append("  ВНИМАНИЕ: биржа не пустила. Дальнейшие пустые результаты —")
+            out.append("  следствие отказа, а НЕ отсутствия истории.")
+    except Exception as exc:  # noqa: BLE001
+        out.append(f"  пробный запрос не прошёл: {exc}")
+    return out
+
+
 async def _main(args: argparse.Namespace) -> int:
     instruments = [x.strip() for x in args.instruments.split(",") if x.strip()]
-    exchange = create_exchange(settings.EXCHANGE)
+    client = create_http_client()
     print("=" * 78)
     print(" ЗОНД ГЛУБИНЫ ИСТОРИИ OKX (Этап 7.4, §4.1 ТЗ)")
     print("=" * 78)
-    print(f" Биржа (из продакшн-конфигурации): {settings.EXCHANGE}")
+    print(f" Адрес API: {OKX_BASE_URL}")
     print(f" Бар: {args.bar}")
     print(f" Время запуска (UTC): {datetime.now(UTC).isoformat()}")
     print(" Скрипт ничего не пишет в БД и не меняет конфигурацию.")
     try:
+        print("\n=== Проверка доступа ===")
+        for line in await probe_client_signature(client):
+            print(line)
         for inst_id in instruments:
-            for line in await probe_instrument(exchange, inst_id, args.bar):
+            for line in await probe_instrument(client, inst_id, args.bar):
                 print(line)
     finally:
-        await exchange.close()
+        await client.aclose()
     print("\nПеренесите эту таблицу в docs/STAGE_7_4_REPORT.md (§14.1) и подставьте")
     print("BT_PERIOD_FROM и BT_REQUEST_PAUSE_MS в backtest/.env.backtest.")
     return 0

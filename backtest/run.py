@@ -62,11 +62,14 @@ CONFIG_B = ["market", "futures"]
 
 
 async def _load_history(cfg: BacktestConfig) -> None:
-    """Загрузка истории и контроль целостности."""
-    from src.core.exchange import create_exchange
+    """Загрузка истории обоих рядов по всем инструментам.
 
-    exchange = create_exchange(settings.EXCHANGE)
-    client = loader.OkxHistory(exchange, cfg.request_pause_ms)
+    HTTP-клиент один на всю загрузку (httpx со штатной подписью): переоткрывать
+    соединение на каждый запрос незачем, а пауза между запросами задаётся
+    значением, полученным зондом.
+    """
+    http_client = loader.create_http_client()
+    client = loader.OkxHistory(http_client, cfg.request_pause_ms)
     try:
         for inst_id in cfg.instruments:
             await loader.backfill_candles(
@@ -76,7 +79,7 @@ async def _load_history(cfg: BacktestConfig) -> None:
                 inst_id, cfg.period_from, cfg.period_to, client=client
             )
     finally:
-        await exchange.close()
+        await http_client.aclose()
 
 
 async def _integrity(cfg: BacktestConfig) -> dict[str, list[tuple]]:
