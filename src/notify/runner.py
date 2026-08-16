@@ -27,6 +27,10 @@ async def run() -> None:
     get_redis()
     # Идемпотентно гарантируем наличие колонки notified (на старом томе).
     await db.ensure_notify_schema()
+    # Этап 7.3: колонки калибровки читаются выборкой кандидатов, поэтому сервис
+    # уведомлений тоже гарантирует их наличие (порядок старта сервисов не задан).
+    await db.ensure_calibration_schema()
+    await db.ensure_signals_inertia()
 
     if not settings.telegram_configured:
         log.warning("TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID не заданы — сервис простаивает")
@@ -41,6 +45,8 @@ async def run() -> None:
             tz_name=settings.NOTIFY_TIMEZONE,
             primary_horizon=settings.EVAL_PRIMARY_HORIZON,
             min_agents=settings.NOTIFY_MIN_AGENTS,
+            use_calibrated=settings.NOTIFY_USE_CALIBRATED,
+            min_calibrated=settings.NOTIFY_MIN_CALIBRATED,
         )
         tasks = [asyncio.create_task(agent.run(), name="notify")]
 

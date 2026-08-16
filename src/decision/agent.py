@@ -3,16 +3,28 @@
 ВАЖНО: Decision Agent НЕ анализирует рынок сам. Он читает ТОЛЬКО таблицу
 ``agent_outputs`` (через ``db.get_latest_agent_output``) и не имеет доступа к
 сырым рыночным таблицам (ohlcv/orderbook/funding) — это видно по импортам и коду.
+
+ЭТАП 7.3. Величина, которую агент кладёт в колонку ``probability``, переименована
+по смыслу в ИНДЕКС СОГЛАСИЯ: формула не изменилась, но диагностика 7.1 показала,
+что вероятностью успеха она не является (связь с исходом убывающая). Вероятность
+теперь берётся из калибровочной кривой, построенной по фактическим исходам, и
+пишется отдельной колонкой ``calibrated_probability`` — либо NULL, если кривой
+ещё нет. Колонка ``probability`` в БД сохранена: её читают выгрузка, бот и
+суточная сводка.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from datetime import UTC, datetime
 from typing import Any
 
 import structlog
 
+from src.calibration.curve import probability_for_index
+from src.core.config import settings
 from src.core.db import db
 from src.core.redis_client import get_redis
 
@@ -30,15 +42,46 @@ DECISION_BUY = "buy"
 DECISION_SELL = "sell"
 DECISION_WAIT = "wait"
 
-# Версия логики агентов/агрегации (Задача D). Это свойство КОДА, а не настройки,
-# поэтому константа здесь, а не в .env. Инкрементируется при правках, делающих
-# сигналы несравнимыми с прежними.
+# Версия логики агентов/агрегации (Задача D). Это свойство КОДА: инкрементируется
+# при правках, делающих сигналы несравнимыми с прежними. С Этапа 7.3 значение
+# читается из настроек (LOGIC_VERSION в .env), чтобы граница режимов была видна в
+# конфигурации, — но менять его вручную нельзя: оно должно совпадать с логикой,
+# заложенной текущим кодом.
 #   v1 — исходная логика.
 #   v2 (Этап 7.0) — приведение шкал уверенности, симметрия Futures, защита записи.
 #   v3 (Этап 7.2) — знаменатель согласованности = полное число агентов (Задача B1):
 #       выпадение агента ПОНИЖАЕТ согласованность (и вероятность). Меняет
 #       probability → статистика v2 и v3 несравнима, окно наблюдения обнуляется.
-LOGIC_VERSION = 3
+#   v4 (Этап 7.3) — перцентильные границы Futures (ветка bearish стала
+#       достижимой), калиброванная вероятность отдельной колонкой, учёт инерции
+#       входов. Меняет распределение мнений → статистика v3 и v4 несравнима.
+LOGIC_VERSION = settings.LOGIC_VERSION
+
+# Ключ кэша активной калибровочной кривой в Redis и его TTL (секунды).
+CALIBRATION_CACHE_PREFIX = "calibration:active:"
+CALIBRATION_CACHE_TTL = 3600
+
+
+def compute_inputs_hash(agents_payload: list[dict[str, Any]]) -> str:
+    """sha256 канонической строки входных мнений (Этап 7.3, Блок C).
+
+    Каноническая строка: агенты отсортированы по имени, для каждого берётся пара
+    ``signal`` + ``confidence``, округлённая до 4 знаков, разделитель ``|``:
+
+        futures:neutral:0.4000|liquidity:bullish:1.0000|market:bearish:0.3185
+
+    Время (``ts``) в строку НЕ входит: одинаковые мнения, прочитанные минутой
+    позже, — это тот же самый вход, и решение по ним новой информации не несёт.
+    Порядок агентов в payload на хэш не влияет (сортировка), изменение
+    уверенности в пятом знаке — тоже (округление до четвёртого).
+    """
+    parts = [
+        f"{entry.get('agent')}:{entry.get('signal')}:"
+        f"{float(entry.get('confidence', 0.0)):.4f}"
+        for entry in sorted(agents_payload, key=lambda e: str(e.get("agent")))
+    ]
+    canonical = "|".join(parts)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _is_fresh(output: dict[str, Any], freshness_sec: float, now: datetime) -> bool:
@@ -57,7 +100,12 @@ def make_decision(
     now: datetime,
     total_agents: int | None = None,
 ) -> tuple[str, float, list[dict[str, Any]], str]:
-    """Чистая функция агрегации → (decision, probability, agents_payload, rationale).
+    """Чистая функция агрегации → (decision, conviction, agents_payload, rationale).
+
+    Второй элемент — ИНДЕКС СОГЛАСИЯ (Этап 7.3): ``|балл| × (0.5 + 0.5 ×
+    согласованность)``. Формула НЕ изменена; изменилось только название, потому
+    что вероятностью успеха эта величина не является (диагностика 7.1 показала
+    убывающую связь с исходом). Хранится по-прежнему в колонке ``probability``.
 
     ``outputs`` — последние выводы агентов (могут быть None / устаревшие /
     ``insufficient_data``). Детерминирована: одинаковый ввод и ``now`` →
@@ -117,15 +165,16 @@ def make_decision(
     else:
         decision = DECISION_WAIT
 
-    # 6. Вероятность: |балл| усиленный согласованностью направлений.
+    # 6. Индекс согласия: |балл|, усиленный согласованностью направлений.
+    # Формула Этапа 7.3 НЕ ИЗМЕНЕНА — изменилось только название величины.
     # Знаменатель согласованности — ПОЛНОЕ число агентов (Задача B1), а не число
     # свежих: иначе выпадение агента механически завышало бы согласованность
-    # (напр. #8205: |1-0|/2=0.50 вместо |1-0|/3=0.33 → prob 0.72 вместо ≈0.64).
+    # (напр. #8205: |1-0|/2=0.50 вместо |1-0|/3=0.33 → индекс 0.72 вместо ≈0.64).
     directions = [_SIGNAL_VALUE[o["signal"]] for o in fresh]
     pos = sum(1 for d in directions if d > 0)
     neg = sum(1 for d in directions if d < 0)
     agreement = abs(pos - neg) / total_agents if total_agents > 0 else 0.0
-    probability = round(min(abs(score) * (0.5 + 0.5 * agreement), 1.0), 4)
+    conviction = round(min(abs(score) * (0.5 + 0.5 * agreement), 1.0), 4)
 
     # 7. Объяснение.
     parts = ", ".join(
@@ -134,7 +183,7 @@ def make_decision(
     rationale = (
         f"{parts}; балл={score:+.2f}, согласованность={agreement:.2f} → {decision}."
     )
-    return decision, probability, payload, rationale
+    return decision, conviction, payload, rationale
 
 
 class DecisionAgent:
@@ -167,7 +216,7 @@ class DecisionAgent:
             await db.get_latest_agent_output(agent, self.agent_instruments[agent])
             for agent in AGENTS
         ]
-        decision, probability, payload, rationale = make_decision(
+        decision, conviction, payload, rationale = make_decision(
             outputs,
             weights=self.weights,
             threshold=self.threshold,
@@ -180,22 +229,86 @@ class DecisionAgent:
         # payload содержит РОВНО свежие содержательные выводы (insufficient_data и
         # устаревшие уже отфильтрованы), поэтому его длина = число «живых» агентов.
         degraded = len(payload) < len(AGENTS)
+
+        # Инерция входов (Блок C): решение на том же наборе мнений — повтор.
+        inputs_hash = compute_inputs_hash(payload)
+        previous_hash = await db.get_last_inputs_hash(self.instrument_id)
+        is_repeat = previous_hash is not None and previous_hash == inputs_hash
+
+        # Калиброванная вероятность (Блок B): только если кривая уже построена.
+        # Нет кривой — NULL, и никакая «вероятность» никому не показывается.
+        calibrated, calibration_id = await self._calibrate(conviction)
+
         await db.save_signal(
             self.instrument_id,
             decision,
-            probability,
+            conviction,
             payload,
             rationale,
             logic_version=LOGIC_VERSION,
             degraded=degraded,
+            calibrated_probability=calibrated,
+            calibration_id=calibration_id,
+            inputs_hash=inputs_hash,
+            is_repeat=is_repeat,
         )
         self._log.info(
             "Решение сохранено",
             decision=decision,
-            probability=probability,
+            conviction=conviction,
+            calibrated_probability=calibrated,
             agents=len(payload),
             degraded=degraded,
+            is_repeat=is_repeat,
         )
+
+    async def _calibrate(self, conviction: float) -> tuple[float | None, int | None]:
+        """Вероятность по активной кривой → (значение, id кривой) или (None, None).
+
+        Отсутствие кривой — штатное состояние первых суток после смены версии
+        логики, поэтому здесь нет ни ошибок, ни исключений. Сбой Redis или БД
+        тоже не должен ронять решение: в худшем случае вероятность просто не
+        будет записана, а сам сигнал сохранится.
+        """
+        try:
+            curve = await self._active_curve()
+        except Exception as exc:  # noqa: BLE001 — решение важнее калибровки
+            self._log.warning("Кривая калибровки недоступна", error=str(exc))
+            return None, None
+        if not curve:
+            return None, None
+        value = probability_for_index(curve.get("bins") or [], conviction)
+        if value is None:
+            return None, None
+        return value, curve.get("id")
+
+    async def _active_curve(self) -> dict[str, Any] | None:
+        """Активная кривая с кэшированием в Redis (ключ на версию логики, TTL 1 ч)."""
+        key = f"{CALIBRATION_CACHE_PREFIX}{LOGIC_VERSION}"
+        try:
+            cached = await get_redis().get(key)
+        except Exception:  # noqa: BLE001 — Redis необязателен, читаем из БД
+            cached = None
+        if cached:
+            try:
+                return json.loads(cached)
+            except (TypeError, ValueError):
+                pass  # мусор в кэше — перечитаем из БД и перезапишем
+
+        curve = await db.get_active_calibration(LOGIC_VERSION)
+        if curve is None:
+            return None
+        bins = curve["bins"]
+        if isinstance(bins, str):  # asyncpg отдаёт JSONB строкой
+            bins = json.loads(bins)
+        compact = {"id": int(curve["id"]), "bins": bins}
+        try:
+            await get_redis().set(
+                key, json.dumps(compact), ex=CALIBRATION_CACHE_TTL
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning("Не удалось закэшировать кривую", error=str(exc))
+        return compact
 
     async def run(self) -> None:
         """Бесконечный цикл: decide_once → heartbeat → пауза. Не падает на ошибках."""

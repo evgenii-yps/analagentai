@@ -45,6 +45,12 @@ class NotifyConfig:
     cooldown_sec: float
     # Минимум агентов со свежим содержательным выводом для отправки (Задача A2).
     min_agents: int = 3
+    # Этап 7.3, Блок B. false (по умолчанию) — отбор по ИНДЕКСУ СОГЛАСИЯ и
+    # прежнему порогу min_probability, поведение уведомлений не меняется.
+    # true — отбор по КАЛИБРОВАННОЙ вероятности и порогу min_calibrated; пока
+    # активной кривой нет, calibrated_probability = NULL, и не уходит ничего.
+    use_calibrated: bool = False
+    min_calibrated: float = 0.55
 
 
 @dataclass
@@ -71,8 +77,14 @@ def should_notify(
     # 1. Только направленные решения.
     if signal["decision"] == "wait":
         return False
-    # 2. Достаточная вероятность.
-    if float(signal["probability"]) < cfg.min_probability:
+    # 2. Порог силы сигнала. По умолчанию — индекс согласия, как и раньше.
+    #    В калиброванном режиме — вероятность из кривой; её отсутствие (кривая
+    #    ещё не построена) означает «не отправлять», а не «отправить всё».
+    if cfg.use_calibrated:
+        calibrated = signal.get("calibrated_probability")
+        if calibrated is None or float(calibrated) < cfg.min_calibrated:
+            return False
+    elif float(signal["probability"]) < cfg.min_probability:
         return False
     # 3. Раньше ничего не отправляли по этому инструменту → можно слать.
     if last_decision is None or last_sent_ts is None:
@@ -196,6 +208,33 @@ def _agent_line(entry: dict[str, Any]) -> str:
     return f"• {name}: {opinion} (уверенность {confidence:.2f})"
 
 
+def format_calibrated_line(signal: dict[str, Any]) -> str | None:
+    """Строка «Вероятность успеха (по истории)» — или None, если кривой нет.
+
+    Правило Этапа 7.3 §4.1: система никогда не показывает число, называя его
+    вероятностью, если это число не выведено из фактических исходов. Пока
+    ``calibrated_probability`` пуста, строки просто нет — вместо неё не
+    подставляется индекс согласия и не пишется «нет данных».
+
+    Дата кривой и размер её выборки печатаются, когда они известны: человек
+    должен видеть, на чём основано число (кривая от 16.08 по 87 наблюдениям —
+    это совсем не то же самое, что кривая по 8 наблюдениям).
+    """
+    value = signal.get("calibrated_probability")
+    if value is None:
+        return None
+    percent = round(float(value) * 100)
+    built_at = signal.get("calibration_built_at")
+    sample = signal.get("calibration_sample_size")
+    marks: list[str] = []
+    if isinstance(built_at, datetime):
+        marks.append(f"кривая от {built_at.strftime('%d.%m')}")
+    if sample is not None:
+        marks.append(f"N={int(sample)}")
+    suffix = f"  [{', '.join(marks)}]" if marks else ""
+    return f"Вероятность успеха (по истории): <b>{percent}%</b>{suffix}"
+
+
 def format_signal_message(
     signal: dict[str, Any],
     price: float | None,
@@ -214,15 +253,21 @@ def format_signal_message(
         emoji, action = "🟢", "ПОКУПАТЬ"
     else:
         emoji, action = "🔴", "ПРОДАВАТЬ"
-    probability = round(float(signal["probability"]) * 100)
+    conviction = round(float(signal["probability"]) * 100)
 
     payload = normalize_payload(signal.get("agents_payload"))
     present = {e.get("agent") for e in payload}
 
+    # Этап 7.3 §4.6: величина, которую считает Decision Agent, называется
+    # ИНДЕКСОМ СОГЛАСИЯ. Слово «вероятность» появляется ТОЛЬКО отдельной строкой
+    # и ТОЛЬКО когда она выведена из фактических исходов (есть кривая).
     lines = [
         f"{emoji} <b>СИГНАЛ: {action} {base}</b>",
-        f"Вероятность: <b>{probability}%</b>",
+        f"Индекс согласия: <b>{conviction}%</b>",
     ]
+    calibrated_line = format_calibrated_line(signal)
+    if calibrated_line:
+        lines.append(calibrated_line)
     if price is not None:
         lines.append(f"Цена сейчас: {format_price(price, quote)}")
 
@@ -270,9 +315,17 @@ class NotifyAgent:
         tz_name: str,
         primary_horizon: str,
         min_agents: int = 3,
+        use_calibrated: bool = False,
+        min_calibrated: float = 0.55,
     ) -> None:
         self.interval = interval
-        self.cfg = NotifyConfig(min_probability, cooldown_sec, min_agents)
+        self.cfg = NotifyConfig(
+            min_probability,
+            cooldown_sec,
+            min_agents,
+            use_calibrated=use_calibrated,
+            min_calibrated=min_calibrated,
+        )
         self.symbol = symbol
         self.tz_name = tz_name
         self.fmt_cfg = SignalFormatConfig(symbol, tz_name, primary_horizon)
@@ -285,7 +338,11 @@ class NotifyAgent:
             self._log.warning("Telegram не настроен — ожидание (сигналы не шлются)")
             return
 
-        signals = await db.get_unnotified_strong_signals(self.cfg.min_probability)
+        signals = await db.get_unnotified_strong_signals(
+            self.cfg.min_probability,
+            use_calibrated=self.cfg.use_calibrated,
+            min_calibrated=self.cfg.min_calibrated,
+        )
         for signal in signals:
             await self._process_signal(signal)
 

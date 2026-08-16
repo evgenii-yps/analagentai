@@ -81,10 +81,23 @@ PG_DB = os.environ.get("POSTGRES_DB", ENV.get("POSTGRES_DB", "agenttrade"))
 PRIMARY_HORIZON = os.environ.get(
     "EVAL_PRIMARY_HORIZON", ENV.get("EVAL_PRIMARY_HORIZON", "4h")
 )
-# Порог вероятности для счётчика «кандидатов» — берётся из .env, не зашивается.
+# Порог индекса согласия для счётчика «кандидатов» — из .env, не зашивается.
 NOTIFY_MIN_PROBABILITY = os.environ.get(
     "NOTIFY_MIN_PROBABILITY", ENV.get("NOTIFY_MIN_PROBABILITY", "0.7")
 )
+# Версия логики: по ней ищется активная калибровочная кривая (Этап 7.3).
+# Значение может прийти с хвостовым комментарием (если .env правили вручную) —
+# берём первое «слово» и не падаем на мусоре: сводка важнее одной строки в ней.
+def _logic_version() -> int:
+    raw = os.environ.get("LOGIC_VERSION", ENV.get("LOGIC_VERSION", "4")) or "4"
+    head = raw.split("#", 1)[0].strip().split()
+    try:
+        return int(head[0]) if head else 4
+    except ValueError:
+        return 4
+
+
+LOGIC_VERSION = _logic_version()
 
 
 def _run(cmd: list[str], timeout: int = 60) -> str:
@@ -252,7 +265,40 @@ def section_signals_24h() -> list[str]:
         f"AND probability >= {float(NOTIFY_MIN_PROBABILITY)} "
         "AND ts > now() - interval '24 hours';"
     )
-    lines.append(f"Кандидатов (вероятность ≥ порога): {candidates or '0'}")
+    lines.append(f"Кандидатов (индекс согласия ≥ порога): {candidates or '0'}")
+
+    # Этап 7.3, Блок C: инерция входов. Решение, принятое на том же наборе мнений
+    # агентов, что и предыдущее, новой информации не несёт. Отправку это не
+    # фильтрует — но без этой строки статистика «1440 решений в сутки» вводит
+    # в заблуждение.
+    repeats = _psql(
+        "SELECT count(*) FILTER (WHERE is_repeat) || '|' || count(*) "
+        "|| '|' || count(DISTINCT inputs_hash) FROM signals "
+        "WHERE ts > now() - interval '24 hours';"
+    )
+    if repeats and repeats.count("|") == 2:
+        repeat_n, total_n, unique_n = (part.strip() for part in repeats.split("|"))
+        share = (
+            f" ({round(100.0 * int(repeat_n) / int(total_n))}%)"
+            if total_n.isdigit() and int(total_n) > 0
+            else ""
+        )
+        lines.append(f"Из них повторных решений: {repeat_n}{share}")
+        lines.append(f"Уникальных наборов мнений: {unique_n}")
+
+    # Калибровочная кривая (Этап 7.3, Блок B): есть ли она вообще и на чём стоит.
+    curve = _psql(
+        "SELECT to_char(built_at, 'DD.MM HH24:MI') || '|' || sample_size "
+        "FROM calibration_curves WHERE is_active "
+        f"AND logic_version = {int(LOGIC_VERSION)} LIMIT 1;"
+    )
+    if curve and "|" in curve:
+        built, sample = (part.strip() for part in curve.split("|", 1))
+        lines.append(f"Калибровка: кривая от {built} UTC, N={sample}")
+    else:
+        lines.append(
+            "Калибровка: активной кривой нет — вероятность не показывается"
+        )
 
     closed = _psql(
         "SELECT count(*) FROM signal_evaluations "

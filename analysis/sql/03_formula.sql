@@ -86,7 +86,7 @@ GROUP BY logic_version
 ORDER BY logic_version;
 
 \echo
-\echo '--- 3.3 Доля успеха по КВАРТИЛЯМ |балла| (независимые окна версии 1, X из N) ---'
+\echo '--- 3.3 Доля успеха по КВАРТИЛЯМ |балла| (независимые окна целевой версии, X из N) ---'
 WITH v1_indep AS (
     SELECT DISTINCT ON (win) *
     FROM (
@@ -94,7 +94,9 @@ WITH v1_indep AS (
                to_timestamp(floor(extract(epoch FROM s.ts) / 14400) * 14400) AS win
         FROM signals s
         JOIN signal_evaluations e ON e.signal_id = s.id AND e.horizon = '4h'
-        WHERE s.logic_version = 1 AND s.decision <> 'wait'
+        WHERE s.logic_version = :target_version
+                  AND s.decision <> 'wait'
+                  AND s.degraded = FALSE
     ) q ORDER BY win, ts ASC
 ), calc AS (
     SELECT i.id, i.success, i.probability,
@@ -126,7 +128,7 @@ GROUP BY quartile
 ORDER BY quartile;
 
 \echo
-\echo '--- 3.4 Доля успеха по КАЖДОМУ дискретному значению согласованности (независимые окна версии 1, X из N) ---'
+\echo '--- 3.4 Доля успеха по КАЖДОМУ дискретному значению согласованности (независимые окна целевой версии, X из N) ---'
 WITH v1_indep AS (
     SELECT DISTINCT ON (win) *
     FROM (
@@ -134,7 +136,9 @@ WITH v1_indep AS (
                to_timestamp(floor(extract(epoch FROM s.ts) / 14400) * 14400) AS win
         FROM signals s
         JOIN signal_evaluations e ON e.signal_id = s.id AND e.horizon = '4h'
-        WHERE s.logic_version = 1 AND s.decision <> 'wait'
+        WHERE s.logic_version = :target_version
+                  AND s.decision <> 'wait'
+                  AND s.degraded = FALSE
     ) q ORDER BY win, ts ASC
 ), calc AS (
     SELECT i.success,
@@ -160,7 +164,7 @@ GROUP BY 1, 2
 ORDER BY 1, 2;
 
 \echo
-\echo '--- 3.5 Доля успеха по КВАРТИЛЯМ probability (независимые окна версии 1, X из N) ---'
+\echo '--- 3.5 Доля успеха по КВАРТИЛЯМ probability (независимые окна целевой версии, X из N) ---'
 WITH v1_indep AS (
     SELECT DISTINCT ON (win) *
     FROM (
@@ -168,7 +172,9 @@ WITH v1_indep AS (
                to_timestamp(floor(extract(epoch FROM s.ts) / 14400) * 14400) AS win
         FROM signals s
         JOIN signal_evaluations e ON e.signal_id = s.id AND e.horizon = '4h'
-        WHERE s.logic_version = 1 AND s.decision <> 'wait'
+        WHERE s.logic_version = :target_version
+                  AND s.decision <> 'wait'
+                  AND s.degraded = FALSE
     ) q ORDER BY win, ts ASC
 ), q AS (
     SELECT *, ntile(4) OVER (ORDER BY probability) AS quartile
@@ -185,7 +191,7 @@ GROUP BY quartile
 ORDER BY quartile;
 
 \echo
-\echo '--- 3.6 КАЛИБРОВОЧНАЯ ТАБЛИЦА: заявленная вероятность против фактической доли успеха (независимые окна версии 1) ---'
+\echo '--- 3.6 КАЛИБРОВОЧНАЯ ТАБЛИЦА: заявленная вероятность против фактической доли успеха (независимые окна целевой версии) ---'
 WITH v1_indep AS (
     SELECT DISTINCT ON (win) *
     FROM (
@@ -193,7 +199,9 @@ WITH v1_indep AS (
                to_timestamp(floor(extract(epoch FROM s.ts) / 14400) * 14400) AS win
         FROM signals s
         JOIN signal_evaluations e ON e.signal_id = s.id AND e.horizon = '4h'
-        WHERE s.logic_version = 1 AND s.decision <> 'wait'
+        WHERE s.logic_version = :target_version
+                  AND s.decision <> 'wait'
+                  AND s.degraded = FALSE
     ) q ORDER BY win, ts ASC
 ), b AS (
     SELECT *, least(width_bucket(probability, 0, 1, 5), 5) AS bucket
@@ -216,12 +224,14 @@ GROUP BY bucket
 ORDER BY bucket;
 
 \echo
-\echo '--- 3.7 Та же калибровка по ПОЛНОЙ выборке версии 1 (наблюдения ЗАВИСИМЫ, доверительные интервалы неприменимы) ---'
+\echo '--- 3.7 Та же калибровка по ПОЛНОЙ выборке целевой версии (наблюдения ЗАВИСИМЫ, доверительные интервалы неприменимы) ---'
 WITH b AS (
     SELECT s.probability, e.success, least(width_bucket(s.probability, 0, 1, 5), 5) AS bucket
     FROM signals s
     JOIN signal_evaluations e ON e.signal_id = s.id AND e.horizon = '4h'
-    WHERE s.logic_version = 1 AND s.decision <> 'wait' AND s.probability IS NOT NULL
+    WHERE s.logic_version = :target_version
+                  AND s.decision <> 'wait'
+                  AND s.degraded = FALSE AND s.probability IS NOT NULL
 )
 SELECT CASE bucket
             WHEN 1 THEN '0.0 – 0.2'
@@ -237,3 +247,61 @@ SELECT CASE bucket
 FROM b
 GROUP BY bucket
 ORDER BY bucket;
+
+\echo
+\echo '--- 3.8 ЭТАП 7.3: КАЛИБРОВОЧНАЯ ТАБЛИЦА по calibrated_probability (независимые окна целевой версии) ---'
+\echo '(в отличие от 3.6, здесь по горизонтали — вероятность, ВЫВЕДЕННАЯ из фактических исходов)'
+WITH indep AS (
+    SELECT DISTINCT ON (win) *
+    FROM (
+        SELECT s.id, s.ts, s.calibrated_probability AS cp, e.success,
+               to_timestamp(floor(extract(epoch FROM s.ts) / 14400) * 14400) AS win
+        FROM signals s
+        JOIN signal_evaluations e ON e.signal_id = s.id AND e.horizon = '4h'
+        WHERE s.logic_version = :target_version
+          AND s.decision <> 'wait'
+          AND s.degraded = FALSE
+          AND s.calibrated_probability IS NOT NULL
+    ) q ORDER BY win, ts ASC
+), b AS (
+    SELECT *, least(width_bucket(cp, 0, 1, 5), 5) AS bucket FROM indep
+)
+SELECT CASE bucket
+            WHEN 1 THEN '0.0 – 0.2'
+            WHEN 2 THEN '0.2 – 0.4'
+            WHEN 3 THEN '0.4 – 0.6'
+            WHEN 4 THEN '0.6 – 0.8'
+            WHEN 5 THEN '0.8 – 1.0'
+       END                                 AS calibrated_range,
+       count(*)                            AS n,
+       round(avg(cp)::numeric, 4)          AS claimed_probability_avg,
+       count(*) FILTER (WHERE success)     AS success_x,
+       round((count(*) FILTER (WHERE success))::numeric / NULLIF(count(*), 0), 4) AS actual_success_rate,
+       round(avg(cp)::numeric - (count(*) FILTER (WHERE success))::numeric / NULLIF(count(*), 0), 4) AS gap
+FROM b
+GROUP BY bucket
+ORDER BY bucket;
+
+\echo
+\echo '--- 3.9 ЭТАП 7.3: построенные калибровочные кривые (история, активная помечена) ---'
+SELECT id,
+       logic_version,
+       built_at,
+       sample_size,
+       window_from,
+       window_to,
+       round(base_rate::numeric, 4) AS base_rate,
+       is_active,
+       bins
+FROM calibration_curves
+ORDER BY logic_version, built_at DESC;
+
+\echo
+\echo '--- 3.10 ЭТАП 7.3: контроль — активная кривая на версию логики может быть только одна ---'
+SELECT logic_version,
+       count(*) FILTER (WHERE is_active) AS active_curves,
+       CASE WHEN count(*) FILTER (WHERE is_active) <= 1
+            THEN 'ОК' ELSE 'НАРУШЕНИЕ' END AS verdict
+FROM calibration_curves
+GROUP BY logic_version
+ORDER BY logic_version;

@@ -155,6 +155,21 @@ services:
     command: ["python", "-m", "src.export_main"]
     restart: "no"
 
+  # Этап 7.3: построение калибровочной кривой (разовая задача, cron 05:30 UTC).
+  # Тот же профиль tools и та же причина, что у export: постоянный контейнер не
+  # нужен, а сторонние пакеты (asyncpg/structlog/pydantic) есть только в образе —
+  # на хост pip-пакеты не ставятся (правило D-3).
+  #   docker compose --profile tools run --rm --no-deps calibration
+  # Нехватка данных для кривой — код возврата 0 (штатное состояние), реальный
+  # сбой — 1, и cron его увидит.
+  calibration:
+    build: .
+    env_file: .env
+    profiles: ["tools"]
+    depends_on: [postgres, redis]
+    command: ["python", "-m", "src.calibration_main"]
+    restart: "no"
+
 volumes:
   pg_data:
   redis_data:

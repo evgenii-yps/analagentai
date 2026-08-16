@@ -24,7 +24,11 @@ APP_DIR="${APP_DIR:-/opt/agent-trade}"
 OUT_DIR="${OUT_DIR:-$APP_DIR/analysis_out}"
 SQL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/sql"
 RUN_DATE="$(date -u +%Y%m%d)"
-OUT_FILE="$OUT_DIR/report_7_1_${RUN_DATE}.txt"
+# Целевая версия логики для расчётов 1–5 и 7 (Этап 7.3, Блок D). По умолчанию 4 —
+# режим, начатый развёртыванием 7.3. Для повторения измерения Этапа 7.1 задать
+# TARGET_LOGIC_VERSION=1. Расчёт 6 всегда идёт по всем версиям сразу.
+TARGET_LOGIC_VERSION="${TARGET_LOGIC_VERSION:-4}"
+OUT_FILE="$OUT_DIR/report_7_1_v${TARGET_LOGIC_VERSION}_${RUN_DATE}.txt"
 MAX_LINES="${MAX_LINES:-2000}"   # порог, после которого отчёт делится на две части
 
 # Пароль роли только на чтение. Читается из .env, НИКОГДА не печатается и не
@@ -95,9 +99,12 @@ fi
 #   passwd — через 127.0.0.1 с паролем из .env (запасной путь).
 # Роль в обоих случаях одна и та же и прав записи не имеет.
 # ---------------------------------------------------------------------------
-psql_socket() { "${DC[@]}" exec -T postgres psql -X -q -U agenttrade_ro -d "$DB_NAME" "$@"; }
+psql_socket() { "${DC[@]}" exec -T postgres psql -X -q \
+                    -v target_version="$TARGET_LOGIC_VERSION" \
+                    -U agenttrade_ro -d "$DB_NAME" "$@"; }
 psql_passwd() { "${DC[@]}" exec -T -e PGPASSWORD="$RO_PW" postgres \
-                    psql -X -q -h 127.0.0.1 -U agenttrade_ro -d "$DB_NAME" "$@"; }
+                    psql -X -q -v target_version="$TARGET_LOGIC_VERSION" \
+                    -h 127.0.0.1 -U agenttrade_ro -d "$DB_NAME" "$@"; }
 
 psql_run() {  # $1 — путь к .sql-файлу на ХОСТЕ (подаётся в psql через stdin)
     case "$CONN_MODE" in
@@ -128,6 +135,7 @@ BLOCKS=(
     "04_inertia.sql|РАСЧЁТ 4: ЧАСТОТА ОБНОВЛЕНИЯ ВХОДНЫХ ДАННЫХ"
     "05_correlation.sql|РАСЧЁТ 5: КОРРЕЛЯЦИЯ МЕЖДУ АГЕНТАМИ"
     "06_silence.sql|РАСЧЁТ 6: ПОЧЕМУ СИСТЕМА ЗАМОЛЧАЛА"
+    "07_compare.sql|РАСЧЁТ 7: ЦЕЛЕВАЯ ВЕРСИЯ ПРОТИВ ВЕРСИИ 1"
 )
 
 # ---------------------------------------------------------------------------
@@ -140,6 +148,7 @@ main() {
     echo " Дата запуска (UTC): $(date -u '+%Y-%m-%d %H:%M:%S')"
     echo " Каталог приложения: $APP_DIR"
     echo " Запросы:            $SQL_DIR"
+    echo " Целевая версия:     logic_version = $TARGET_LOGIC_VERSION (расчёты 1–5 и 7)"
     echo " Роль подключения:   agenttrade_ro (только SELECT)"
     echo " Режим записи:       отсутствует (default_transaction_read_only = on)"
     echo " Контейнеры:         не перезапускались, .env и src/ не изменялись"

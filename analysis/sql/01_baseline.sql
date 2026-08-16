@@ -8,7 +8,9 @@
 --     00/04/08/12/16/20 UTC (epoch кратен 14400 → границы совпадают ровно);
 --     из окна берётся ПЕРВЫЙ по времени закрытый сигнал;
 --   * успех — pnl_pct > 0 по горизонту 4h (знак уже учитывает направление);
---   * область данных — logic_version = 1; решения wait исключены.
+--   * область данных — logic_version = :target_version (переменная psql,
+--     задаётся TARGET_LOGIC_VERSION, по умолчанию 4); решения wait исключены,
+--     записи degraded = true отсекаются.
 --
 -- ВАЖНО по схеме: в ohlcv нет таймфрейма 4h (собираются 1m,5m,15m,1h), поэтому
 -- базовые линии считаются по close 1m-свечей — ровно так же, как берёт цену сам
@@ -20,14 +22,16 @@ SET default_transaction_read_only = on;
 SET statement_timeout = '600s';
 
 \echo
-\echo '--- 1.1 Размер независимой выборки (logic_version = 1) ---'
+\echo '--- 1.1 Размер независимой выборки (logic_version = :target_version) ---'
 WITH v1_eval AS (
     SELECT s.id, s.ts, s.instrument_id, s.decision, s.probability,
            e.pnl_pct, e.success,
            to_timestamp(floor(extract(epoch FROM s.ts) / 14400) * 14400) AS win
     FROM signals s
     JOIN signal_evaluations e ON e.signal_id = s.id AND e.horizon = '4h'
-    WHERE s.logic_version = 1 AND s.decision <> 'wait'
+    WHERE s.logic_version = :target_version
+                  AND s.decision <> 'wait'
+                  AND s.degraded = FALSE
 ), v1_indep AS (
     SELECT DISTINCT ON (win) * FROM v1_eval ORDER BY win, ts ASC
 ), px AS (
@@ -59,7 +63,9 @@ WITH v1_eval AS (
            to_timestamp(floor(extract(epoch FROM s.ts) / 14400) * 14400) AS win
     FROM signals s
     JOIN signal_evaluations e ON e.signal_id = s.id AND e.horizon = '4h'
-    WHERE s.logic_version = 1 AND s.decision <> 'wait'
+    WHERE s.logic_version = :target_version
+                  AND s.decision <> 'wait'
+                  AND s.degraded = FALSE
 ), v1_indep AS (
     SELECT DISTINCT ON (win) * FROM v1_eval ORDER BY win, ts ASC
 )
@@ -84,7 +90,9 @@ WITH v1_eval AS (
            to_timestamp(floor(extract(epoch FROM s.ts) / 14400) * 14400) AS win
     FROM signals s
     JOIN signal_evaluations e ON e.signal_id = s.id AND e.horizon = '4h'
-    WHERE s.logic_version = 1 AND s.decision <> 'wait'
+    WHERE s.logic_version = :target_version
+                  AND s.decision <> 'wait'
+                  AND s.degraded = FALSE
 ), v1_indep AS (
     SELECT DISTINCT ON (win) * FROM v1_eval ORDER BY win, ts ASC
 )
@@ -114,7 +122,9 @@ WITH v1_eval AS (
            to_timestamp(floor(extract(epoch FROM s.ts) / 14400) * 14400) AS win
     FROM signals s
     JOIN signal_evaluations e ON e.signal_id = s.id AND e.horizon = '4h'
-    WHERE s.logic_version = 1 AND s.decision <> 'wait'
+    WHERE s.logic_version = :target_version
+                  AND s.decision <> 'wait'
+                  AND s.degraded = FALSE
 ), v1_indep AS (
     SELECT DISTINCT ON (win) * FROM v1_eval ORDER BY win, ts ASC
 ), px AS (
@@ -161,7 +171,9 @@ WITH v1_eval AS (
            to_timestamp(floor(extract(epoch FROM s.ts) / 14400) * 14400) AS win
     FROM signals s
     JOIN signal_evaluations e ON e.signal_id = s.id AND e.horizon = '4h'
-    WHERE s.logic_version = 1 AND s.decision <> 'wait'
+    WHERE s.logic_version = :target_version
+                  AND s.decision <> 'wait'
+                  AND s.degraded = FALSE
 ), v1_indep AS (
     SELECT DISTINCT ON (win) * FROM v1_eval ORDER BY win, ts ASC
 ), px AS (
@@ -197,7 +209,9 @@ WITH v1_eval AS (
            to_timestamp(floor(extract(epoch FROM s.ts) / 14400) * 14400) AS win
     FROM signals s
     JOIN signal_evaluations e ON e.signal_id = s.id AND e.horizon = '4h'
-    WHERE s.logic_version = 1 AND s.decision <> 'wait'
+    WHERE s.logic_version = :target_version
+                  AND s.decision <> 'wait'
+                  AND s.degraded = FALSE
 ), v1_indep AS (
     SELECT DISTINCT ON (win) * FROM v1_eval ORDER BY win, ts ASC
 ), px AS (
@@ -229,15 +243,17 @@ FROM px
 ORDER BY win;
 
 \echo
-\echo '=== ПОЛНАЯ ВЫБОРКА (logic_version = 1): наблюдения ЗАВИСИМЫ, доверительные интервалы неприменимы ==='
+\echo '=== ПОЛНАЯ ВЫБОРКА (logic_version = :target_version): наблюдения ЗАВИСИМЫ, доверительные интервалы неприменимы ==='
 
 \echo
-\echo '--- 1.7 Доля успеха по ПОЛНОЙ выборке закрытых сигналов версии 1 (X из N) ---'
+\echo '--- 1.7 Доля успеха по ПОЛНОЙ выборке закрытых сигналов целевой версии (X из N) ---'
 WITH v1_eval AS (
     SELECT s.decision, e.success
     FROM signals s
     JOIN signal_evaluations e ON e.signal_id = s.id AND e.horizon = '4h'
-    WHERE s.logic_version = 1 AND s.decision <> 'wait'
+    WHERE s.logic_version = :target_version
+                  AND s.decision <> 'wait'
+                  AND s.degraded = FALSE
 )
 SELECT 'ВСЕГО' AS bucket,
        count(*) FILTER (WHERE success) AS success_x,
@@ -254,12 +270,14 @@ GROUP BY decision
 ORDER BY 1;
 
 \echo
-\echo '--- 1.8 pnl_4h по ПОЛНОЙ выборке версии 1 (наблюдения зависимы) ---'
+\echo '--- 1.8 pnl_4h по ПОЛНОЙ выборке целевой версии (наблюдения зависимы) ---'
 WITH v1_eval AS (
     SELECT s.decision, e.pnl_pct
     FROM signals s
     JOIN signal_evaluations e ON e.signal_id = s.id AND e.horizon = '4h'
-    WHERE s.logic_version = 1 AND s.decision <> 'wait'
+    WHERE s.logic_version = :target_version
+                  AND s.decision <> 'wait'
+                  AND s.degraded = FALSE
 )
 SELECT 'ВСЕГО' AS bucket,
        count(*)                                                                AS n,
@@ -276,7 +294,7 @@ GROUP BY decision
 ORDER BY 1;
 
 \echo
-\echo '--- 1.9 Полная выборка версии 1 по суткам (динамика; наблюдения зависимы) ---'
+\echo '--- 1.9 Полная выборка целевой версии по суткам (динамика; наблюдения зависимы) ---'
 SELECT date_trunc('day', s.ts)::date        AS day_utc,
        count(*)                             AS n,
        count(*) FILTER (WHERE e.success)    AS success_x,
@@ -284,6 +302,8 @@ SELECT date_trunc('day', s.ts)::date        AS day_utc,
        round(avg(e.pnl_pct)::numeric, 4)    AS avg_pnl_pct
 FROM signals s
 JOIN signal_evaluations e ON e.signal_id = s.id AND e.horizon = '4h'
-WHERE s.logic_version = 1 AND s.decision <> 'wait'
+WHERE s.logic_version = :target_version
+                  AND s.decision <> 'wait'
+                  AND s.degraded = FALSE
 GROUP BY 1
 ORDER BY 1;

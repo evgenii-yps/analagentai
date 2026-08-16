@@ -114,7 +114,8 @@ class BotQueries:
         rows = await self._pool.fetch(
             """
             SELECT id, ts, decision, probability, status,
-                   pnl_pct, drawdown_pct, success
+                   pnl_pct, drawdown_pct, success,
+                   calibrated_probability, is_repeat
             FROM signals
             WHERE (NOT $1 OR notified_at IS NOT NULL)
             ORDER BY ts DESC
@@ -131,10 +132,16 @@ class BotQueries:
         """Полная карточка сигнала: поля, оценки 1ч/4ч и цена на момент сигнала."""
         row = await self._pool.fetchrow(
             """
-            SELECT id, instrument_id, ts, decision, probability, rationale,
-                   notified, notified_at, status,
-                   agents_payload::text AS agents_payload
-            FROM signals WHERE id = $1;
+            SELECT s.id, s.instrument_id, s.ts, s.decision, s.probability,
+                   s.rationale, s.notified, s.notified_at, s.status,
+                   s.agents_payload::text AS agents_payload,
+                   s.calibrated_probability, s.calibration_id,
+                   s.inputs_hash, s.is_repeat,
+                   c.built_at    AS calibration_built_at,
+                   c.sample_size AS calibration_sample_size
+            FROM signals s
+            LEFT JOIN calibration_curves c ON c.id = s.calibration_id
+            WHERE s.id = $1;
             """,
             signal_id,
         )
@@ -317,7 +324,11 @@ class BotQueries:
                 count(*) FILTER (WHERE notified AND notified_at IS NULL) AS absorbed,
                 count(*) FILTER (
                     WHERE decision <> 'wait' AND probability >= $1
-                ) AS candidates
+                ) AS candidates,
+                -- Этап 7.3, Блок C: сколько решений принято на том же наборе
+                -- мнений, что и предыдущее, и сколько разных наборов вообще было.
+                count(*) FILTER (WHERE is_repeat)      AS repeats,
+                count(DISTINCT inputs_hash)            AS unique_inputs
             FROM signals
             WHERE ts > now() - interval '24 hours';
             """,
@@ -335,6 +346,8 @@ class BotQueries:
             "sent": int(row["sent"]) if row else 0,
             "absorbed": int(row["absorbed"]) if row else 0,
             "candidates": int(row["candidates"]) if row else 0,
+            "repeats": int(row["repeats"]) if row else 0,
+            "unique_inputs": int(row["unique_inputs"]) if row else 0,
             "closed": int(closed or 0),
         }
 

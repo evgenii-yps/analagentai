@@ -326,6 +326,51 @@ class DB:
         """
         return await self.pool.fetch(query, instrument_id, limit)
 
+    async def get_funding_window(
+        self,
+        instrument_id: int,
+        hours: int,
+    ) -> list[asyncpg.Record]:
+        """Окно funding за последние ``hours`` часов, по одной точке на час.
+
+        Прореживание (``DISTINCT ON`` по часу, берётся последнее значение часа)
+        нужно потому, что коллектор может писать значение хоть раз в минуту: без
+        него неделя дала бы более 10 000 строк на каждой итерации агента.
+        Перцентиль при этом считается по «времени, проведённому ниже текущего
+        уровня», что и требуется для оценки положения в распределении.
+        """
+        query = """
+            SELECT ts, rate
+            FROM (
+                SELECT DISTINCT ON (date_trunc('hour', ts)) ts, rate
+                FROM funding
+                WHERE instrument_id = $1
+                  AND ts >= now() - make_interval(hours => $2)
+                ORDER BY date_trunc('hour', ts), ts DESC
+            ) sub
+            ORDER BY ts ASC;
+        """
+        return await self.pool.fetch(query, instrument_id, int(hours))
+
+    async def get_open_interest_window(
+        self,
+        instrument_id: int,
+        hours: int,
+    ) -> list[asyncpg.Record]:
+        """Окно open interest за последние ``hours`` часов, по точке на час."""
+        query = """
+            SELECT ts, value
+            FROM (
+                SELECT DISTINCT ON (date_trunc('hour', ts)) ts, value
+                FROM open_interest
+                WHERE instrument_id = $1
+                  AND ts >= now() - make_interval(hours => $2)
+                ORDER BY date_trunc('hour', ts), ts DESC
+            ) sub
+            ORDER BY ts ASC;
+        """
+        return await self.pool.fetch(query, instrument_id, int(hours))
+
     async def ensure_agent_failure_schema(self) -> None:
         """Идемпотентно создаёт таблицу учёта сбоев агентов (Этап 7.0, Задача B).
 
@@ -444,6 +489,111 @@ class DB:
             "ADD COLUMN IF NOT EXISTS degraded BOOLEAN NOT NULL DEFAULT FALSE;"
         )
 
+    async def ensure_calibration_schema(self) -> None:
+        """Идемпотентно создаёт схему калибровки (Этап 7.3, Блок B).
+
+        Колонка ``probability`` СОХРАНЯЕТСЯ и продолжает хранить индекс согласия:
+        переименование колонки сломало бы выгрузку, бота и суточную сводку.
+        Рядом появляются ``calibrated_probability`` (вероятность, выведенная из
+        фактических исходов; NULL, пока кривой нет) и ссылка на кривую.
+        Уникальный частичный индекс гарантирует не больше одной активной кривой
+        на версию логики.
+        """
+        await self.pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS calibration_curves (
+                id              BIGSERIAL PRIMARY KEY,
+                logic_version   SMALLINT    NOT NULL,
+                built_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+                sample_size     INTEGER     NOT NULL,
+                window_from     TIMESTAMPTZ NOT NULL,
+                window_to       TIMESTAMPTZ NOT NULL,
+                base_rate       DOUBLE PRECISION NOT NULL,
+                bins            JSONB       NOT NULL,
+                is_active       BOOLEAN     NOT NULL DEFAULT FALSE,
+                notes           TEXT
+            );
+            """
+        )
+        await self.pool.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_calibration_active "
+            "ON calibration_curves (logic_version) WHERE is_active;"
+        )
+        await self.pool.execute(
+            "CREATE INDEX IF NOT EXISTS idx_calibration_built "
+            "ON calibration_curves (logic_version, built_at DESC);"
+        )
+        await self.pool.execute(
+            "ALTER TABLE signals "
+            "ADD COLUMN IF NOT EXISTS calibrated_probability DOUBLE PRECISION;"
+        )
+        await self.pool.execute(
+            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS calibration_id BIGINT;"
+        )
+        # Роль только на чтение (сервис бота) должна видеть новую таблицу сразу.
+        # Без этого бот, стартовавший РАНЬШЕ создания таблицы, получал бы отказ
+        # в правах на /signal до следующего перезапуска: его собственный
+        # GRANT ON ALL TABLES отработал, когда таблицы ещё не было.
+        await self.pool.execute(
+            """
+            DO $$
+            BEGIN
+                IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agenttrade_ro') THEN
+                    GRANT SELECT ON calibration_curves TO agenttrade_ro;
+                END IF;
+            END $$;
+            """
+        )
+        # Внешний ключ добавляем отдельно: ADD CONSTRAINT не поддерживает
+        # IF NOT EXISTS, поэтому проверяем наличие по каталогу (идемпотентность).
+        await self.pool.execute(
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname = 'signals_calibration_id_fkey'
+                ) THEN
+                    ALTER TABLE signals
+                        ADD CONSTRAINT signals_calibration_id_fkey
+                        FOREIGN KEY (calibration_id)
+                        REFERENCES calibration_curves(id);
+                END IF;
+            END $$;
+            """
+        )
+
+    async def ensure_signals_inertia(self) -> None:
+        """Идемпотентно добавляет ``inputs_hash`` и ``is_repeat`` (Этап 7.3, Блок C).
+
+        Частота решений не меняется: решение, принятое на том же наборе входных
+        мнений, что и предыдущее, просто помечается повтором. Старые записи не
+        пересчитываются — у них ``inputs_hash`` остаётся NULL.
+        """
+        await self.pool.execute(
+            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS inputs_hash TEXT;"
+        )
+        await self.pool.execute(
+            "ALTER TABLE signals "
+            "ADD COLUMN IF NOT EXISTS is_repeat BOOLEAN NOT NULL DEFAULT FALSE;"
+        )
+        await self.pool.execute(
+            "CREATE INDEX IF NOT EXISTS idx_signals_inputs_hash "
+            "ON signals (instrument_id, inputs_hash, ts DESC);"
+        )
+
+    async def get_last_inputs_hash(self, instrument_id: int) -> str | None:
+        """Хэш входов предыдущего по времени сигнала инструмента (или None)."""
+        return await self.pool.fetchval(
+            """
+            SELECT inputs_hash FROM signals
+            WHERE instrument_id = $1
+            ORDER BY ts DESC
+            LIMIT 1;
+            """,
+            instrument_id,
+        )
+
     async def save_signal(
         self,
         instrument_id: int,
@@ -453,19 +603,28 @@ class DB:
         rationale: str,
         logic_version: int,
         degraded: bool = False,
+        calibrated_probability: float | None = None,
+        calibration_id: int | None = None,
+        inputs_hash: str | None = None,
+        is_repeat: bool = False,
     ) -> None:
         """INSERT итогового решения в ``signals`` (status остаётся 'open').
 
-        ``logic_version`` — версия логики агрегации/агентов (константа кода
-        Decision Agent, а не настройка), фиксирует границу режимов Этапа 7.0/7.2.
+        ``logic_version`` — версия логики агрегации/агентов, фиксирует границу
+        режимов Этапов 7.0/7.2/7.3.
         ``degraded`` (Этап 7.2) — участвовало меньше полного числа агентов;
         по такому сигналу уведомление НЕ отправляется, но сам сигнал сохраняется.
+        ``probability`` (Этап 7.3) — ИНДЕКС СОГЛАСИЯ, формула не изменилась.
+        ``calibrated_probability`` — вероятность по накопленным исходам; NULL,
+        пока активной кривой нет. ``inputs_hash``/``is_repeat`` — учёт инерции
+        входов (Блок C).
         """
         query = """
             INSERT INTO signals
                 (instrument_id, decision, probability, agents_payload, rationale,
-                 logic_version, degraded)
-            VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7);
+                 logic_version, degraded, calibrated_probability, calibration_id,
+                 inputs_hash, is_repeat)
+            VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11);
         """
         await self.pool.execute(
             query,
@@ -476,7 +635,104 @@ class DB:
             rationale,
             int(logic_version),
             bool(degraded),
+            None if calibrated_probability is None else float(calibrated_probability),
+            None if calibration_id is None else int(calibration_id),
+            inputs_hash,
+            bool(is_repeat),
         )
+
+    # --- Калибровочные кривые (Этап 7.3, Блок B) ---
+
+    async def get_active_calibration(
+        self,
+        logic_version: int,
+    ) -> dict[str, Any] | None:
+        """Активная кривая для версии логики (или None, если её нет)."""
+        row = await self.pool.fetchrow(
+            """
+            SELECT id, logic_version, built_at, sample_size, window_from,
+                   window_to, base_rate, bins, notes
+            FROM calibration_curves
+            WHERE logic_version = $1 AND is_active
+            LIMIT 1;
+            """,
+            int(logic_version),
+        )
+        return dict(row) if row is not None else None
+
+    async def get_independent_outcomes(
+        self,
+        logic_version: int,
+        horizon: str,
+    ) -> list[dict[str, Any]]:
+        """Независимые наблюдения для калибровки: одно на 4-часовое окно.
+
+        Берутся закрытые направленные сигналы указанной версии логики с
+        ``degraded = false``, у которых есть оценка на нужном горизонте. Окна —
+        непересекающиеся 4-часовые отрезки с границами 00/04/08/12/16/20 UTC
+        (epoch кратен 14400), из окна берётся ПЕРВЫЙ по времени сигнал.
+        Прореживание обязательно: решения выдаются раз в минуту, а горизонт —
+        четыре часа, поэтому соседние сигналы описывают почти один и тот же
+        отрезок рынка и независимыми наблюдениями не являются.
+        """
+        query = """
+            SELECT DISTINCT ON (win) win, id, ts, probability, success
+            FROM (
+                SELECT s.id, s.ts, s.probability, e.success,
+                       to_timestamp(floor(extract(epoch FROM s.ts) / 14400) * 14400)
+                           AS win
+                FROM signals s
+                JOIN signal_evaluations e
+                  ON e.signal_id = s.id AND e.horizon = $2
+                WHERE s.logic_version = $1
+                  AND s.decision <> 'wait'
+                  AND s.degraded = FALSE
+                  AND s.probability IS NOT NULL
+            ) q
+            ORDER BY win, ts ASC;
+        """
+        rows = await self.pool.fetch(query, int(logic_version), horizon)
+        return [dict(r) for r in rows]
+
+    async def save_calibration_curve(
+        self,
+        logic_version: int,
+        sample_size: int,
+        window_from: datetime,
+        window_to: datetime,
+        base_rate: float,
+        bins: list[dict[str, Any]],
+        notes: str | None = None,
+    ) -> int:
+        """Сохраняет кривую и делает её активной в ОДНОЙ транзакции → id кривой.
+
+        Прежняя активная кривая этой версии деактивируется в той же транзакции:
+        частичный уникальный индекс не допускает двух активных одновременно,
+        поэтому порядок «снять — поставить» обязателен.
+        """
+        async with self.pool.acquire() as conn, conn.transaction():
+            await conn.execute(
+                "UPDATE calibration_curves SET is_active = FALSE "
+                "WHERE logic_version = $1 AND is_active;",
+                int(logic_version),
+            )
+            curve_id = await conn.fetchval(
+                """
+                INSERT INTO calibration_curves
+                    (logic_version, sample_size, window_from, window_to,
+                     base_rate, bins, is_active, notes)
+                VALUES ($1, $2, $3, $4, $5, $6::jsonb, TRUE, $7)
+                RETURNING id;
+                """,
+                int(logic_version),
+                int(sample_size),
+                window_from,
+                window_to,
+                float(base_rate),
+                json.dumps(bins),
+                notes,
+            )
+        return int(curve_id)
 
     # --- Уведомления (Этап 5) ---
 
@@ -498,23 +754,54 @@ class DB:
     async def get_unnotified_strong_signals(
         self,
         min_probability: float,
+        use_calibrated: bool = False,
+        min_calibrated: float = 0.0,
     ) -> list[dict[str, Any]]:
-        """Неотправленные сильные сигналы (decision != wait, prob >= порога), ts ASC.
+        """Неотправленные сильные сигналы (decision != wait, порог пройден), ts ASC.
 
         ``agents_payload`` включён для самодостаточного текста уведомления (ТЗ 6.7
         §6): по нему форматтер показывает мнения агентов и пересчитывает
-        согласованность. Условия выборки (фильтры отправки) не изменены.
+        согласованность.
+
+        Режим отбора (Этап 7.3, Блок B). По умолчанию (``use_calibrated=False``)
+        условия ровно те же, что и были: индекс согласия ≥ NOTIFY_MIN_PROBABILITY.
+        При ``use_calibrated=True`` отбор идёт по КАЛИБРОВАННОЙ вероятности; пока
+        активной кривой нет, она у всех сигналов NULL — выборка пуста, и
+        уведомления не уходят вовсе, как и требует ТЗ.
         """
-        query = """
-            SELECT id, instrument_id, ts, decision, probability, rationale,
-                   agents_payload
-            FROM signals
-            WHERE notified = FALSE
-              AND decision <> 'wait'
-              AND probability >= $1
-            ORDER BY ts ASC;
+        # Кривая присоединяется LEFT JOIN: в тексте уведомления вероятность
+        # сопровождается датой кривой и размером её выборки, а при отсутствии
+        # кривой обе колонки просто NULL и строка про вероятность не печатается.
+        columns = """
+            s.id, s.instrument_id, s.ts, s.decision, s.probability, s.rationale,
+            s.agents_payload, s.calibrated_probability, s.calibration_id,
+            s.is_repeat,
+            c.built_at    AS calibration_built_at,
+            c.sample_size AS calibration_sample_size
         """
-        rows = await self.pool.fetch(query, float(min_probability))
+        if use_calibrated:
+            query = f"""
+                SELECT {columns}
+                FROM signals s
+                LEFT JOIN calibration_curves c ON c.id = s.calibration_id
+                WHERE s.notified = FALSE
+                  AND s.decision <> 'wait'
+                  AND s.calibrated_probability IS NOT NULL
+                  AND s.calibrated_probability >= $1
+                ORDER BY s.ts ASC;
+            """
+            rows = await self.pool.fetch(query, float(min_calibrated))
+        else:
+            query = f"""
+                SELECT {columns}
+                FROM signals s
+                LEFT JOIN calibration_curves c ON c.id = s.calibration_id
+                WHERE s.notified = FALSE
+                  AND s.decision <> 'wait'
+                  AND s.probability >= $1
+                ORDER BY s.ts ASC;
+            """
+            rows = await self.pool.fetch(query, float(min_probability))
         return [dict(r) for r in rows]
 
     async def mark_signal_notified(self, signal_id: int) -> None:

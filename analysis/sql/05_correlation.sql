@@ -1,5 +1,6 @@
 -- ЭТАП 7.1, РАСЧЁТ 5 (раздел 9 ТЗ): попарная согласованность агентов.
--- Только чтение. Независимые 4-часовые окна, logic_version = 1.
+-- Только чтение. Независимые 4-часовые окна, logic_version = :target_version
+-- (переменная psql из TARGET_LOGIC_VERSION, по умолчанию 4), degraded = false.
 --
 -- Направления берутся из signals.agents_payload — то есть ровно те мнения,
 -- которые участвовали в решении. Окна, где одного из пары нет в payload,
@@ -10,7 +11,7 @@ SET default_transaction_read_only = on;
 SET statement_timeout = '600s';
 
 \echo
-\echo '--- 5.1 Попарное совпадение направлений агентов (независимые окна версии 1, X из N) ---'
+\echo '--- 5.1 Попарное совпадение направлений агентов (независимые окна целевой версии, X из N) ---'
 WITH v1_indep AS (
     SELECT DISTINCT ON (win) *
     FROM (
@@ -18,7 +19,9 @@ WITH v1_indep AS (
                to_timestamp(floor(extract(epoch FROM s.ts) / 14400) * 14400) AS win
         FROM signals s
         JOIN signal_evaluations e ON e.signal_id = s.id AND e.horizon = '4h'
-        WHERE s.logic_version = 1 AND s.decision <> 'wait'
+        WHERE s.logic_version = :target_version
+                  AND s.decision <> 'wait'
+                  AND s.degraded = FALSE
     ) q ORDER BY win, ts ASC
 ), piv AS (
     SELECT i.id,
@@ -58,7 +61,9 @@ WITH v1_indep AS (
                to_timestamp(floor(extract(epoch FROM s.ts) / 14400) * 14400) AS win
         FROM signals s
         JOIN signal_evaluations e ON e.signal_id = s.id AND e.horizon = '4h'
-        WHERE s.logic_version = 1 AND s.decision <> 'wait'
+        WHERE s.logic_version = :target_version
+                  AND s.decision <> 'wait'
+                  AND s.degraded = FALSE
     ) q ORDER BY win, ts ASC
 ), piv AS (
     SELECT i.id,
@@ -95,7 +100,9 @@ WITH v1_indep AS (
                to_timestamp(floor(extract(epoch FROM s.ts) / 14400) * 14400) AS win
         FROM signals s
         JOIN signal_evaluations e ON e.signal_id = s.id AND e.horizon = '4h'
-        WHERE s.logic_version = 1 AND s.decision <> 'wait'
+        WHERE s.logic_version = :target_version
+                  AND s.decision <> 'wait'
+                  AND s.degraded = FALSE
     ) q ORDER BY win, ts ASC
 ), piv AS (
     SELECT i.id,
@@ -131,7 +138,9 @@ WITH v1_indep AS (
                to_timestamp(floor(extract(epoch FROM s.ts) / 14400) * 14400) AS win
         FROM signals s
         JOIN signal_evaluations e ON e.signal_id = s.id AND e.horizon = '4h'
-        WHERE s.logic_version = 1 AND s.decision <> 'wait'
+        WHERE s.logic_version = :target_version
+                  AND s.decision <> 'wait'
+                  AND s.degraded = FALSE
     ) q ORDER BY win, ts ASC
 ), piv AS (
     SELECT i.id, i.decision, i.success,

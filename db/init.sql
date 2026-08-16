@@ -87,9 +87,50 @@ CREATE TABLE IF NOT EXISTS signals (
     notified       BOOLEAN NOT NULL DEFAULT FALSE, -- признак «обработан» notify (Этап 5)
     notified_at    TIMESTAMPTZ,                    -- факт реальной отправки в Telegram (Этап 6.6)
     logic_version  SMALLINT NOT NULL DEFAULT 1,    -- версия логики агентов/агрегации (Этап 7.0/7.2)
-    degraded       BOOLEAN NOT NULL DEFAULT FALSE  -- решение при неполном составе агентов (<3), Этап 7.2
+    degraded       BOOLEAN NOT NULL DEFAULT FALSE, -- решение при неполном составе агентов (<3), Этап 7.2
+    -- Этап 7.3. probability выше хранит ИНДЕКС СОГЛАСИЯ (формула не изменилась);
+    -- вероятность успеха — только здесь и только если построена по фактическим
+    -- исходам, иначе NULL. Колонка probability НЕ переименовывается: её читают
+    -- выгрузка, бот и суточная сводка.
+    calibrated_probability DOUBLE PRECISION,
+    calibration_id BIGINT,
+    inputs_hash    TEXT,                           -- sha256 канонической строки мнений
+    is_repeat      BOOLEAN NOT NULL DEFAULT FALSE  -- тот же набор мнений, что и у предыдущего
 );
 CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals (ts DESC);
+CREATE INDEX IF NOT EXISTS idx_signals_inputs_hash
+    ON signals (instrument_id, inputs_hash, ts DESC);
+
+-- Калибровочные кривые (Этап 7.3): таблица соответствия «диапазон индекса
+-- согласия → фактическая доля успеха», построенная по независимым наблюдениям.
+CREATE TABLE IF NOT EXISTS calibration_curves (
+    id              BIGSERIAL PRIMARY KEY,
+    logic_version   SMALLINT    NOT NULL,
+    built_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    sample_size     INTEGER     NOT NULL,   -- число НЕЗАВИСИМЫХ наблюдений
+    window_from     TIMESTAMPTZ NOT NULL,
+    window_to       TIMESTAMPTZ NOT NULL,
+    base_rate       DOUBLE PRECISION NOT NULL,
+    bins            JSONB       NOT NULL,   -- [{"lo","hi","n","successes","p"}, ...]
+    is_active       BOOLEAN     NOT NULL DEFAULT FALSE,
+    notes           TEXT
+);
+-- Активная кривая на версию логики может быть только одна.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_calibration_active
+    ON calibration_curves (logic_version) WHERE is_active;
+CREATE INDEX IF NOT EXISTS idx_calibration_built
+    ON calibration_curves (logic_version, built_at DESC);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'signals_calibration_id_fkey'
+    ) THEN
+        ALTER TABLE signals
+            ADD CONSTRAINT signals_calibration_id_fkey
+            FOREIGN KEY (calibration_id) REFERENCES calibration_curves(id);
+    END IF;
+END $$;
 
 -- Учёт выгрузок сигналов наружу (Этап 6.6). Отдельная строка на каждую цель:
 -- сбой выгрузки в Notion не блокирует повтор в Sheets и наоборот.

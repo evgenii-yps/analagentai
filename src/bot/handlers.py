@@ -257,12 +257,21 @@ def render_last(signals: list[dict[str, Any]], notified_only: bool, now: datetim
     for s in signals:
         emoji = DECISION_EMOJI.get(s["decision"], "⚪")
         decision = DECISION_RU.get(s["decision"], s["decision"])
-        prob = round(float(s["probability"]) * 100) if s.get("probability") is not None else "—"
-        status = "закрыт" if s.get("status") == "closed" else "открыт"
-        head = (
-            f"\n{emoji} <b>#{s['id']}</b> · {fmt_msk(s['ts'])}\n"
-            f"   {decision}, вероятность {prob}%, {status}"
+        # Этап 7.3: величина Decision Agent — ИНДЕКС СОГЛАСИЯ, а не вероятность.
+        conviction = (
+            round(float(s["probability"]) * 100)
+            if s.get("probability") is not None
+            else "—"
         )
+        status = "закрыт" if s.get("status") == "closed" else "открыт"
+        repeat_mark = " · повтор входов" if s.get("is_repeat") else ""
+        head = (
+            f"\n{emoji} <b>#{s['id']}</b> · {fmt_msk(s['ts'])}{repeat_mark}\n"
+            f"   {decision}, индекс согласия {conviction}%, {status}"
+        )
+        calibrated = s.get("calibrated_probability")
+        if calibrated is not None:
+            head += f"\n   вероятность успеха (по истории) {round(float(calibrated) * 100)}%"
         lines.append(head)
         if s.get("status") == "closed":
             lines.append(
@@ -279,13 +288,35 @@ def render_signal_card(card: dict[str, Any] | None, now: datetime) -> str:
 
     emoji = DECISION_EMOJI.get(card["decision"], "⚪")
     decision = DECISION_RU.get(card["decision"], card["decision"])
-    prob = round(float(card["probability"]) * 100) if card.get("probability") is not None else "—"
+    conviction = (
+        round(float(card["probability"]) * 100)
+        if card.get("probability") is not None
+        else "—"
+    )
 
     lines = [
         f"{emoji} <b>Сигнал #{card['id']}</b>",
         f"Время: {fmt_msk(card['ts'])}",
-        f"Решение: {decision}, вероятность {prob}%",
+        f"Решение: {decision}, индекс согласия {conviction}%",
     ]
+    # Слово «вероятность» — только когда число выведено из фактических исходов.
+    calibrated = card.get("calibrated_probability")
+    if calibrated is not None:
+        mark = ""
+        built_at = card.get("calibration_built_at")
+        sample = card.get("calibration_sample_size")
+        marks = []
+        if isinstance(built_at, datetime):
+            marks.append(f"кривая от {built_at.strftime('%d.%m')}")
+        if sample is not None:
+            marks.append(f"N={int(sample)}")
+        if marks:
+            mark = f"  [{', '.join(marks)}]"
+        lines.append(
+            f"Вероятность успеха (по истории): {round(float(calibrated) * 100)}%{mark}"
+        )
+    if card.get("is_repeat"):
+        lines.append("Повтор: решение принято на том же наборе мнений, что и предыдущее")
     price = card.get("price_at_signal")
     if price is not None:
         lines.append(f"Цена на момент сигнала: {round(float(price)):,}".replace(",", " "))
@@ -484,7 +515,13 @@ def render_summary(
     lines.append(f"По решениям: {decoded}")
     lines.append(f"Отправлено уведомлений: {signal_counts.get('sent', 0)}")
     lines.append(f"Поглощено анти-спамом: {signal_counts.get('absorbed', 0)}")
-    lines.append(f"Кандидатов (вероятность ≥ порога): {signal_counts.get('candidates', 0)}")
+    lines.append(f"Кандидатов (индекс согласия ≥ порога): {signal_counts.get('candidates', 0)}")
+    # Этап 7.3, Блок C: сколько из решений реально несут новую информацию.
+    total_24h = sum(by_decision.values())
+    repeats = signal_counts.get("repeats", 0)
+    share = f" ({round(100.0 * repeats / total_24h)}%)" if total_24h else ""
+    lines.append(f"Из них повторных решений: {repeats}{share}")
+    lines.append(f"Уникальных наборов мнений: {signal_counts.get('unique_inputs', 0)}")
     lines.append(f"Закрыто оценщиком: {signal_counts.get('closed', 0)}")
 
     lines.append("")

@@ -1,5 +1,7 @@
 -- ЭТАП 7.1, РАСЧЁТ 2 (раздел 6 ТЗ): вклад каждого агента по отдельности.
--- Только чтение. Область данных — logic_version = 1, независимые 4-часовые окна.
+-- Только чтение. Область данных — logic_version = :target_version (переменная
+-- psql из TARGET_LOGIC_VERSION, по умолчанию 4), независимые 4-часовые окна,
+-- degraded = false.
 --
 -- Источник мнения агента — signals.agents_payload (JSONB): в нём лежит РОВНО тот
 -- набор выводов, который видел Decision Agent в момент решения (agent, signal,
@@ -12,7 +14,7 @@ SET default_transaction_read_only = on;
 SET statement_timeout = '600s';
 
 \echo
-\echo '--- 2.1 Распределение уверенности по агентам, НЕЗАВИСИМЫЕ ОКНА версии 1 ---'
+\echo '--- 2.1 Распределение уверенности по агентам, НЕЗАВИСИМЫЕ ОКНА целевой версии ---'
 WITH v1_indep AS (
     SELECT DISTINCT ON (win) *
     FROM (
@@ -20,7 +22,9 @@ WITH v1_indep AS (
                to_timestamp(floor(extract(epoch FROM s.ts) / 14400) * 14400) AS win
         FROM signals s
         JOIN signal_evaluations e ON e.signal_id = s.id AND e.horizon = '4h'
-        WHERE s.logic_version = 1 AND s.decision <> 'wait'
+        WHERE s.logic_version = :target_version
+                  AND s.decision <> 'wait'
+                  AND s.degraded = FALSE
     ) q ORDER BY win, ts ASC
 ), aw AS (
     SELECT g.agent, p.confidence
@@ -50,7 +54,7 @@ GROUP BY agent
 ORDER BY agent;
 
 \echo
-\echo '--- 2.2 То же по ВСЕМ выводам agent_outputs за период версии 1 (наблюдения зависимы) ---'
+\echo '--- 2.2 То же по ВСЕМ выводам agent_outputs за период целевой версии (наблюдения зависимы) ---'
 WITH bounds AS (
     SELECT COALESCE(
                (SELECT min(ts) FROM signals WHERE logic_version = 2),
@@ -78,7 +82,7 @@ GROUP BY agent
 ORDER BY agent;
 
 \echo
-\echo '--- 2.3 Распределение направлений агента по независимым окнам версии 1 (X из N) ---'
+\echo '--- 2.3 Распределение направлений агента по независимым окнам целевой версии (X из N) ---'
 WITH v1_indep AS (
     SELECT DISTINCT ON (win) *
     FROM (
@@ -86,7 +90,9 @@ WITH v1_indep AS (
                to_timestamp(floor(extract(epoch FROM s.ts) / 14400) * 14400) AS win
         FROM signals s
         JOIN signal_evaluations e ON e.signal_id = s.id AND e.horizon = '4h'
-        WHERE s.logic_version = 1 AND s.decision <> 'wait'
+        WHERE s.logic_version = :target_version
+                  AND s.decision <> 'wait'
+                  AND s.degraded = FALSE
     ) q ORDER BY win, ts ASC
 ), aw AS (
     SELECT g.agent, p.signal
@@ -123,7 +129,9 @@ WITH v1_indep AS (
                to_timestamp(floor(extract(epoch FROM s.ts) / 14400) * 14400) AS win
         FROM signals s
         JOIN signal_evaluations e ON e.signal_id = s.id AND e.horizon = '4h'
-        WHERE s.logic_version = 1 AND s.decision <> 'wait'
+        WHERE s.logic_version = :target_version
+                  AND s.decision <> 'wait'
+                  AND s.degraded = FALSE
     ) q ORDER BY win, ts ASC
 ), px AS (
     SELECT i.*,
@@ -179,7 +187,9 @@ WITH v1_indep AS (
                to_timestamp(floor(extract(epoch FROM s.ts) / 14400) * 14400) AS win
         FROM signals s
         JOIN signal_evaluations e ON e.signal_id = s.id AND e.horizon = '4h'
-        WHERE s.logic_version = 1 AND s.decision <> 'wait'
+        WHERE s.logic_version = :target_version
+                  AND s.decision <> 'wait'
+                  AND s.degraded = FALSE
     ) q ORDER BY win, ts ASC
 ), aw AS (
     SELECT g.agent, p.confidence, i.success
@@ -218,7 +228,9 @@ WITH v1_indep AS (
                to_timestamp(floor(extract(epoch FROM s.ts) / 14400) * 14400) AS win
         FROM signals s
         JOIN signal_evaluations e ON e.signal_id = s.id AND e.horizon = '4h'
-        WHERE s.logic_version = 1 AND s.decision <> 'wait'
+        WHERE s.logic_version = :target_version
+                  AND s.decision <> 'wait'
+                  AND s.degraded = FALSE
     ) q ORDER BY win, ts ASC
 ), aw AS (
     SELECT g.agent, p.signal, i.decision
@@ -286,3 +298,78 @@ SELECT date_trunc('day', ts)::date AS day_utc,
 FROM agent_failures
 GROUP BY 1, 2, 3
 ORDER BY 1, 2, 3;
+
+\echo
+\echo '--- 2.10 ЭТАП 7.3: направления Futures по версиям логики (проверка симметрии агента) ---'
+\echo '(ожидание после 7.3: bearish строго больше нуля — до 7.3 их было РОВНО НОЛЬ за 8 суток)'
+WITH bounds AS (
+    SELECT COALESCE((SELECT min(ts) FROM signals WHERE logic_version = 2),
+                    (SELECT min(ts) FROM signals WHERE logic_version = 3),
+                    (SELECT min(ts) FROM signals WHERE logic_version = 4),
+                    'infinity'::timestamptz) AS v2_start,
+           COALESCE((SELECT min(ts) FROM signals WHERE logic_version = 3),
+                    (SELECT min(ts) FROM signals WHERE logic_version = 4),
+                    'infinity'::timestamptz) AS v3_start,
+           COALESCE((SELECT min(ts) FROM signals WHERE logic_version = 4),
+                    'infinity'::timestamptz) AS v4_start
+), ao AS (
+    SELECT a.agent, a.signal,
+           CASE WHEN a.ts < b.v2_start THEN 1
+                WHEN a.ts < b.v3_start THEN 2
+                WHEN a.ts < b.v4_start THEN 3
+                ELSE 4 END AS ver
+    FROM agent_outputs a CROSS JOIN bounds b
+    WHERE a.agent = 'futures'
+)
+SELECT ver AS logic_version,
+       count(*)                                                  AS outputs_n,
+       count(*) FILTER (WHERE signal = 'bullish')                AS bullish_x,
+       count(*) FILTER (WHERE signal = 'bearish')                AS bearish_x,
+       count(*) FILTER (WHERE signal = 'neutral')                AS neutral_x,
+       count(*) FILTER (WHERE signal = 'insufficient_data')      AS insufficient_x,
+       round(100.0 * count(*) FILTER (WHERE signal = 'bearish')
+             / NULLIF(count(*), 0), 3)                           AS bearish_pct,
+       CASE WHEN count(*) FILTER (WHERE signal = 'bearish') > 0
+            THEN 'ДА — ветка bearish достижима'
+            ELSE 'НЕТ — ни одного bearish' END                   AS bearish_reachable
+FROM ao
+GROUP BY ver
+ORDER BY ver;
+
+\echo
+\echo '--- 2.11 ЭТАП 7.3: фактическое распределение funding rate за весь период наблюдений ---'
+\echo '(этим подтверждается или опровергается причина односторонности Futures до 7.3)'
+SELECT f.instrument_id,
+       i.symbol,
+       count(*)                                                             AS n,
+       min(f.ts)                                                            AS ts_from,
+       max(f.ts)                                                            AS ts_to,
+       round(min(f.rate)::numeric, 8)                                       AS min_rate,
+       round(percentile_cont(0.01) WITHIN GROUP (ORDER BY f.rate)::numeric, 8) AS p1,
+       round(percentile_cont(0.05) WITHIN GROUP (ORDER BY f.rate)::numeric, 8) AS p5,
+       round(percentile_cont(0.50) WITHIN GROUP (ORDER BY f.rate)::numeric, 8) AS median,
+       round(percentile_cont(0.95) WITHIN GROUP (ORDER BY f.rate)::numeric, 8) AS p95,
+       round(percentile_cont(0.99) WITHIN GROUP (ORDER BY f.rate)::numeric, 8) AS p99,
+       round(max(f.rate)::numeric, 8)                                       AS max_rate,
+       count(*) FILTER (WHERE f.rate < 0)                                   AS negative_x,
+       round(100.0 * count(*) FILTER (WHERE f.rate < 0) / NULLIF(count(*), 0), 3) AS negative_pct,
+       count(*) FILTER (WHERE abs(f.rate) > 0.0003)                         AS above_old_threshold_x,
+       round(100.0 * count(*) FILTER (WHERE abs(f.rate) > 0.0003)
+             / NULLIF(count(*), 0), 3)                                      AS above_old_threshold_pct
+FROM funding f
+JOIN instruments i ON i.id = f.instrument_id
+GROUP BY f.instrument_id, i.symbol
+ORDER BY f.instrument_id;
+
+\echo
+\echo '--- 2.12 ЭТАП 7.3: распределение open interest (тот же перцентильный принцип) ---'
+SELECT o.instrument_id,
+       i.symbol,
+       count(*)                                                              AS n,
+       round(min(o.value)::numeric, 4)                                       AS min_value,
+       round(percentile_cont(0.50) WITHIN GROUP (ORDER BY o.value)::numeric, 4) AS median,
+       round(max(o.value)::numeric, 4)                                       AS max_value
+FROM open_interest o
+JOIN instruments i ON i.id = o.instrument_id
+GROUP BY o.instrument_id, i.symbol
+ORDER BY o.instrument_id;

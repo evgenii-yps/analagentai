@@ -29,6 +29,9 @@ async def run() -> None:
     # (Задача A2, Этап 7.2) на старом томе — init.sql на нём уже не выполнится.
     await db.ensure_signals_logic_version()
     await db.ensure_signals_degraded()
+    # Этап 7.3: калиброванная вероятность (Блок B) и учёт инерции входов (Блок C).
+    await db.ensure_calibration_schema()
+    await db.ensure_signals_inertia()
 
     tasks: list[asyncio.Task[None]] = []
     try:

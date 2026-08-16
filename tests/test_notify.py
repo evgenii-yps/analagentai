@@ -207,3 +207,77 @@ def test_compute_agreement_uses_total_agents_denominator() -> None:
     # выпадение агента понижает согласованность (та же формула, что у Decision).
     payload = _payload(("market", "bullish", 0.7), ("futures", "bullish", 0.6))
     assert abs(compute_agreement(payload) - 2 / 3) < 1e-9
+
+
+# --- Этап 7.3, Блок B: калиброванный режим отбора и текст сообщения ---------
+
+_CFG_CALIBRATED = NotifyConfig(
+    min_probability=0.7,
+    cooldown_sec=1800,
+    use_calibrated=True,
+    min_calibrated=0.55,
+)
+
+
+def _sig_calibrated(probability: float, calibrated: float | None) -> dict:
+    signal = _sig("buy", probability)
+    signal["calibrated_probability"] = calibrated
+    return signal
+
+
+def test_calibrated_mode_sends_nothing_without_curve() -> None:
+    """NOTIFY_USE_CALIBRATED=true и нет кривой → уведомления не уходят.
+
+    Индекс согласия при этом высокий: в прежнем режиме сигнал бы ушёл. Это и
+    есть требование ТЗ — вероятность не выдумывается из индекса.
+    """
+    signal = _sig_calibrated(probability=0.95, calibrated=None)
+    assert should_notify(signal, None, None, _NOW, _CFG_CALIBRATED) is False
+
+
+def test_calibrated_mode_uses_its_own_threshold() -> None:
+    low = _sig_calibrated(probability=0.95, calibrated=0.40)
+    high = _sig_calibrated(probability=0.20, calibrated=0.60)
+    assert should_notify(low, None, None, _NOW, _CFG_CALIBRATED) is False
+    assert should_notify(high, None, None, _NOW, _CFG_CALIBRATED) is True
+
+
+def test_default_mode_ignores_calibrated_value() -> None:
+    """По умолчанию поведение уведомлений не изменилось: отбор по индексу согласия."""
+    signal = _sig_calibrated(probability=0.8, calibrated=0.01)
+    assert should_notify(signal, None, None, _NOW, _CFG) is True
+
+
+def test_message_says_conviction_not_probability() -> None:
+    """Пока кривой нет, слово «вероятность» в сообщении не появляется."""
+    from src.notify.agent import format_signal_message
+
+    signal = _sig("buy", 0.74)
+    signal["agents_payload"] = [
+        {"agent": "market", "signal": "bullish", "confidence": 0.8},
+        {"agent": "liquidity", "signal": "bullish", "confidence": 0.6},
+        {"agent": "futures", "signal": "neutral", "confidence": 0.4},
+    ]
+    text = format_signal_message(
+        signal, price=60000.0, cfg=SignalFormatConfig("BTC/USDT", "Europe/Moscow", "4h")
+    )
+    assert "Индекс согласия: <b>74%</b>" in text
+    assert "Вероятность" not in text
+
+
+def test_message_shows_probability_only_with_curve() -> None:
+    """С кривой появляется отдельная строка с датой кривой и размером выборки."""
+    from src.notify.agent import format_signal_message
+
+    signal = _sig("buy", 0.74)
+    signal["agents_payload"] = []
+    signal["calibrated_probability"] = 0.31
+    signal["calibration_built_at"] = datetime(2026, 8, 16, 5, 30, tzinfo=UTC)
+    signal["calibration_sample_size"] = 87
+    text = format_signal_message(
+        signal, price=None, cfg=SignalFormatConfig("BTC/USDT", "Europe/Moscow", "4h")
+    )
+    assert "Индекс согласия: <b>74%</b>" in text
+    assert "Вероятность успеха (по истории): <b>31%</b>" in text
+    assert "кривая от 16.08" in text
+    assert "N=87" in text

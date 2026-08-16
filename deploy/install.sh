@@ -415,6 +415,11 @@ AGENT_MIN_CANDLES=200
 AGENT_FAILURE_ALERT_STREAK=5
 AGENT_AUTO_RESET_STREAK=20
 FUNDING_EXTREME_THRESHOLD=0.0003
+FUTURES_LOOKBACK_HOURS=${FUTURES_LOOKBACK_HOURS:-168}
+FUTURES_PCT_HIGH=${FUTURES_PCT_HIGH:-0.80}
+FUTURES_PCT_LOW=${FUTURES_PCT_LOW:-0.20}
+FUTURES_MIN_POINTS=${FUTURES_MIN_POINTS:-20}
+LOGIC_VERSION=${LOGIC_VERSION:-4}
 DECISION_INTERVAL=60
 DECISION_THRESHOLD=0.3
 AGENT_FRESHNESS_SEC=300
@@ -429,6 +434,13 @@ NOTIFY_MIN_PROBABILITY=0.7
 NOTIFY_MIN_AGENTS=3
 NOTIFY_COOLDOWN_SEC=1800
 NOTIFY_TIMEZONE=Europe/Moscow
+# --- Калибровка вероятности (Этап 7.3, Блок B) ---
+CALIBRATION_MIN_SAMPLES=${CALIBRATION_MIN_SAMPLES:-60}
+CALIBRATION_BINS=${CALIBRATION_BINS:-5}
+CALIBRATION_PRIOR_WEIGHT=${CALIBRATION_PRIOR_WEIGHT:-10}
+CALIBRATION_HORIZON=${CALIBRATION_HORIZON:-4h}
+NOTIFY_USE_CALIBRATED=${NOTIFY_USE_CALIBRATED:-false}
+NOTIFY_MIN_CALIBRATED=${NOTIFY_MIN_CALIBRATED:-0.55}
 EVAL_INTERVAL=300
 EVAL_HORIZONS=1h,4h
 EVAL_PRIMARY_HORIZON=4h
@@ -498,6 +510,9 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 */10 * * * * ${APP_USER} /usr/bin/python3 ${APP_DIR}/scripts/watchdog.py >> ${APP_DIR}/logs/watchdog.log 2>&1
 # Этап 6.6 Выгрузка сигналов — ежедневно 06:20 UTC (внутри контейнера, D-3)
 20 6 * * * ${APP_USER} cd ${APP_DIR} && /usr/bin/docker compose --profile tools run --rm --no-deps export >> ${APP_DIR}/logs/export.log 2>&1
+# Этап 7.3 Калибровочная кривая — ежедневно 05:30 UTC, ДО суточной сводки в 06:00,
+# чтобы сводка показывала актуальное состояние кривой (внутри контейнера, D-3)
+30 5 * * * ${APP_USER} cd ${APP_DIR} && /usr/bin/docker compose --profile tools run --rm --no-deps calibration >> ${APP_DIR}/logs/calibration.log 2>&1
 EOF
     chmod 644 /etc/cron.d/agent-trade
     log "Cron-задачи установлены (/etc/cron.d/agent-trade)."

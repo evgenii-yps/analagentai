@@ -136,15 +136,16 @@ def test_success_cell_variants() -> None:
 # --- build_signal_row ---
 
 def test_signal_row_length_matches_header() -> None:
+    # Этап 7.3 добавил четыре колонки В КОНЕЦ: 29 → 33.
     row = build_signal_row(_signal())
-    assert len(row) == len(SIGNALS_HEADER) == 29
+    assert len(row) == len(SIGNALS_HEADER) == 33
 
 
-def test_signal_row_logic_version_then_degraded_last() -> None:
-    # logic_version — предпоследняя, degraded — последняя (Этап 7.2): новые
-    # колонки добавлены в конец, существующие не сдвинуты (§D.3 / A2).
-    assert SIGNALS_HEADER[-2] == "logic_version"
-    assert SIGNALS_HEADER[-1] == "degraded"
+def test_signal_row_keeps_existing_column_positions() -> None:
+    # Приём прежний (§D.3 / A2 / 7.3): новые колонки дописываются в КОНЕЦ,
+    # позиции ранее выгруженных столбцов не сдвигаются.
+    assert SIGNALS_HEADER[27] == "logic_version"
+    assert SIGNALS_HEADER[28] == "degraded"
     assert build_signal_row(_signal(logic_version=2))[27] == 2
     # Отсутствие поля → версия 1 (исторические сигналы «до» правок).
     assert build_signal_row(_signal(logic_version=None))[27] == 1
@@ -155,6 +156,38 @@ def test_signal_row_degraded_cell() -> None:
     assert build_signal_row(_signal(degraded=False))[28] == "нет"
     # Отсутствие поля (старый сигнал) → «нет».
     assert build_signal_row(_signal())[28] == "нет"
+
+
+def test_signals_header_renames_probability_to_conviction() -> None:
+    # Колонка и её позиция сохранены, изменилась только подпись (Этап 7.3 §4.7).
+    assert SIGNALS_HEADER[6] == "индекс согласия"
+    assert "probability" not in SIGNALS_HEADER
+
+
+def test_signal_row_calibration_and_repeat_columns() -> None:
+    # Хвост Этапа 7.3: вероятность, ссылка на кривую, хэш входов, признак повтора.
+    assert SIGNALS_HEADER[-4:] == [
+        "calibrated_probability",
+        "calibration_id",
+        "inputs_hash",
+        "is_repeat",
+    ]
+    # Кривой нет → ячейка пустая; подставлять индекс согласия нельзя.
+    empty = build_signal_row(_signal())
+    assert empty[-4] == ""
+    assert empty[-3] == ""
+    assert empty[-1] == "нет"
+
+    signal = _signal()
+    signal["calibrated_probability"] = 0.3124
+    signal["calibration_id"] = 7
+    signal["inputs_hash"] = "a" * 64
+    signal["is_repeat"] = True
+    row = build_signal_row(signal)
+    assert row[-4] == 0.3124
+    assert row[-3] == 7
+    assert row[-2] == "a" * 64
+    assert row[-1] == "да"
 
 
 def test_signal_row_core_fields() -> None:

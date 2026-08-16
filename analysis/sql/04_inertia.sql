@@ -23,18 +23,23 @@ SELECT COALESCE((SELECT min(ts) FROM signals WHERE logic_version = 2),
        (SELECT max(ts) FROM agent_outputs)                             AS agent_outputs_to;
 
 \echo
-\echo '--- 4.1 Серии подряд идущих циклов с ОДИНАКОВЫМ confidence (по версиям 1 и 3) ---'
+\echo '--- 4.1 Серии подряд идущих циклов с ОДИНАКОВЫМ confidence (по версиям 1, 3 и 4) ---'
 WITH bounds AS (
     SELECT COALESCE((SELECT min(ts) FROM signals WHERE logic_version = 2),
                     (SELECT min(ts) FROM signals WHERE logic_version = 3),
+                    (SELECT min(ts) FROM signals WHERE logic_version = 4),
                     'infinity'::timestamptz) AS v2_start,
            COALESCE((SELECT min(ts) FROM signals WHERE logic_version = 3),
-                    'infinity'::timestamptz) AS v3_start
+                    (SELECT min(ts) FROM signals WHERE logic_version = 4),
+                    'infinity'::timestamptz) AS v3_start,
+           COALESCE((SELECT min(ts) FROM signals WHERE logic_version = 4),
+                    'infinity'::timestamptz) AS v4_start
 ), ao AS (
     SELECT a.agent, a.ts, a.confidence,
            CASE WHEN a.ts < b.v2_start THEN 1
                 WHEN a.ts < b.v3_start THEN 2
-                ELSE 3 END AS ver
+                WHEN a.ts < b.v4_start THEN 3
+                ELSE 4 END AS ver
     FROM agent_outputs a CROSS JOIN bounds b
 ), seq AS (
     SELECT agent, ver, confidence,
@@ -53,23 +58,28 @@ SELECT agent,
        max(run_len)                         AS max_run_len,
        round(percentile_cont(0.5) WITHIN GROUP (ORDER BY run_len)::numeric, 2) AS median_run_len
 FROM runs
-WHERE ver IN (1, 3)
+WHERE ver IN (1, 3, 4)
 GROUP BY agent, ver
 ORDER BY agent, ver;
 
 \echo
-\echo '--- 4.2 Доля циклов, где confidence НЕ изменился относительно предыдущего (по версиям 1 и 3) ---'
+\echo '--- 4.2 Доля циклов, где confidence НЕ изменился относительно предыдущего (по версиям 1, 3 и 4) ---'
 WITH bounds AS (
     SELECT COALESCE((SELECT min(ts) FROM signals WHERE logic_version = 2),
                     (SELECT min(ts) FROM signals WHERE logic_version = 3),
+                    (SELECT min(ts) FROM signals WHERE logic_version = 4),
                     'infinity'::timestamptz) AS v2_start,
            COALESCE((SELECT min(ts) FROM signals WHERE logic_version = 3),
-                    'infinity'::timestamptz) AS v3_start
+                    (SELECT min(ts) FROM signals WHERE logic_version = 4),
+                    'infinity'::timestamptz) AS v3_start,
+           COALESCE((SELECT min(ts) FROM signals WHERE logic_version = 4),
+                    'infinity'::timestamptz) AS v4_start
 ), ao AS (
     SELECT a.agent, a.ts, a.confidence, a.signal,
            CASE WHEN a.ts < b.v2_start THEN 1
                 WHEN a.ts < b.v3_start THEN 2
-                ELSE 3 END AS ver
+                WHEN a.ts < b.v4_start THEN 3
+                ELSE 4 END AS ver
     FROM agent_outputs a CROSS JOIN bounds b
 ), lagged AS (
     SELECT agent, ver, confidence, signal,
@@ -87,7 +97,7 @@ SELECT agent,
        round(100.0 * count(*) FILTER (WHERE prev_signal IS NOT NULL AND signal = prev_signal)
              / NULLIF(count(*) FILTER (WHERE prev_signal IS NOT NULL), 0), 2) AS unchanged_signal_pct
 FROM lagged
-WHERE ver IN (1, 3)
+WHERE ver IN (1, 3, 4)
 GROUP BY agent, ver
 ORDER BY agent, ver;
 
@@ -96,14 +106,19 @@ ORDER BY agent, ver;
 WITH bounds AS (
     SELECT COALESCE((SELECT min(ts) FROM signals WHERE logic_version = 2),
                     (SELECT min(ts) FROM signals WHERE logic_version = 3),
+                    (SELECT min(ts) FROM signals WHERE logic_version = 4),
                     'infinity'::timestamptz) AS v2_start,
            COALESCE((SELECT min(ts) FROM signals WHERE logic_version = 3),
-                    'infinity'::timestamptz) AS v3_start
+                    (SELECT min(ts) FROM signals WHERE logic_version = 4),
+                    'infinity'::timestamptz) AS v3_start,
+           COALESCE((SELECT min(ts) FROM signals WHERE logic_version = 4),
+                    'infinity'::timestamptz) AS v4_start
 ), ao AS (
     SELECT a.agent, a.ts, a.confidence,
            CASE WHEN a.ts < b.v2_start THEN 1
                 WHEN a.ts < b.v3_start THEN 2
-                ELSE 3 END AS ver
+                WHEN a.ts < b.v4_start THEN 3
+                ELSE 4 END AS ver
     FROM agent_outputs a CROSS JOIN bounds b
 )
 SELECT date_trunc('day', ts)::date AS day_utc,
@@ -122,14 +137,19 @@ ORDER BY 1, 2;
 WITH bounds AS (
     SELECT COALESCE((SELECT min(ts) FROM signals WHERE logic_version = 2),
                     (SELECT min(ts) FROM signals WHERE logic_version = 3),
+                    (SELECT min(ts) FROM signals WHERE logic_version = 4),
                     'infinity'::timestamptz) AS v2_start,
            COALESCE((SELECT min(ts) FROM signals WHERE logic_version = 3),
-                    'infinity'::timestamptz) AS v3_start
+                    (SELECT min(ts) FROM signals WHERE logic_version = 4),
+                    'infinity'::timestamptz) AS v3_start,
+           COALESCE((SELECT min(ts) FROM signals WHERE logic_version = 4),
+                    'infinity'::timestamptz) AS v4_start
 ), ao AS (
     SELECT a.agent, a.ts, a.confidence,
            CASE WHEN a.ts < b.v2_start THEN 1
                 WHEN a.ts < b.v3_start THEN 2
-                ELSE 3 END AS ver
+                WHEN a.ts < b.v4_start THEN 3
+                ELSE 4 END AS ver
     FROM agent_outputs a CROSS JOIN bounds b
 ), seq AS (
     SELECT agent, ver, ts, confidence,
@@ -141,7 +161,7 @@ WITH bounds AS (
     FROM seq GROUP BY agent, ver, confidence, grp
 ), ranked AS (
     SELECT *, row_number() OVER (PARTITION BY ver ORDER BY run_len DESC) AS rn
-    FROM runs WHERE ver IN (1, 3)
+    FROM runs WHERE ver IN (1, 3, 4)
 )
 SELECT ver AS logic_version, agent, round(confidence::numeric, 4) AS confidence,
        run_len, ts_from, ts_to,
@@ -149,3 +169,28 @@ SELECT ver AS logic_version, agent, round(confidence::numeric, 4) AS confidence,
 FROM ranked
 WHERE rn <= 15
 ORDER BY ver, run_len DESC;
+
+\echo
+\echo '--- 4.5 ЭТАП 7.3: доля повторных решений и число уникальных наборов входов по суткам ---'
+\echo '(is_repeat = решение принято на том же наборе мнений, что и предыдущее; отправку это не фильтрует)'
+SELECT date_trunc('day', ts)::date        AS day_utc,
+       logic_version,
+       count(*)                           AS decisions,
+       count(*) FILTER (WHERE is_repeat)  AS repeats_x,
+       round(100.0 * count(*) FILTER (WHERE is_repeat) / NULLIF(count(*), 0), 2) AS repeats_pct,
+       count(DISTINCT inputs_hash)        AS unique_inputs,
+       count(*) FILTER (WHERE inputs_hash IS NULL) AS without_hash
+FROM signals
+GROUP BY 1, 2
+ORDER BY 1, 2;
+
+\echo
+\echo '--- 4.6 ЭТАП 7.3: сколько решений приходится на один уникальный набор входов ---'
+SELECT logic_version,
+       count(*)                                                       AS decisions,
+       count(DISTINCT inputs_hash)                                    AS unique_inputs,
+       round(count(*)::numeric / NULLIF(count(DISTINCT inputs_hash), 0), 2) AS decisions_per_input
+FROM signals
+WHERE inputs_hash IS NOT NULL
+GROUP BY logic_version
+ORDER BY logic_version;

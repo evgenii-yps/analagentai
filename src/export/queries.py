@@ -35,7 +35,11 @@ _SIGNAL_COLUMNS = """
     e4.drawdown_pct    AS dd_4h,
     e4.success         AS succ_4h,
     s.logic_version    AS logic_version,
-    s.degraded         AS degraded
+    s.degraded         AS degraded,
+    s.calibrated_probability AS calibrated_probability,
+    s.calibration_id   AS calibration_id,
+    s.inputs_hash      AS inputs_hash,
+    s.is_repeat        AS is_repeat
 """
 
 _SIGNAL_JOINS = """
@@ -76,6 +80,23 @@ async def apply_migrations(conn: asyncpg.Connection) -> None:
     # её и здесь, чтобы SELECT s.degraded не падал на старом томе.
     await conn.execute(
         "ALTER TABLE signals ADD COLUMN IF NOT EXISTS degraded BOOLEAN NOT NULL "
+        "DEFAULT FALSE;"
+    )
+    # Колонки Этапа 7.3 (калиброванная вероятность и учёт инерции входов) — по той
+    # же причине: выгрузка держит свой пул и может стартовать раньше сервисов,
+    # применяющих миграцию, а SELECT по отсутствующей колонке упал бы.
+    await conn.execute(
+        "ALTER TABLE signals "
+        "ADD COLUMN IF NOT EXISTS calibrated_probability DOUBLE PRECISION;"
+    )
+    await conn.execute(
+        "ALTER TABLE signals ADD COLUMN IF NOT EXISTS calibration_id BIGINT;"
+    )
+    await conn.execute(
+        "ALTER TABLE signals ADD COLUMN IF NOT EXISTS inputs_hash TEXT;"
+    )
+    await conn.execute(
+        "ALTER TABLE signals ADD COLUMN IF NOT EXISTS is_repeat BOOLEAN NOT NULL "
         "DEFAULT FALSE;"
     )
 

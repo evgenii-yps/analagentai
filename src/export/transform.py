@@ -31,7 +31,10 @@ SIGNALS_HEADER: list[str] = [
     "window_4h_utc",
     "token",
     "decision",
-    "probability",
+    # Этап 7.3 §4.7: сама колонка и её позиция сохранены (иначе поедут все
+    # выгруженные ранее строки), меняется только ПОДПИСЬ: это индекс согласия,
+    # а не вероятность.
+    "индекс согласия",
     "notified",
     "notified_at_utc",
     "agents_count",
@@ -54,6 +57,11 @@ SIGNALS_HEADER: list[str] = [
     "agents_payload_json",
     "logic_version",
     "degraded",
+    # Этап 7.3: новые колонки добавляются В КОНЕЦ тем же приёмом, что и раньше.
+    "calibrated_probability",
+    "calibration_id",
+    "inputs_hash",
+    "is_repeat",
 ]
 
 # Заголовок листа «Сводка по дням» — порядок из §7.2.
@@ -71,7 +79,7 @@ SUMMARY_HEADER: list[str] = [
     "avg_pnl_buy_4h",
     "avg_pnl_sell_4h",
     "avg_drawdown_4h",
-    "avg_probability",
+    "avg_conviction",
     "logic_version_dominant",
     "degraded_count",
 ]
@@ -242,6 +250,12 @@ def build_signal_row(signal: dict[str, Any]) -> list[Any]:
         # degraded новой колонкой в самом конце — тем же приёмом, чтобы не сдвигать
         # уже выгруженные столбцы (Этап 7.2, Задача A2). «да»/«нет».
         "да" if signal.get("degraded") else "нет",
+        # Этап 7.3. Пустая ячейка вместо вероятности означает «кривой ещё нет»:
+        # подставлять сюда индекс согласия нельзя — это разные величины.
+        _rate(signal.get("calibrated_probability")),
+        signal.get("calibration_id") if signal.get("calibration_id") is not None else "",
+        signal.get("inputs_hash") or "",
+        "да" if signal.get("is_repeat") else "нет",
     ]
 
 
@@ -299,7 +313,11 @@ def build_notion_properties(
     decision_ru = DECISION_RU.get(decision, decision)
     title = f"BTC · {decision_ru} · {ts.astimezone(UTC).strftime('%Y-%m-%d %H:%M')} UTC"
 
-    probability = float(signal.get("probability") or 0.0)
+    # В базе Notion свойство называется «Вероятность %» и переименованию не
+    # подлежит (это поле базы, а не текст интерфейса). Чтобы не выдавать индекс
+    # согласия за вероятность, в комментарий добавляется явная расшифровка, а
+    # калиброванная вероятность выгружается отдельным числовым свойством.
+    conviction = float(signal.get("probability") or 0.0)
     comment = (signal.get("rationale") or "")[:RATIONALE_LIMIT_NOTION]
 
     properties: dict[str, Any] = {
@@ -307,7 +325,7 @@ def build_notion_properties(
         "Дата": {"date": {"start": ts.astimezone(UTC).isoformat()}},
         "Токен": {"select": {"name": signal.get("token") or "BTC"}},
         "Решение": {"select": {"name": decision_ru}},
-        "Вероятность %": {"number": round(probability * 100, 1)},
+        "Вероятность %": {"number": round(conviction * 100, 1)},
         "Статус": {"status": {"name": "Done"}},
         "Источник агента": {
             "multi_select": [
@@ -329,4 +347,21 @@ def build_notion_properties(
     if succ_4h is not None:
         properties["Успешность"] = {"select": {"name": "Успех" if succ_4h else "Неудача"}}
 
+    # Этап 7.3: калиброванная вероятность и признак повтора входов дописываются
+    # в текст комментария — новые свойства в базе Notion этим этапом не создаются.
+    marks: list[str] = []
+    calibrated = signal.get("calibrated_probability")
+    if calibrated is not None:
+        marks.append(
+            f"вероятность успеха (по истории) {round(float(calibrated) * 100, 1)}%"
+        )
+    marks.append(
+        "повтор входов" if signal.get("is_repeat") else "новый набор входов"
+    )
+    suffix = " | " + "; ".join(marks)
+    properties["Комментарий"] = {
+        "rich_text": [
+            {"text": {"content": (comment + suffix)[:RATIONALE_LIMIT_NOTION]}}
+        ]
+    }
     return properties

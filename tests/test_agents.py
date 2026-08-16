@@ -137,31 +137,54 @@ def test_futures_insufficient_data() -> None:
     assert signal == "insufficient_data"
 
 
-def test_futures_moderate_positive_funding_rising_oi_is_bullish() -> None:
+# Этап 7.3: направление задаётся перцентилем текущего значения в СВОЁМ окне,
+# а не сравнением с абсолютным порогом. Полный набор проверок симметрии и
+# достижимости обеих веток — в tests/test_futures_symmetry.py.
+
+def _window(values: list[float]) -> list[dict]:
+    return [{"rate": v} for v in values]
+
+
+def _rising(n: int = 30, start: float = 0.00002, step: float = 0.000001) -> list[float]:
+    return [start + step * i for i in range(n)]
+
+
+def test_futures_top_of_window_is_bullish() -> None:
     signal, conf, _, _ = analyze_futures(
-        funding=[{"rate": 0.0001}], open_interest=_oi(1000.0, 1100.0)
+        funding=_window(_rising()), open_interest=_oi(1000.0, 1100.0)
     )
     assert signal == "bullish"
     assert 0.0 <= conf <= 1.0
 
 
-def test_futures_extreme_funding_is_reversal_bearish() -> None:
+def test_futures_bottom_of_window_is_bearish() -> None:
+    # Тот же ряд в обратном порядке: текущее значение — минимум окна.
     signal, _, metrics, _ = analyze_futures(
-        funding=[{"rate": 0.002}], open_interest=_oi(1000.0, 1100.0)
+        funding=_window(_rising()[::-1]), open_interest=_oi(1000.0, 1100.0)
     )
-    assert signal == "bearish"          # экстремальный + funding → разворот вниз
-    assert metrics["funding_extreme"] is True
+    assert signal == "bearish"
+    assert metrics["funding_pct"] <= 0.20
 
 
-def test_futures_flat_oi_is_neutral() -> None:
+def test_futures_middle_of_window_is_neutral() -> None:
+    values = _rising(n=29)
+    values.append(values[len(values) // 2])   # текущее = середина распределения
     signal, _, _, _ = analyze_futures(
-        funding=[{"rate": 0.0001}], open_interest=_oi(1000.0, 1000.0)
+        funding=_window(values), open_interest=_oi(1000.0, 1000.0)
     )
     assert signal == "neutral"
 
 
+def test_futures_short_window_is_insufficient_data() -> None:
+    # Окно короче FUTURES_MIN_POINTS: «нет данных», а не «сигнала нет».
+    signal, _, _, _ = analyze_futures(
+        funding=_window(_rising(n=5)), open_interest=_oi(1000.0, 1100.0)
+    )
+    assert signal == "insufficient_data"
+
+
 def test_futures_is_deterministic() -> None:
-    args = ([{"rate": 0.0001}], _oi(1000.0, 1100.0))
+    args = (_window(_rising()), _oi(1000.0, 1100.0))
     assert analyze_futures(*args) == analyze_futures(*args)
 
 
@@ -198,7 +221,7 @@ def test_liquidity_saves_confidence_raw_and_amplifies() -> None:
 
 def test_futures_saves_confidence_raw() -> None:
     _, _, metrics, _ = analyze_futures(
-        funding=[{"rate": 0.0001}], open_interest=_oi(1000.0, 1100.0)
+        funding=_window(_rising()), open_interest=_oi(1000.0, 1100.0)
     )
     assert "confidence_raw" in metrics
 
@@ -220,36 +243,32 @@ def test_round_clamps_inf_and_nan() -> None:
     assert _round(1.23456, 2) == 1.23
 
 
-# --- Задача C: симметрия Futures — медвежьи ветки достижимы ---
+# --- Симметрия Futures (Задача C Этапа 7.0 → переделана Этапом 7.3) ---
+# Абсолютный порог экстремума признан причиной односторонности агента: за 8 суток
+# он не сработал ни разу, а вторая ветка bearish требовала отрицательного funding,
+# которого у BTC практически не бывает. Теперь границы относительные, и проверка
+# симметрии выполняется зеркальным отражением ряда (tests/test_futures_symmetry.py).
 
-def test_futures_negative_funding_rising_oi_is_bearish() -> None:
-    # Реалистичный отрицательный funding (распродажа) + рост OI → продолжение вниз.
-    signal, _, _, _ = analyze_futures(
-        funding=[{"rate": -0.0002}], open_interest=_oi(1000.0, 1100.0)
-    )
-    assert signal == "bearish"
-
-
-def test_futures_positive_extreme_is_bearish_at_new_threshold() -> None:
-    # При новом пороге 0.0003 реалистичный всплеск 0.0004 → ветка разворота (bearish).
-    signal, _, metrics, _ = analyze_futures(
-        funding=[{"rate": 0.0004}],
-        open_interest=_oi(1000.0, 1000.0),
-        extreme_threshold=0.0003,
-    )
-    assert signal == "bearish"
-    assert metrics["funding_extreme"] is True
+def test_futures_direction_does_not_depend_on_sign() -> None:
+    # Ряд одинаковой ФОРМЫ, но целиком положительный и целиком отрицательный,
+    # даёт одно и то же направление: знак funding больше ничего не решает.
+    shape = _rising()
+    positive = _window([0.0001 + v for v in shape])
+    negative = _window([-0.0005 + v for v in shape])
+    assert analyze_futures(positive, _oi(1000.0, 1000.0))[0] == "bullish"
+    assert analyze_futures(negative, _oi(1000.0, 1000.0))[0] == "bullish"
 
 
-def test_futures_extreme_threshold_is_configurable() -> None:
-    # То же значение funding при старом пороге 0.0005 экстремумом НЕ считается.
-    signal, _, metrics, _ = analyze_futures(
-        funding=[{"rate": 0.0004}],
-        open_interest=_oi(1000.0, 1000.0),
-        extreme_threshold=0.0005,
-    )
-    assert signal == "neutral"
-    assert metrics["funding_extreme"] is False
+def test_futures_pct_thresholds_are_configurable() -> None:
+    # Более узкая нейтральная зона делает то же значение направленным.
+    values = _rising(n=29)
+    values.append(values[len(values) // 2 + 3])
+    strict = analyze_futures(_window(values), _oi(1000.0, 1000.0))[0]
+    loose = analyze_futures(
+        _window(values), _oi(1000.0, 1000.0), pct_high=0.55, pct_low=0.45
+    )[0]
+    assert strict == "neutral"
+    assert loose == "bullish"
 
 
 # --- Задача A1 (Этап 7.2): пустой/нечисловой кадр → insufficient_data, НЕ DataError ---
