@@ -170,6 +170,28 @@ services:
     command: ["python", "-m", "src.calibration_main"]
     restart: "no"
 
+  # Этап 7.4: исторический реплей ядра. Отдельный профиль — контейнер НЕ
+  # поднимается вместе с продакшн-стеком и запускается только вручную:
+  #   docker compose --profile backtest run --rm backtest
+  # Ресурсы ограничены намеренно (§12.3 ТЗ): продакшн работает на том же
+  # сервере и не должен пострадать от прогона.
+  backtest:
+    build:
+      context: .
+      dockerfile: backtest/Dockerfile
+    env_file: .env
+    profiles: ["backtest"]
+    depends_on: [postgres]
+    restart: "no"
+    mem_limit: 1g
+    cpus: 1.0
+    volumes:
+      # Конфигурация прогона и каталог отчётов пробрасываются с хоста: сама
+      # конфигурация в образ не запекается, чтобы её можно было править без
+      # пересборки.
+      - ./backtest/.env.backtest:/app/backtest/.env.backtest:ro
+      - ./analysis_out:/opt/agent-trade/analysis_out
+
 volumes:
   pg_data:
   redis_data:
