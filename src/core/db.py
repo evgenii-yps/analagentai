@@ -893,6 +893,27 @@ class DB:
         await self.pool.execute(
             "ALTER TABLE signal_evaluations ALTER COLUMN horizon_h SET NOT NULL;"
         )
+        # Та же защита, что в миграции 009: у одного сигнала не может быть двух
+        # оценок на один горизонт. Если это случилось (в колонке horizon было
+        # значение, которое не разбирается, — оно получает 4 и сталкивается с
+        # настоящей строкой '4h'), сервис обязан сказать это прямо, а не падать
+        # на «could not create unique index» при смене ключа.
+        duplicates = await self.pool.fetchval(
+            """
+            SELECT string_agg(DISTINCT signal_id::text, ', ')
+              FROM (
+                  SELECT signal_id FROM signal_evaluations
+                   GROUP BY signal_id, horizon_h HAVING count(*) > 1
+              ) q;
+            """
+        )
+        if duplicates:
+            raise RuntimeError(
+                f"У сигналов {duplicates} есть по две оценки на один горизонт. "
+                "Схема оценок не может быть приведена к виду Этапа 8.1, пока эти "
+                "строки не разобраны вручную: удалять данные об оценках "
+                "автоматически нельзя."
+            )
         await self.pool.execute(
             "ALTER TABLE signal_evaluations DROP CONSTRAINT IF EXISTS "
             "signal_evaluations_signal_id_horizon_key;"

@@ -144,17 +144,31 @@ CREATE TABLE IF NOT EXISTS signal_exports (
 CREATE INDEX IF NOT EXISTS idx_signal_exports_target ON signal_exports (target, signal_id);
 
 -- Оценка результатов сигналов фактом движения цены (Этап 6).
+-- Оценка результата сигнала. Этап 8.1 §5: горизонтов четыре (1, 4, 12, 24 ч),
+-- каждый считается независимо, а сигнал остаётся ОДИН. Ключ записи —
+-- (сигнал, горизонт в часах). Текстовая колонка horizon сохранена и несёт
+-- подпись того же значения ('4h'): её читают выгрузка, бот и суточная сводка.
 CREATE TABLE IF NOT EXISTS signal_evaluations (
-    id              BIGSERIAL PRIMARY KEY,
     signal_id       BIGINT NOT NULL REFERENCES signals(id),
-    horizon         TEXT NOT NULL,                 -- 1h | 4h
+    horizon         TEXT NOT NULL,                 -- 1h | 4h | 12h | 24h
+    horizon_h       SMALLINT NOT NULL,             -- тот же горизонт в часах
     price_at_signal DOUBLE PRECISION NOT NULL,
     price_at_close  DOUBLE PRECISION NOT NULL,
     pnl_pct         DOUBLE PRECISION NOT NULL,
     drawdown_pct    DOUBLE PRECISION NOT NULL,
     success         BOOLEAN NOT NULL,
     evaluated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (signal_id, horizon)
+    PRIMARY KEY (signal_id, horizon_h)
+);
+CREATE INDEX IF NOT EXISTS ix_eval_horizon
+    ON signal_evaluations (horizon_h, evaluated_at);
+
+-- Границы версий логики (Этап 8.1 §6). Данные версий не смешиваются в анализе,
+-- поэтому момент перехода хранится машиночитаемо, с точностью до минуты.
+CREATE TABLE IF NOT EXISTS logic_version_windows (
+    logic_version SMALLINT    PRIMARY KEY,
+    started_at    TIMESTAMPTZ NOT NULL,
+    note          TEXT
 );
 
 -- Учёт сбоев итераций агентов (Этап 7.0). Раньше сбой терялся молча — теперь
