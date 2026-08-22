@@ -200,10 +200,27 @@ else
   # подставлялась минимальная известная версия. Строка, целиком лежащая раньше
   # начала СВОЕЙ версии, — признак этой подстановки. Таблица вечная, сырьё
   # живёт 90 суток: не поймав это сейчас, проверить будет уже нечем.
+  # Два признака, потому что дефект даёт два вида строк:
+  #  а) сутки ЦЕЛИКОМ раньше начала своей версии — видно по одной дате, и это
+  #     видно всегда, даже когда сырьё уже удалено;
+  #  б) сутки границы, слитые в одну строку, — по дате неотличимы, видно только
+  #     по сырью: среди выводов строки есть сделанные раньше начала её версии,
+  #     а отдельной строки на раннюю часть суток нет.
   false_version="$(psql_q "SELECT count(*) FROM agent_outputs_daily d
                              JOIN logic_version_windows w USING (logic_version)
                             WHERE d.logic_version > 0
-                              AND d.day < w.started_at::date;")"
+                              AND (d.day < w.started_at::date
+                                   OR (EXISTS (SELECT 1 FROM agent_outputs a
+                                                WHERE a.agent = d.agent
+                                                  AND a.instrument_id = d.instrument_id
+                                                  AND a.ts >= d.day::timestamptz
+                                                  AND a.ts < d.day::timestamptz + interval '1 day'
+                                                  AND a.ts < w.started_at)
+                                       AND NOT EXISTS (SELECT 1 FROM agent_outputs_daily z
+                                                        WHERE z.day = d.day
+                                                          AND z.agent = d.agent
+                                                          AND z.instrument_id = d.instrument_id
+                                                          AND z.logic_version < d.logic_version)));")"
   if [ "${false_version:-0}" != "0" ]; then
     block "строк итогов с ЗАВЕДОМО ЛОЖНОЙ версией: ${false_version}"
     info  "сутки целиком раньше начала версии, которой они помечены — примените"

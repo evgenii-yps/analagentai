@@ -76,13 +76,24 @@ UPDATE agent_outputs_daily d
  WHERE d.logic_version > 0
    AND d.day < (SELECT min(started_at)::date FROM logic_version_windows);
 
--- 3. Сутки границы: разделить на две строки -----------------------------------
--- Условие «нет строки с версией 0 по той же группе» делает шаг идемпотентным:
--- после верного пересчёта удалять становится нечего.
+-- 3. Сутки, слитые через границу: разделить на две строки ---------------------
+-- Датой такие сутки не выявляются: строка за сутки границы лежит НЕ раньше
+-- начала своей версии, а внутри них. Признак другой: строка помечена версией,
+-- а среди её выводов есть сделанные РАНЬШЕ начала этой версии — значит, в ней
+-- смешаны два периода.
+--
+-- Условие «нет строки с меньшей версией по той же группе» делает шаг
+-- идемпотентным: после верного пересчёта ранняя часть суток лежит отдельной
+-- строкой (0 или меньшая версия), и удалять становится нечего.
+--
+-- Удаляются ВСЕ строки таких суток, а не только смешанные: свёртка
+-- пересчитывает сутки целиком, а начинает счёт с суток, по которым итогов нет
+-- вовсе. Значения остальных строк от пересчёта не меняются.
 DELETE FROM agent_outputs_daily d
- WHERE d.day = (SELECT min(started_at)::date FROM logic_version_windows)
-   AND EXISTS (
-           SELECT 1 FROM agent_outputs_daily w
+ WHERE EXISTS (
+           SELECT 1
+             FROM agent_outputs_daily w
+             JOIN logic_version_windows v ON v.logic_version = w.logic_version
             WHERE w.day = d.day
               AND w.logic_version > 0
               AND EXISTS (
@@ -90,13 +101,14 @@ DELETE FROM agent_outputs_daily d
                        WHERE a.agent = w.agent
                          AND a.instrument_id = w.instrument_id
                          AND a.ts >= w.day::timestamptz
-                         AND a.ts < (SELECT min(started_at) FROM logic_version_windows)
+                         AND a.ts < w.day::timestamptz + interval '1 day'
+                         AND a.ts < v.started_at
                   )
               AND NOT EXISTS (
                       SELECT 1 FROM agent_outputs_daily z
                        WHERE z.day = w.day AND z.agent = w.agent
                          AND z.instrument_id = w.instrument_id
-                         AND z.logic_version = 0
+                         AND z.logic_version < w.logic_version
                   )
        )
    -- Пересчитать можно только при живом сырье. Нет сырья — не удаляем.
@@ -118,7 +130,7 @@ BEGIN
     END IF;
     SELECT count(*) INTO stuck
       FROM agent_outputs_daily d
-     WHERE d.day = boundary
+     WHERE d.day <= boundary
        AND d.logic_version > 0
        AND NOT EXISTS (
                SELECT 1 FROM agent_outputs a
@@ -127,9 +139,9 @@ BEGIN
            );
     IF stuck > 0 THEN
         RAISE WARNING
-            'сутки границы % : % строк оставлены как есть — сырьё за эти сутки '
-            'удалено, разделить по версиям нечем. Строки НЕ УДАЛЕНЫ: потерять '
-            'их хуже, чем оставить неточными. Отметьте это в отчёте.',
+            'сутки до границы % включительно: % строк проверить нечем — сырьё '
+            'за эти сутки удалено. Строки НЕ УДАЛЕНЫ: потерять их хуже, чем '
+            'оставить неточными. Отметьте это в отчёте.',
             boundary, stuck;
     END IF;
 END $$;
