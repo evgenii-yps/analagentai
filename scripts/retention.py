@@ -4,9 +4,11 @@
 Пять токенов увеличивают приток данных впятеро, поэтому сроки заданы явно:
 
 * ``orderbook_snapshots`` — старше ``RETENTION_ORDERBOOK_DAYS`` (по умолчанию 14);
-* ``trades``              — старше ``RETENTION_TRADES_DAYS`` (по умолчанию 3);
+* ``trades``              — старше ``RETENTION_TRADES_DAYS`` (по умолчанию 2);
 * ``ohlcv`` с ``timeframe = '1m'`` — старше ``RETENTION_1M_DAYS`` (по умолчанию 30);
-* ``agent_outputs`` — старше ``RETENTION_AGENT_OUTPUTS_DAYS`` (по умолчанию 90).
+* ``agent_outputs`` — старше ``RETENTION_AGENT_OUTPUTS_DAYS`` (по умолчанию 90);
+  перед удалением журнал сворачивается в суточные итоги ``agent_outputs_daily``,
+  которые не удаляются никогда.
 
 СНАЧАЛА СВЁРТКА, ПОТОМ УДАЛЕНИЕ. Сырая лента сделок живёт трое суток, но её
 содержательная часть остаётся навсегда: перед удалением задача сворачивает
@@ -64,6 +66,7 @@ PROTECTED_TABLES: frozenset[str] = frozenset(
         "signals",
         "signal_evaluations",
         "trade_flow_1m",
+        "agent_outputs_daily",
         "instruments",
         "calibration_curves",
         "signal_exports",
@@ -177,11 +180,113 @@ PG_DB = _env_value("POSTGRES_DB", "agenttrade")
 # Правила очистки: (таблица, срок хранения в днях, дополнительное условие).
 # Значения читаются из окружения или из .env — сроки задаёт конфигурация, а не
 # код: §4 ТЗ 8.1 требует RETENTION_1M_DAYS=30 и RETENTION_ORDERBOOK_DAYS=14.
+def rollup_daily_sql() -> str:
+    """SQL суточной свёртки выводов агентов в ``agent_outputs_daily``.
+
+    Свойства те же, что у свёртки сделок, и по тем же причинам:
+
+    * сворачиваются ТОЛЬКО завершённые сутки (``ts < date_trunc('day', now())``);
+    * идемпотентность через ``ON CONFLICT DO NOTHING``: повторный запуск не
+      создаёт дублей и не меняет уже записанные значения;
+    * выполняется ДО удаления сырья, и при неудаче удаление пропускается.
+
+    ОТКУДА БЕРЁТСЯ logic_version. В самой таблице ``agent_outputs`` его нет, и
+    добавлять его туда задним числом нельзя: у старых строк верного значения
+    взять неоткуда. Версия восстанавливается по окнам ``logic_version_windows``
+    (§6 ТЗ 8.1): для вывода в момент ``ts`` берётся последнее окно, начавшееся
+    не позже ``ts``. Выводы, сделанные раньше самого раннего известного окна,
+    получают минимальную известную версию — их число печатается отдельной
+    строкой в логе, чтобы «неизвестная версия» не растворилась в данных.
+
+    Сутки, на которые пришлась граница версий, дают ДВЕ строки — по одной на
+    версию. Это прямо требуется: смешивать версии в анализе запрещено.
+
+    ``repeat_rate`` — доля ПОЛНЫХ повторов: вывод считается повтором, когда с
+    предыдущим выводом того же агента по тому же инструменту совпали И
+    направление, И уверенность (до четвёртого знака). Так эта величина
+    считалась в Расчёте 4 диагностики 7.1. Сравнение идёт по всему ряду, а не
+    внутри суток: первая запись суток сравнивается с последней записью
+    предыдущих — иначе каждый день терял бы одно сравнение. Если сравнивать
+    не с чем вовсе (самый первый вывод), доля равна нулю: колонка не допускает
+    пустого значения, а «повторов не было» — верное утверждение для одной
+    записи.
+
+    ``n_total`` считает ВСЕ выводы суток, включая ``insufficient_data``,
+    поэтому сумма трёх направлений может быть меньше ``n_total``. Это не
+    расхождение: «агенту не хватило данных» — не направление.
+    """
+    return """
+        WITH ver AS (
+            SELECT logic_version, started_at,
+                   lead(started_at) OVER (ORDER BY started_at) AS ended_at
+              FROM logic_version_windows
+        ), fallback AS (
+            SELECT coalesce(min(logic_version), 0) AS v FROM logic_version_windows
+        ), target AS (
+            SELECT coalesce(
+                       (SELECT max(day) + 1 FROM agent_outputs_daily),
+                       (SELECT min(ts)::date FROM agent_outputs),
+                       CURRENT_DATE
+                   ) AS from_day
+        ), src AS (
+            SELECT a.agent,
+                   a.instrument_id,
+                   a.ts::date AS day,
+                   a.signal,
+                   round(a.confidence::numeric, 4) AS conf,
+                   coalesce(
+                       (SELECT v.logic_version FROM ver v
+                         WHERE v.started_at <= a.ts
+                           AND (v.ended_at IS NULL OR a.ts < v.ended_at)
+                         ORDER BY v.started_at DESC LIMIT 1),
+                       (SELECT v FROM fallback)
+                   ) AS logic_version,
+                   lag(a.signal) OVER w AS prev_signal,
+                   lag(round(a.confidence::numeric, 4)) OVER w AS prev_conf
+              FROM agent_outputs a
+             WHERE a.ts >= (SELECT from_day FROM target)::timestamptz
+                            - interval '1 day'
+               AND a.ts < date_trunc('day', now())
+            WINDOW w AS (PARTITION BY a.agent, a.instrument_id ORDER BY a.ts)
+        )
+        INSERT INTO agent_outputs_daily
+            (day, agent, instrument_id, logic_version, n_total, n_bullish,
+             n_bearish, n_neutral, conf_avg, conf_p50, conf_p90, repeat_rate)
+        SELECT day, agent, instrument_id, logic_version,
+               count(*),
+               count(*) FILTER (WHERE signal = 'bullish'),
+               count(*) FILTER (WHERE signal = 'bearish'),
+               count(*) FILTER (WHERE signal = 'neutral'),
+               round(avg(conf), 6),
+               -- percentile_cont определён для double precision, поэтому
+               -- результат приводится к numeric явно: round(double, int)
+               -- в PostgreSQL не существует.
+               round((percentile_cont(0.5) WITHIN GROUP (ORDER BY conf))::numeric, 6),
+               round((percentile_cont(0.9) WITHIN GROUP (ORDER BY conf))::numeric, 6),
+               -- coalesce обязателен: если сравнивать не с чем (единственный
+               -- вывод за сутки), доля повторов равна нулю — колонка не
+               -- допускает пустого значения, а «повторов не было» верно.
+               coalesce(round(
+                   count(*) FILTER (
+                       WHERE prev_signal IS NOT NULL
+                         AND prev_signal = signal AND prev_conf = conf
+                   )::numeric
+                   / NULLIF(count(*) FILTER (WHERE prev_signal IS NOT NULL), 0),
+                   4
+               ), 0)
+          FROM src
+         WHERE day >= (SELECT from_day FROM target)
+         GROUP BY day, agent, instrument_id, logic_version
+        ON CONFLICT (day, agent, instrument_id, logic_version) DO NOTHING;
+    """
+
+
 RETENTION_RULES: list[tuple[str, int, str]] = [
     _rule("orderbook_snapshots", "RETENTION_ORDERBOOK_DAYS", "14"),
-    # Трое суток: сырья хватает на разбор инцидентов, а содержательная часть
-    # уже сохранена свёрткой в trade_flow_1m (решение по §4.3).
-    _rule("trades", "RETENTION_TRADES_DAYS", "3"),
+    # Двое суток: сырья хватает на разбор инцидентов, а содержательная часть
+    # уже сохранена свёрткой в trade_flow_1m. Срок выбран по бюджету диска —
+    # см. §4.5 отчёта 8.1.
+    _rule("trades", "RETENTION_TRADES_DAYS", "2"),
     _rule("ohlcv", "RETENTION_1M_DAYS", "30", "AND timeframe = '1m'"),
     # Журнал выводов агентов: 90 суток. Без срока он даёт 6.6 ГБ в год на пять
     # токенов и один делает недостижимым порог §3 (свободного места не меньше
@@ -272,10 +377,44 @@ def main() -> int:
         had_error = True
         _log(f"ОШИБКА свёртки trade_flow_1m: {exc}")
 
-    # 2. Удаление по правилам. Сырьё сделок удаляется ТОЛЬКО после успешной
-    # свёртки: потерять ленту, не сохранив итог, нельзя, а отложить удаление
-    # на сутки — можно.
+    # 2. СВЁРТКА журнала выводов агентов — тоже ДО удаления сырья.
+    daily_ok = False
+    try:
+        before_daily = _psql("SELECT count(*) FROM agent_outputs_daily;")
+        _psql(rollup_daily_sql())
+        after_daily = _psql("SELECT count(*) FROM agent_outputs_daily;")
+        unknown_version = _psql(
+            "SELECT count(*) FROM agent_outputs a "
+            "WHERE a.ts < (SELECT min(started_at) FROM logic_version_windows);"
+        )
+        _log(
+            f"agent_outputs_daily: свёрнуто суток (новых строк): "
+            f"{int(after_daily or 0) - int(before_daily or 0)}; "
+            f"всего строк итогов: {after_daily}."
+        )
+        if int(unknown_version or 0) > 0:
+            _log(
+                f"ВНИМАНИЕ: выводов раньше самого раннего известного окна версий: "
+                f"{unknown_version}. Им проставлена минимальная известная версия."
+            )
+        daily_ok = True
+    except subprocess.CalledProcessError as exc:
+        had_error = True
+        _log(f"ОШИБКА свёртки agent_outputs_daily: {(exc.stderr or '').strip() or exc}")
+    except Exception as exc:  # noqa: BLE001
+        had_error = True
+        _log(f"ОШИБКА свёртки agent_outputs_daily: {exc}")
+
+    # 3. Удаление по правилам. Сырьё удаляется ТОЛЬКО после успешной свёртки:
+    # потерять данные, не сохранив итог, нельзя, а отложить удаление на сутки —
+    # можно.
     for table, days, extra_where in RETENTION_RULES:
+        if table == "agent_outputs" and not daily_ok:
+            _log(
+                "agent_outputs: удаление ПРОПУЩЕНО — суточная свёртка не "
+                "выполнена. Журнал сохранён до следующего запуска."
+            )
+            continue
         if table == "trades" and not rollup_ok:
             _log(
                 "trades: удаление ПРОПУЩЕНО — свёртка в trade_flow_1m не "

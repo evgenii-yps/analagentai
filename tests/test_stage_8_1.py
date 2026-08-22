@@ -454,20 +454,28 @@ def test_daily_report_counts_trades_by_whitelist() -> None:
     )
 
 
-def test_trades_retention_is_three_days_and_rollup_runs_first() -> None:
-    """Решение по §4.3: сырьё — трое суток, свёртка — ДО удаления."""
+def test_trades_retention_is_two_days_and_rollups_run_first() -> None:
+    """Сырьё сделок — ДВОЕ суток (поправка по бюджету диска), свёртки — ДО удаления.
+
+    Порядок проверяется по исходному тексту задачи, а не по договорённости:
+    обе свёртки обязаны вызываться раньше первого удаления, иначе сырьё уйдёт,
+    не оставив итогов.
+    """
     import inspect
 
     import scripts.retention as retention
 
     rules = {table: days for table, days, _where in retention.RETENTION_RULES}
-    assert rules["trades"] == 3
+    assert rules["trades"] == 2
 
     source = inspect.getsource(retention.main)
-    rollup_at = source.index("rollup_sql()")
     delete_at = source.index("_delete_in_batches")
-    assert rollup_at < delete_at, "удаление сырья идёт раньше свёртки"
-    assert "rollup_ok" in source, "нет защиты «не свернулось — не удаляем»"
+    assert source.index("rollup_sql()") < delete_at, "лента сделок удаляется до свёртки"
+    assert source.index("rollup_daily_sql()") < delete_at, (
+        "журнал выводов удаляется до суточной свёртки"
+    )
+    # Защита «не свернулось — не удаляем» для обеих таблиц.
+    assert "rollup_ok" in source and "daily_ok" in source
 
 
 def test_agent_outputs_has_a_retention_rule_and_is_not_protected() -> None:

@@ -309,6 +309,7 @@ YEAR_GB="$(psql_q "
     + r.ev_d     * 365 * s.b_ev
     + (r.fund_d + r.oi_d) * 365 * s.b_fund
     + r.flow_d   * 365 * s.b_flow
+    + 15 * 365 * 260   -- суточные итоги выводов агентов: строк в сутки мало
   )::numeric * 1.2 / 1073741824.0, 2) FROM sizes s, rate r;")"
 echo
 echo "Прогноз объёма БД ЧЕРЕЗ ГОД (по измеренному притоку): ${YEAR_GB:-н/д} ГБ"
@@ -317,11 +318,23 @@ if [ -n "${DISK_TOTAL_GB:-}" ] && [ -n "${YEAR_GB:-}" ]; then
   FREE_PCT="$(awk -v d="$DISK_TOTAL_GB" -v u="$YEAR_GB" \
       'BEGIN{ printf "%.0f", 100 * (d - 10 - u) / d }')"
   echo "Диск ${DISK_TOTAL_GB} ГБ: через год свободно ≈ ${FREE_PCT}% (порог §3: не меньше 40%)"
+  # Бюджет занятого места, который оставляет порог, и доля, которую съедает
+  # прогноз. Требование: занимать не больше 75% бюджета, то есть оставлять
+  # четверть на непредвиденное — иначе «порог соблюдён» означает «впритык».
+  BUDGET_GB="$(awk -v d="$DISK_TOTAL_GB" 'BEGIN{ printf "%.2f", d * 0.6 }')"
+  BUDGET_USED="$(awk -v b="$BUDGET_GB" -v u="$YEAR_GB" \
+      'BEGIN{ printf "%.0f", (b > 0) ? 100 * u / b : 999 }')"
+  echo "Бюджет под данные (порог 40%): ${BUDGET_GB} ГБ; прогноз занимает ${BUDGET_USED}%"
   if [ "${FREE_PCT:-0}" -lt 40 ]; then
     warn "через ГОД свободного места останется ${FREE_PCT}% < 40%: сократите"
     warn "RETENTION_TRADES_DAYS или RETENTION_AGENT_OUTPUTS_DAYS либо увеличьте диск"
+  elif [ "${BUDGET_USED:-0}" -gt 75 ]; then
+    warn "прогноз съедает ${BUDGET_USED}% бюджета: порог соблюдён, но запаса нет."
+    warn "Поставьте RETENTION_TRADES_DAYS=1 — сырьё нужно только для разбора"
+    warn "инцидентов, содержательная часть уже в trade_flow_1m"
   else
-    ok "порог 40% выполняется и на горизонте года (${FREE_PCT}%)"
+    ok "порог 40% выполняется на горизонте года (${FREE_PCT}%), прогноз занимает"
+    ok "${BUDGET_USED}% бюджета — запас есть"
   fi
 fi
 

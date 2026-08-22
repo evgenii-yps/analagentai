@@ -148,8 +148,8 @@ info "часовых (и прочих не 1m) свечей старше 31 дн
 
 # Лента сделок: сырьё живёт трое суток, итоги минут — навсегда (решение по §4.3).
 ret_tr="$(env_value RETENTION_TRADES_DAYS "")"
-[ "$ret_tr" = "3" ] && ok "RETENTION_TRADES_DAYS=3" \
-  || warn "RETENTION_TRADES_DAYS=${ret_tr:-не задан} (решение по §4.3 — 3)"
+[ "$ret_tr" = "2" ] && ok "RETENTION_TRADES_DAYS=2" \
+  || warn "RETENTION_TRADES_DAYS=${ret_tr:-не задан} (решение по §4.3 — 2 суток)"
 has_flow="$(psql_q "SELECT count(*) FROM information_schema.tables
                      WHERE table_schema='public' AND table_name='trade_flow_1m';")"
 if [ "${has_flow:-0}" != "1" ]; then
@@ -171,8 +171,32 @@ else
   fi
 fi
 ret_ao="$(env_value RETENTION_AGENT_OUTPUTS_DAYS "")"
-info "RETENTION_AGENT_OUTPUTS_DAYS=${ret_ao:-не задан} (журнал выводов агентов; "
-info "мнения, участвовавшие в решении, остаются навсегда в signals.agents_payload)"
+info "RETENTION_AGENT_OUTPUTS_DAYS=${ret_ao:-не задан} (журнал выводов агентов)"
+has_daily="$(psql_q "SELECT count(*) FROM information_schema.tables
+                      WHERE table_schema='public' AND table_name='agent_outputs_daily';")"
+if [ "${has_daily:-0}" != "1" ]; then
+  block "таблицы agent_outputs_daily нет — миграция 011 не применена, а журнал"
+  info  "выводов удаляется через ${ret_ao:-90} суток: история поведения агентов потеряется"
+else
+  ok "таблица суточных итогов agent_outputs_daily есть"
+  daily_lag="$(psql_q "SELECT coalesce((CURRENT_DATE - max(day)), 999)
+                         FROM agent_outputs_daily;")"
+  raw_days="$(psql_q "SELECT coalesce((CURRENT_DATE - min(ts)::date), 0)
+                        FROM agent_outputs;")"
+  if [ "${daily_lag:-999}" -gt 3 ] && [ "${raw_days:-0}" -gt 3 ]; then
+    block "суточные итоги отстают на ${daily_lag} дн. при журнале глубиной ${raw_days} дн.:"
+    info  "ежесуточная задача не выполняется — журнал удалится несвёрнутым"
+  else
+    ok "суточные итоги свежие (отставание ${daily_lag} дн.)"
+  fi
+  # Сутки на границе версий обязаны давать ДВЕ строки, а не одну смешанную.
+  mixed_days="$(psql_q "SELECT count(*) FROM (
+                          SELECT day, agent, instrument_id FROM agent_outputs_daily
+                           GROUP BY day, agent, instrument_id
+                          HAVING count(DISTINCT logic_version) > 1) q;")"
+  info "суток с несколькими версиями логики: ${mixed_days:-0} (они разделены по строкам)"
+fi
+info "мнения, участвовавшие в решении, остаются навсегда в signals.agents_payload"
 
 echo
 echo "=== 5. Версия логики и граница данных (§6) ==="

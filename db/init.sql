@@ -58,6 +58,28 @@ CREATE TABLE IF NOT EXISTS trade_flow_1m (
 );
 CREATE INDEX IF NOT EXISTS ix_trade_flow_1m_ts ON trade_flow_1m (ts);
 
+-- Суточные итоги выводов агентов (Этап 8.1). Сырой журнал agent_outputs живёт
+-- 90 суток (версия логики меняется почти каждый этап, и старые выводы
+-- аналитически непригодны), итоги суток — НАВСЕГДА. logic_version в ключе:
+-- сутки на границе версий дают две строки, а не одну смешанную.
+CREATE TABLE IF NOT EXISTS agent_outputs_daily (
+    day            DATE          NOT NULL,
+    agent          TEXT          NOT NULL,
+    instrument_id  INTEGER       NOT NULL REFERENCES instruments(id),
+    logic_version  SMALLINT      NOT NULL,
+    n_total        INTEGER       NOT NULL,
+    n_bullish      INTEGER       NOT NULL,
+    n_bearish      INTEGER       NOT NULL,
+    n_neutral      INTEGER       NOT NULL,
+    conf_avg       NUMERIC(10,6) NOT NULL,
+    conf_p50       NUMERIC(10,6) NOT NULL,
+    conf_p90       NUMERIC(10,6) NOT NULL,
+    repeat_rate    NUMERIC(5,4)  NOT NULL,
+    PRIMARY KEY (day, agent, instrument_id, logic_version)
+);
+CREATE INDEX IF NOT EXISTS ix_agent_outputs_daily_agent
+    ON agent_outputs_daily (agent, day);
+
 -- Ставки финансирования (funding rate) для деривативов.
 CREATE TABLE IF NOT EXISTS funding (
     instrument_id INT NOT NULL REFERENCES instruments(id),
