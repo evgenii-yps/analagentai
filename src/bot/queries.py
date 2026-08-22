@@ -137,9 +137,13 @@ class BotQueries:
                    s.agents_payload::text AS agents_payload,
                    s.calibrated_probability, s.calibration_id,
                    s.inputs_hash, s.is_repeat,
+                   -- Этап 8.1: токенов пять, и карточка обязана называть тот,
+                   -- по которому выдан сигнал.
+                   i.symbol      AS symbol,
                    c.built_at    AS calibration_built_at,
                    c.sample_size AS calibration_sample_size
             FROM signals s
+            JOIN instruments i ON i.id = s.instrument_id
             LEFT JOIN calibration_curves c ON c.id = s.calibration_id
             WHERE s.id = $1;
             """,
@@ -151,12 +155,17 @@ class BotQueries:
 
         evals = await self._pool.fetch(
             """
-            SELECT horizon, price_at_close, pnl_pct, drawdown_pct, success
+            SELECT horizon, horizon_h, price_at_close, pnl_pct, drawdown_pct, success
             FROM signal_evaluations WHERE signal_id = $1;
             """,
             signal_id,
         )
         by_horizon = {e["horizon"]: dict(e) for e in evals}
+        # Этап 8.1: горизонтов четыре. Ключи 1h/4h сохранены (их читает прежняя
+        # разметка карточки), 12h/24h добавлены рядом.
+        card["evals_by_horizon"] = {
+            int(e["horizon_h"]): dict(e) for e in evals if e["horizon_h"] is not None
+        }
         card["eval_1h"] = by_horizon.get("1h")
         card["eval_4h"] = by_horizon.get("4h")
 

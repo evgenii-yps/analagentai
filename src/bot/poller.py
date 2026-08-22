@@ -20,6 +20,7 @@ import structlog
 from src.bot import handlers
 from src.bot.queries import PERIOD_SECONDS, BotQueries
 from src.core.config import settings
+from src.core.instruments import horizon_label
 from src.core.redis_client import get_redis
 from src.notify.agent import AGENT_ORDER
 from src.notify.telegram import send_message
@@ -261,7 +262,8 @@ class BotPoller:
         hb_rows = await self._read_heartbeats()
         data_counts = await self.queries.data_counts_24h()
         signal_counts = await self.queries.signal_counts_24h(
-            settings.NOTIFY_MIN_PROBABILITY, settings.EVAL_PRIMARY_HORIZON
+            settings.NOTIFY_MIN_PROBABILITY,
+            horizon_label(settings.eval_primary_horizon_h),
         )
         db_size = await self.queries.db_size()
         return handlers.render_summary(hb_rows, data_counts, signal_counts, db_size, now)

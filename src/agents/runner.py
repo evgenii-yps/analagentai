@@ -13,16 +13,20 @@ from src.agents.liquidity import LiquidityAgent
 from src.agents.market import MarketAgent
 from src.core.config import settings
 from src.core.db import db
+from src.core.instruments import ensure_instruments
 from src.core.redis_client import close_redis, get_redis
 
 
 async def run() -> None:
     """Поднимает инфраструктуру, запускает агентов и ждёт сигнала остановки."""
     log = structlog.get_logger()
+    pairs = settings.symbol_pairs
     log.info(
-        "Запуск сервиса агентов Agent Trade (Этап 3)",
+        "Запуск сервиса агентов Agent Trade (Этап 3, состав — Этап 8.1)",
         timeframe=settings.AGENT_TIMEFRAME,
         interval=settings.AGENT_INTERVAL,
+        pairs=[pair.label for pair in pairs],
+        closed_bars_only=settings.MARKET_CLOSED_BARS_ONLY,
     )
 
     # 1. Инфраструктура: БД и Redis.
@@ -33,26 +37,39 @@ async def run() -> None:
 
     tasks: list[asyncio.Task[None]] = []
     try:
-        # 2. Инструменты: spot (Market/Liquidity) и swap (Futures).
-        spot_id = await db.get_or_create_instrument(
-            settings.EXCHANGE, settings.SYMBOL, "spot"
-        )
-        swap_id = await db.get_or_create_instrument(
-            settings.EXCHANGE, settings.SWAP_SYMBOL, "swap"
-        )
-        log.info("Инструменты готовы", spot_id=spot_id, swap_id=swap_id)
+        # 2. Инструменты: на каждый токен пара «спот + контракт».
+        instruments = await ensure_instruments(db, settings.EXCHANGE, pairs)
+        for item in instruments:
+            log.info(
+                "Инструменты готовы", token=item.token,
+                spot=item.pair.spot, spot_id=item.spot_id,
+                swap=item.pair.swap, swap_id=item.swap_id,
+            )
 
-        # 3. Агенты (каждый получает только свой инструмент).
-        agents: list[BaseAgent] = [
-            MarketAgent(
-                spot_id,
-                settings.AGENT_TIMEFRAME,
-                settings.AGENT_MIN_CANDLES,
-                settings.AGENT_INTERVAL,
-            ),
-            LiquidityAgent(spot_id, settings.AGENT_INTERVAL),
-            FuturesAgent(swap_id, settings.AGENT_TIMEFRAME, settings.AGENT_INTERVAL),
-        ]
+        # 3. Агенты: свой комплект на каждую пару. Market и Liquidity получают
+        # СПОТ, Futures — КОНТРАКТ. Это не деталь оформления: свечи собираются
+        # только по споту, а funding и открытый интерес — только по контракту
+        # (замеры 22.08.2026, §1 ТЗ 8.1). Подмена одного рынка другим означала
+        # бы анализ не того рынка — тест test_market_split этого не допускает.
+        agents: list[BaseAgent] = []
+        for item in instruments:
+            agents.extend([
+                MarketAgent(
+                    item.spot_id,
+                    settings.AGENT_TIMEFRAME,
+                    settings.AGENT_MIN_CANDLES,
+                    settings.AGENT_INTERVAL,
+                    name_suffix=item.token,
+                ),
+                LiquidityAgent(
+                    item.spot_id, settings.AGENT_INTERVAL, name_suffix=item.token
+                ),
+                FuturesAgent(
+                    item.swap_id, settings.AGENT_TIMEFRAME, settings.AGENT_INTERVAL,
+                    name_suffix=item.token,
+                ),
+            ])
+        log.info("Агенты созданы", count=len(agents), pairs=len(instruments))
         tasks = [asyncio.create_task(a.run(), name=a.name) for a in agents]
 
         # 4. Обработчики сигналов остановки.

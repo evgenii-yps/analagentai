@@ -8,6 +8,12 @@
 2. WebSocket: подписка на публичный канал ``tickers`` и ожидание реальных
    данных. Если данные по WebSocket не пришли — тест провален.
 
+ЭТАП 8.1 §1. Дополнительно проверяется доступность КАЖДОГО из десяти
+инструментов (пять токенов × спот и контракт): недоступный инструмент
+ИСКЛЮЧАЕТСЯ из конфигурации, а не подменяется другим. Проверка идёт по тем же
+публичным эндпоинтам: тикер — для спота и контракта, ставка финансирования —
+только для контракта (у спота её не существует, и это не отказ биржи).
+
 Скрипт написан ТОЛЬКО на стандартной библиотеке Python 3 (socket/ssl/urllib),
 поэтому запускается на «голом» сервере до установки Docker и pip-пакетов.
 
@@ -44,6 +50,19 @@ WS_TIMEOUT = float(os.environ.get("GEO_WS_TIMEOUT", "20"))
 
 # Коды, которые однозначно указывают на гео-/сетевую блокировку.
 BLOCKING_STATUSES = {403, 451}
+
+# Базовый адрес API (переопределяется для проверки в изолированной среде).
+API_BASE = os.environ.get("GEO_OKX_API_BASE", "https://www.okx.com")
+
+# Инструменты Этапа 8.1 §1: пять токенов, у каждого спот И бессрочный контракт.
+# Имена контрактов выписаны ЯВНО — достраивание из имени спота запрещено.
+DEFAULT_INSTRUMENTS: list[tuple[str, str]] = [
+    ("BTC-USDT", "BTC-USDT-SWAP"),
+    ("ETH-USDT", "ETH-USDT-SWAP"),
+    ("SOL-USDT", "SOL-USDT-SWAP"),
+    ("XRP-USDT", "XRP-USDT-SWAP"),
+    ("DOGE-USDT", "DOGE-USDT-SWAP"),
+]
 
 
 def _log(msg: str) -> None:
@@ -240,20 +259,88 @@ def check_websocket() -> bool:
             pass
 
 
+def _get_json(url: str) -> tuple[int, dict]:
+    """GET с разбором JSON. Возвращает (код ответа, тело). Не бросает."""
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "agent-trade-geocheck/1.0"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=REST_TIMEOUT) as resp:
+            return resp.getcode(), json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = {}
+        try:
+            body = json.loads(exc.read().decode("utf-8"))
+        except Exception:  # noqa: BLE001 — тело может быть не JSON
+            pass
+        return exc.code, body
+    except Exception as exc:  # noqa: BLE001 — сетевой отказ
+        return 0, {"msg": str(exc)}
+
+
+def check_instrument(inst_id: str, kind: str) -> bool:
+    """Доступен ли инструмент: тикер обязателен, funding — только у контракта."""
+    status, body = _get_json(f"{API_BASE}/api/v5/market/ticker?instId={inst_id}")
+    ok = status == 200 and str(body.get("code")) == "0" and bool(body.get("data"))
+    mark = "OK    " if ok else "ПРОВАЛ"
+    detail = "" if ok else f"  (HTTP {status}, код {body.get('code')}, {str(body.get('msg'))[:60]})"
+    _log(f"  {mark} {inst_id:<16} {kind:<9} тикер{detail}")
+    if not ok:
+        return False
+    if kind == "контракт":
+        status_f, body_f = _get_json(
+            f"{API_BASE}/api/v5/public/funding-rate?instId={inst_id}"
+        )
+        ok_f = status_f == 200 and str(body_f.get("code")) == "0"
+        _log(
+            f"  {'OK    ' if ok_f else 'ПРОВАЛ'} {inst_id:<16} {kind:<9} funding"
+            + ("" if ok_f else f"  (HTTP {status_f}, код {body_f.get('code')})")
+        )
+        return ok_f
+    return True
+
+
+def check_instruments(
+    instruments: list[tuple[str, str]] | None = None
+) -> tuple[list[str], list[str]]:
+    """Проверяет все десять инструментов. Возвращает (доступные, недоступные)."""
+    instruments = instruments or DEFAULT_INSTRUMENTS
+    available: list[str] = []
+    unavailable: list[str] = []
+    _log("")
+    _log("--- Доступность инструментов (§1 ТЗ 8.1): пять токенов × два рынка ---")
+    for spot, swap in instruments:
+        for inst_id, kind in ((spot, "спот"), (swap, "контракт")):
+            (available if check_instrument(inst_id, kind) else unavailable).append(
+                inst_id
+            )
+    return available, unavailable
+
+
 def main() -> int:
     """Точка входа: печатает итог и возвращает exit code (0 — успех)."""
     _log("=== Гео-тест OKX (блокирующий шаг развёртывания) ===")
     rest_ok = check_rest()
     ws_ok = check_websocket()
+    available, unavailable = check_instruments()
 
     _log("")
     _log("--- Итог гео-теста ---")
     _log(f"REST OKX:      {'OK' if rest_ok else 'ПРОВАЛ'}")
     _log(f"WebSocket OKX: {'OK' if ws_ok else 'ПРОВАЛ'}")
+    _log(f"Инструменты:   доступно {len(available)} из "
+         f"{len(available) + len(unavailable)}")
+    if unavailable:
+        _log("НЕДОСТУПНЫ: " + ", ".join(unavailable))
+        _log("Такой инструмент ИСКЛЮЧАЕТСЯ из SYMBOLS, а не подменяется другим (§1 ТЗ 8.1).")
 
-    if rest_ok and ws_ok:
-        _log("РЕЗУЛЬТАТ: OKX доступна из этой локации. Можно продолжать развёртывание.")
+    if rest_ok and ws_ok and not unavailable:
+        _log("РЕЗУЛЬТАТ: OKX доступна, все десять инструментов отвечают.")
         return 0
+    if rest_ok and ws_ok:
+        _log("РЕЗУЛЬТАТ: биржа доступна, но не все инструменты отвечают — "
+             "исключите недоступные из SYMBOLS и повторите.")
+        return 1
 
     _log("РЕЗУЛЬТАТ: OKX недоступна из этой локации — развёртывание НЕВОЗМОЖНО.")
     _log("Что делать: сменить локацию сервера (регион дата-центра) на разрешённую для OKX")

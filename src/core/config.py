@@ -5,6 +5,8 @@
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from src.core.instruments import SymbolPair, parse_horizon_hours, parse_symbol_pairs
+
 
 class Settings(BaseSettings):
     """Настройки приложения, считываемые из окружения / ``.env``."""
@@ -33,8 +35,15 @@ class Settings(BaseSettings):
 
     # --- Сбор данных (Этап 2) ---
     EXCHANGE: str = "binance"
-    SYMBOL: str = "BTC/USDT"            # спотовый символ
-    SWAP_SYMBOL: str = "BTC/USDT:USDT"  # бессрочный фьючерс (swap)
+    SYMBOL: str = "BTC/USDT"            # спотовый символ (одна пара, см. SYMBOLS)
+    SWAP_SYMBOL: str = "BTC/USDT:USDT"  # бессрочный фьючерс (swap) той же пары
+    # Этап 8.1 §1. Пары «спот:контракт» через запятую, например:
+    #   SYMBOLS=BTC/USDT:BTC/USDT:USDT,ETH/USDT:ETH/USDT:USDT
+    # Разделитель пары — ПЕРВОЕ двоеточие: имя контракта само содержит ':'.
+    # Достраивание имени контракта из имени спота ЗАПРЕЩЕНО (§1 ТЗ 8.1): рынки
+    # разные, и молчаливая догадка означала бы сбор не с того рынка.
+    # Пустое значение = одна пара из SYMBOL/SWAP_SYMBOL (поведение до 8.1).
+    SYMBOLS: str = ""
     TIMEFRAMES: str = "1m,5m,15m,1h"    # таймфреймы свечей через запятую
     OHLCV_INTERVAL: int = 30            # сек между опросами свечей
     ORDERBOOK_INTERVAL: int = 10        # сек между снимками стакана
@@ -46,6 +55,18 @@ class Settings(BaseSettings):
     AGENT_TIMEFRAME: str = "1h"   # таймфрейм для Market Agent
     AGENT_INTERVAL: int = 60      # сек между запусками агентов
     AGENT_MIN_CANDLES: int = 200  # минимум свечей для анализа
+
+    # --- Незавершённый бар в окне Market Agent (Этап 8.1 §8) ---
+    # Замером 22.08.2026 установлено: коллектор сохраняет НЕЗАВЕРШЁННУЮ часовую
+    # свечу и пересчитывает её на ходу (за 90 c объём 53.86 → 55.19, close
+    # 77179.2 → 77158.7 при той же метке 17:00). Market анализирует её наравне
+    # с закрытыми: в 17:01 видит бар из одной минуты торгов, в 17:59 — из
+    # пятидесяти девяти.
+    #   false (ПО УМОЛЧАНИЮ) — поведение системы НЕ меняется ни в чём;
+    #   true  — Market исключает незавершённый бар из окна.
+    # Этап 8.1 значение НЕ меняет: переключатель вводится, чтобы эффект можно
+    # было измерить отдельным этапом, а не чтобы применить его сейчас.
+    MARKET_CLOSED_BARS_ONLY: bool = False
 
     # --- Наблюдаемость сбоев агентов (Этап 7.0, Задача B) ---
     # Сколько подряд сбойных итераций одного агента вызывают алерт в Telegram.
@@ -89,7 +110,10 @@ class Settings(BaseSettings):
     #   v3 (7.2) — знаменатель согласованности = полное число агентов;
     #   v4 (7.3) — перцентильные границы Futures, калиброванная вероятность,
     #              учёт инерции входов (inputs_hash / is_repeat).
-    LOGIC_VERSION: int = 4
+    # Этап 8.1 §6: v5 — пять токенов и четыре горизонта оценки. Данные версий
+    # 4 и 5 НИКОГДА не смешиваются в анализе: изменился и состав инструментов,
+    # и набор горизонтов.
+    LOGIC_VERSION: int = 5
     DECISION_INTERVAL: int = 60       # сек между решениями
     DECISION_THRESHOLD: float = 0.3   # порог балла для buy/sell
     AGENT_FRESHNESS_SEC: int = 300    # макс. возраст вывода агента
@@ -138,9 +162,36 @@ class Settings(BaseSettings):
 
     # --- Оценка результатов (Этап 6) ---
     EVAL_INTERVAL: int = 300          # сек между прогонами оценщика
-    EVAL_HORIZONS: str = "1h,4h"      # горизонты оценки через запятую
-    EVAL_PRIMARY_HORIZON: str = "4h"  # главный горизонт (сводка в signals)
+    # Этап 8.1 §5: четыре горизонта в ЧАСАХ. Каждый сигнал оценивается на
+    # 1, 4, 12 и 24 часах НЕЗАВИСИМО; сигнал при этом остаётся один.
+    # Горизонт не влияет на выводы агентов — только на оценку исхода.
+    EVAL_HORIZONS: str = "1,4,12,24"
+    # Главный горизонт: по нему пишется сводка в signals и сигнал закрывается.
+    EVAL_PRIMARY_HORIZON: str = "4"
+    # Прежний формат («1h,4h», «4h») читается тоже: значение из .env не обязано
+    # меняться синхронно с кодом, а «4h» и «4» — это один и тот же горизонт.
     STATS_LOG_INTERVAL: int = 3600    # сек между логами статистики
+
+    # --- Срок хранения данных (Этап 8.1 §4) ---
+    # Объём растёт впятеро вместе с числом токенов, поэтому сроки заданы явно и
+    # применяются ежесуточной задачей (scripts/retention.py, cron 03:40 UTC).
+    # НИКОГДА не удаляются: часовые (и любые НЕ 1m) свечи, funding, открытый
+    # интерес, сигналы и оценки — на них держится весь анализ.
+    RETENTION_1M_DAYS: int = 30        # минутные свечи (только timeframe='1m')
+    RETENTION_ORDERBOOK_DAYS: int = 14  # снимки стакана
+    # Лента сделок: ДВОЕ суток сырья. Содержательная часть не теряется — перед
+    # удалением ежесуточная задача сворачивает завершённые минуты в
+    # trade_flow_1m (число сделок, объёмы по сторонам, VWAP), и эти итоги не
+    # удаляются никогда. Срок выбран по бюджету диска: при фактических 37.21 ГБ
+    # порог «свободного места не меньше 40%» оставляет под данные 22.3 ГБ, и
+    # трое суток сырья съедали бы 90% этого бюджета — это не запас (§4.5 отчёта).
+    RETENTION_TRADES_DAYS: int = 2
+    # Журнал выводов агентов: 90 суток. Он не входит в перечень «не удаляется
+    # никогда» из §4 ТЗ 8.1 и при этом самый объёмный из долгоживущих: без
+    # срока хранения он один делает недостижимым порог §3 (свободного места не
+    # меньше 40%) на горизонте года. Мнения, участвовавшие в решении, остаются
+    # навсегда в signals.agents_payload. Значение 0 отключает правило.
+    RETENTION_AGENT_OUTPUTS_DAYS: int = 90
 
     # --- Выгрузка сигналов (Этап 6.6) ---
     # Секреты без значения по умолчанию заданы пустой строкой умышленно: это
@@ -187,8 +238,44 @@ class Settings(BaseSettings):
 
     @property
     def eval_horizons_list(self) -> list[str]:
-        """Разбирает строку EVAL_HORIZONS в список горизонтов."""
-        return [h.strip() for h in self.EVAL_HORIZONS.split(",") if h.strip()]
+        """Горизонты оценки подписями вида ``4h`` (для отображения и текста)."""
+        return [f"{h}h" for h in self.eval_horizons_hours]
+
+    @property
+    def eval_horizons_hours(self) -> list[int]:
+        """Горизонты оценки В ЧАСАХ, по возрастанию и без повторов (§5 ТЗ 8.1)."""
+        hours = [
+            parse_horizon_hours(item)
+            for item in self.EVAL_HORIZONS.split(",")
+            if item.strip()
+        ]
+        return sorted(set(hours))
+
+    @property
+    def eval_primary_horizon_h(self) -> int:
+        """Главный горизонт в часах: по нему закрывается сигнал.
+
+        Обязан входить в набор горизонтов, иначе сигнал не закроется никогда —
+        это ошибка конфигурации, а не повод молча выбрать другой горизонт.
+        """
+        primary = parse_horizon_hours(self.EVAL_PRIMARY_HORIZON)
+        if primary not in self.eval_horizons_hours:
+            raise ValueError(
+                f"EVAL_PRIMARY_HORIZON={self.EVAL_PRIMARY_HORIZON} "
+                f"не входит в EVAL_HORIZONS={self.EVAL_HORIZONS}"
+            )
+        return primary
+
+    @property
+    def symbol_pairs(self) -> list[SymbolPair]:
+        """Пары «спот → контракт» из SYMBOLS (§1 ТЗ 8.1).
+
+        Пустой SYMBOLS означает одну пару из SYMBOL/SWAP_SYMBOL — поведение
+        системы до Этапа 8.1. Имя контракта не достраивается никогда.
+        """
+        if self.SYMBOLS.strip():
+            return parse_symbol_pairs(self.SYMBOLS)
+        return [SymbolPair(spot=self.SYMBOL, swap=self.SWAP_SYMBOL)]
 
     @property
     def agent_weights(self) -> dict[str, float]:

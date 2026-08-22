@@ -34,11 +34,17 @@ from src.core.config import mask_secret, settings
 from src.core.logging import setup_logging
 from src.export import notion, queries, sheets
 from src.export.transform import (
+    CORRELATION_HEADER,
+    INDEPENDENT_DISCLAIMER,
+    INDEPENDENT_HEADER,
     SIGNALS_HEADER,
     SUMMARY_HEADER,
+    build_correlation_row,
+    build_independent_row,
     build_notion_properties,
     build_signal_row,
     build_summary_row,
+    mean_correlation_by_token,
 )
 from src.notify.telegram import send_message
 
@@ -49,6 +55,9 @@ _NOTION_PAUSE = 0.35
 _SHEET_SIGNALS = "Сигналы"
 _SHEET_SUMMARY = "Сводка по дням"
 _SHEET_WINDOWS = "Независимые окна"
+# Этап 8.1 §7: корреляция исходов между токенами — отдельным листом, чтобы её
+# нельзя было не заметить.
+_SHEET_CORRELATION = "Корреляция токенов"
 
 
 class ExportError(Exception):
@@ -108,18 +117,41 @@ async def _export_sheets(
     if not res.ok:
         raise ExportError(f"лист «Сводка по дням»: {res.error}")
 
-    windows = await queries.fetch_independent_windows(conn)
-    window_rows = [build_signal_row(sig) for sig in windows]
+    # Независимые окна: по одному наблюдению на ТОКЕН и ГОРИЗОНТ (§7 ТЗ 8.1).
+    horizons = settings.eval_horizons_hours
+    windows = await queries.fetch_independent_by_token_horizon(conn, horizons)
+    correlation = await queries.fetch_outcome_correlation(conn, horizons)
+    mean_corr = mean_correlation_by_token(correlation)
+    window_rows = [
+        build_independent_row(
+            sig,
+            mean_corr.get((int(sig.get("horizon_h") or 0), str(sig.get("token") or ""))),
+        )
+        for sig in windows
+    ]
+    # Оговорка §7 — ПЕРВОЙ строкой листа, до данных: она обязательна и не
+    # зависит от того, посмотрит ли читатель отдельный лист корреляции.
     res = await sheets.post_rows(
-        url, secret, _SHEET_WINDOWS, "replace", window_rows, header=SIGNALS_HEADER
+        url, secret, _SHEET_WINDOWS, "replace",
+        [INDEPENDENT_DISCLAIMER, *window_rows], header=INDEPENDENT_HEADER,
     )
     if not res.ok:
         raise ExportError(f"лист «Независимые окна»: {res.error}")
+
+    correlation_rows = [build_correlation_row(row) for row in correlation]
+    res = await sheets.post_rows(
+        url, secret, _SHEET_CORRELATION, "replace", correlation_rows,
+        header=CORRELATION_HEADER,
+    )
+    if not res.ok:
+        raise ExportError(f"лист «Корреляция токенов»: {res.error}")
 
     log.info(
         "Служебные листы пересобраны",
         summary_days=len(summary_rows),
         windows=len(window_rows),
+        horizons_h=horizons,
+        correlation_pairs=len(correlation_rows),
     )
     return total
 

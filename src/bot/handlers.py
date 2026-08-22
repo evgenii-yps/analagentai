@@ -294,8 +294,14 @@ def render_signal_card(card: dict[str, Any] | None, now: datetime) -> str:
         else "—"
     )
 
+    # Этап 8.1: инструмент называется в заголовке — токенов пять, и без имени
+    # карточка не отличает сигнал по XRP от сигнала по BTC.
+    symbol = card.get("symbol")
+    header = f"{emoji} <b>Сигнал #{card['id']}</b>"
+    if symbol:
+        header = f"{emoji} <b>Сигнал #{card['id']} · {symbol}</b>"
     lines = [
-        f"{emoji} <b>Сигнал #{card['id']}</b>",
+        header,
         f"Время: {fmt_msk(card['ts'])}",
         f"Решение: {decision}, индекс согласия {conviction}%",
     ]
@@ -341,8 +347,15 @@ def render_signal_card(card: dict[str, Any] | None, now: datetime) -> str:
 
     lines.append("")
     lines.append("<b>Результаты:</b>")
-    lines.append("1 час: " + _render_horizon(card.get("eval_1h")))
-    lines.append("4 часа: " + _render_horizon(card.get("eval_4h")))
+    # Этап 8.1: четыре горизонта. Подписи берутся из фактических данных, а не
+    # зашиты: если состав горизонтов изменится, карточка не начнёт врать.
+    evals = card.get("evals_by_horizon") or {}
+    if evals:
+        for hours in sorted(evals):
+            lines.append(f"{hours} ч: " + _render_horizon(evals[hours]))
+    else:
+        lines.append("1 час: " + _render_horizon(card.get("eval_1h")))
+        lines.append("4 часа: " + _render_horizon(card.get("eval_4h")))
 
     lines.append("")
     lines.append(f"Уведомление: {_notify_status(card)}")

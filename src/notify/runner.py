@@ -9,6 +9,7 @@ import structlog
 
 from src.core.config import settings
 from src.core.db import db
+from src.core.instruments import horizon_label
 from src.core.redis_client import close_redis, get_redis
 from src.notify.agent import NotifyAgent
 
@@ -43,7 +44,7 @@ async def run() -> None:
             cooldown_sec=settings.NOTIFY_COOLDOWN_SEC,
             symbol=settings.SYMBOL,
             tz_name=settings.NOTIFY_TIMEZONE,
-            primary_horizon=settings.EVAL_PRIMARY_HORIZON,
+            primary_horizon=horizon_label(settings.eval_primary_horizon_h),
             min_agents=settings.NOTIFY_MIN_AGENTS,
             use_calibrated=settings.NOTIFY_USE_CALIBRATED,
             min_calibrated=settings.NOTIFY_MIN_CALIBRATED,

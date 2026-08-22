@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 import asyncpg
 
 from src.core.config import settings
+from src.core.instruments import horizon_label
 
 if TYPE_CHECKING:
     # Импорт только для аннотаций — без циклической зависимости в рантайме.
@@ -660,38 +661,55 @@ class DB:
         )
         return dict(row) if row is not None else None
 
+    async def get_instrument_symbol(self, instrument_id: int) -> str | None:
+        """Символ инструмента по идентификатору (для подписи уведомления).
+
+        Введено Этапом 8.1: токенов пять, и сообщение обязано называть тот
+        инструмент, по которому выдан сигнал, а не символ из настройки SYMBOL.
+        """
+        return await self.pool.fetchval(
+            "SELECT symbol FROM instruments WHERE id = $1;", int(instrument_id)
+        )
+
     async def get_independent_outcomes(
         self,
         logic_version: int,
-        horizon: str,
+        horizon_h: int,
     ) -> list[dict[str, Any]]:
-        """Независимые наблюдения для калибровки: одно на 4-часовое окно.
+        """Независимые наблюдения для калибровки: одно на окно И НА ТОКЕН.
 
         Берутся закрытые направленные сигналы указанной версии логики с
         ``degraded = false``, у которых есть оценка на нужном горизонте. Окна —
-        непересекающиеся 4-часовые отрезки с границами 00/04/08/12/16/20 UTC
-        (epoch кратен 14400), из окна берётся ПЕРВЫЙ по времени сигнал.
-        Прореживание обязательно: решения выдаются раз в минуту, а горизонт —
-        четыре часа, поэтому соседние сигналы описывают почти один и тот же
-        отрезок рынка и независимыми наблюдениями не являются.
+        непересекающиеся отрезки длиной в горизонт, из окна берётся ПЕРВЫЙ по
+        времени сигнал. Прореживание обязательно: решения выдаются раз в минуту,
+        а горизонт — часы, поэтому соседние сигналы описывают почти один и тот
+        же отрезок рынка и независимыми наблюдениями не являются.
+
+        ЭТАП 8.1: ключ прореживания включает ИНСТРУМЕНТ. Без него пять токенов
+        конкурировали бы за одно окно, и от каждого окна оставался бы ровно один
+        сигнал — четыре пятых наблюдений исчезли бы молча. Это НЕ означает, что
+        пять токенов дают пятикратную мощность: криптовалюты сильно
+        коррелированы, и корреляция исходов считается отдельно (§7 ТЗ 8.1).
         """
         query = """
-            SELECT DISTINCT ON (win) win, id, ts, probability, success
+            SELECT DISTINCT ON (instrument_id, win)
+                   win, instrument_id, id, ts, probability, success
             FROM (
-                SELECT s.id, s.ts, s.probability, e.success,
-                       to_timestamp(floor(extract(epoch FROM s.ts) / 14400) * 14400)
-                           AS win
+                SELECT s.id, s.ts, s.instrument_id, s.probability, e.success,
+                       to_timestamp(
+                           floor(extract(epoch FROM s.ts) / ($2 * 3600)) * ($2 * 3600)
+                       ) AS win
                 FROM signals s
                 JOIN signal_evaluations e
-                  ON e.signal_id = s.id AND e.horizon = $2
+                  ON e.signal_id = s.id AND e.horizon_h = $2
                 WHERE s.logic_version = $1
                   AND s.decision <> 'wait'
                   AND s.degraded = FALSE
                   AND s.probability IS NOT NULL
             ) q
-            ORDER BY win, ts ASC;
+            ORDER BY instrument_id, win, ts ASC;
         """
-        rows = await self.pool.fetch(query, int(logic_version), horizon)
+        rows = await self.pool.fetch(query, int(logic_version), int(horizon_h))
         return [dict(r) for r in rows]
 
     async def save_calibration_curve(
@@ -829,42 +847,178 @@ class DB:
     # --- Оценка результатов (Этап 6) ---
 
     async def ensure_evaluator_schema(self) -> None:
-        """Идемпотентно создаёт таблицу ``signal_evaluations`` (на старом томе)."""
+        """Идемпотентно приводит схему оценок к виду Этапа 8.1 (§5).
+
+        Повторяет миграцию ``009_stage_8_1_horizons.sql`` для случая, когда том
+        БД старше init.sql: сервисы поднимаются в произвольном порядке, и
+        оценщик обязан работать сразу, а не после ручного применения миграции.
+        Горизонт существующих записей берётся из уже записанного текста
+        (``'4h'`` → 4), НОВЫХ строк не создаётся — досчёт горизонтов задним
+        числом запрещён (§12 ТЗ 8.1).
+        """
         await self.pool.execute(
             """
             CREATE TABLE IF NOT EXISTS signal_evaluations (
-                id              BIGSERIAL PRIMARY KEY,
                 signal_id       BIGINT NOT NULL REFERENCES signals(id),
                 horizon         TEXT NOT NULL,
+                horizon_h       SMALLINT NOT NULL,
                 price_at_signal DOUBLE PRECISION NOT NULL,
                 price_at_close  DOUBLE PRECISION NOT NULL,
                 pnl_pct         DOUBLE PRECISION NOT NULL,
                 drawdown_pct    DOUBLE PRECISION NOT NULL,
                 success         BOOLEAN NOT NULL,
                 evaluated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-                UNIQUE (signal_id, horizon)
+                PRIMARY KEY (signal_id, horizon_h)
+            );
+            """
+        )
+        await self.pool.execute(
+            "ALTER TABLE signal_evaluations ADD COLUMN IF NOT EXISTS "
+            "horizon_h SMALLINT;"
+        )
+        await self.pool.execute(
+            """
+            UPDATE signal_evaluations
+               SET horizon_h = CASE
+                    WHEN horizon ~ '^[0-9]+h$'
+                        THEN (regexp_replace(horizon, 'h$', ''))::smallint
+                    WHEN horizon ~ '^[0-9]+$' THEN horizon::smallint
+                    WHEN horizon ~ '^[0-9]+d$'
+                        THEN ((regexp_replace(horizon, 'd$', ''))::int * 24)::smallint
+                    ELSE 4::smallint
+                   END
+             WHERE horizon_h IS NULL;
+            """
+        )
+        await self.pool.execute(
+            "ALTER TABLE signal_evaluations ALTER COLUMN horizon_h SET NOT NULL;"
+        )
+        # Та же защита, что в миграции 009: у одного сигнала не может быть двух
+        # оценок на один горизонт. Если это случилось (в колонке horizon было
+        # значение, которое не разбирается, — оно получает 4 и сталкивается с
+        # настоящей строкой '4h'), сервис обязан сказать это прямо, а не падать
+        # на «could not create unique index» при смене ключа.
+        duplicates = await self.pool.fetchval(
+            """
+            SELECT string_agg(DISTINCT signal_id::text, ', ')
+              FROM (
+                  SELECT signal_id FROM signal_evaluations
+                   GROUP BY signal_id, horizon_h HAVING count(*) > 1
+              ) q;
+            """
+        )
+        if duplicates:
+            raise RuntimeError(
+                f"У сигналов {duplicates} есть по две оценки на один горизонт. "
+                "Схема оценок не может быть приведена к виду Этапа 8.1, пока эти "
+                "строки не разобраны вручную: удалять данные об оценках "
+                "автоматически нельзя."
+            )
+        await self.pool.execute(
+            "ALTER TABLE signal_evaluations DROP CONSTRAINT IF EXISTS "
+            "signal_evaluations_signal_id_horizon_key;"
+        )
+        # Прежний первичный ключ — суррогатный id. Заменяем на (signal_id,
+        # horizon_h) только если текущий ключ не является нужным.
+        await self.pool.execute(
+            """
+            DO $$
+            DECLARE current_pk TEXT;
+            BEGIN
+                SELECT conname INTO current_pk FROM pg_constraint
+                 WHERE conrelid = 'signal_evaluations'::regclass AND contype = 'p';
+                IF current_pk IS NULL THEN
+                    ALTER TABLE signal_evaluations
+                        ADD PRIMARY KEY (signal_id, horizon_h);
+                ELSIF (
+                    SELECT count(*) FROM pg_constraint c
+                    JOIN unnest(c.conkey) k ON TRUE
+                    JOIN pg_attribute a
+                      ON a.attrelid = c.conrelid AND a.attnum = k
+                    WHERE c.conname = current_pk
+                      AND a.attname IN ('signal_id', 'horizon_h')
+                ) <> 2 THEN
+                    EXECUTE format(
+                        'ALTER TABLE signal_evaluations DROP CONSTRAINT %I', current_pk
+                    );
+                    ALTER TABLE signal_evaluations
+                        ADD PRIMARY KEY (signal_id, horizon_h);
+                END IF;
+            END $$;
+            """
+        )
+        await self.pool.execute(
+            "CREATE INDEX IF NOT EXISTS ix_eval_horizon "
+            "ON signal_evaluations (horizon_h, evaluated_at);"
+        )
+
+    async def ensure_logic_version_schema(self) -> None:
+        """Идемпотентно создаёт таблицу границ версии логики (§6 ТЗ 8.1)."""
+        await self.pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS logic_version_windows (
+                logic_version SMALLINT    PRIMARY KEY,
+                started_at    TIMESTAMPTZ NOT NULL,
+                note          TEXT
             );
             """
         )
 
+    async def record_logic_version_start(
+        self, logic_version: int, note: str | None = None
+    ) -> datetime:
+        """Фиксирует момент начала версии логики и возвращает его.
+
+        Запись делается ОДИН РАЗ: повторный старт сервиса границу не сдвигает
+        (``ON CONFLICT DO NOTHING``), иначе после каждого перезапуска «начало
+        версии» уезжало бы вперёд и данные до перезапуска выпадали бы из окна.
+        Точность — минута: этого требует §6 ТЗ 8.1.
+        """
+        await self.ensure_logic_version_schema()
+        await self.pool.execute(
+            """
+            INSERT INTO logic_version_windows (logic_version, started_at, note)
+            VALUES ($1, date_trunc('minute', now()), $2)
+            ON CONFLICT (logic_version) DO NOTHING;
+            """,
+            int(logic_version), note,
+        )
+        return await self.pool.fetchval(
+            "SELECT started_at FROM logic_version_windows WHERE logic_version = $1;",
+            int(logic_version),
+        )
+
+    async def get_logic_version_start(self, logic_version: int) -> datetime | None:
+        """Момент начала версии логики или None, если он не зафиксирован."""
+        return await self.pool.fetchval(
+            "SELECT started_at FROM logic_version_windows WHERE logic_version = $1;",
+            int(logic_version),
+        )
+
     async def get_signals_to_evaluate(
         self,
-        horizon: str,
-        horizon_sec: float,
+        horizon_h: int,
+        since: datetime | None = None,
     ) -> list[dict[str, Any]]:
-        """Направленные сигналы, у которых прошёл горизонт и нет оценки по нему."""
+        """Направленные сигналы, у которых прошёл горизонт и нет оценки по нему.
+
+        ``since`` (Этап 8.1 §5) отсекает сигналы, выданные ДО перехода на
+        текущую версию логики: досчитывать им новые горизонты задним числом
+        запрещено — этих горизонтов не существовало в момент оценки.
+        """
         query = """
             SELECT s.id, s.instrument_id, s.ts, s.decision
             FROM signals s
             WHERE s.decision <> 'wait'
-              AND (now() - s.ts) >= make_interval(secs => $2)
+              AND (now() - s.ts) >= make_interval(hours => $1)
+              AND ($2::timestamptz IS NULL OR s.ts >= $2)
               AND NOT EXISTS (
                   SELECT 1 FROM signal_evaluations e
-                  WHERE e.signal_id = s.id AND e.horizon = $1
+                  WHERE e.signal_id = s.id AND e.horizon_h = $1
               )
             ORDER BY s.ts ASC;
         """
-        rows = await self.pool.fetch(query, horizon, float(horizon_sec))
+        rows = await self.pool.fetch(query, int(horizon_h), since)
         return [dict(r) for r in rows]
 
     async def get_ohlcv_window(
@@ -904,25 +1058,31 @@ class DB:
     async def save_evaluation(
         self,
         signal_id: int,
-        horizon: str,
+        horizon_h: int,
         price_at_signal: float,
         price_at_close: float,
         pnl_pct: float,
         drawdown_pct: float,
         success: bool,
     ) -> None:
-        """INSERT оценки (идемпотентно по UNIQUE (signal_id, horizon))."""
+        """INSERT оценки (идемпотентно по ключу (signal_id, horizon_h)).
+
+        Текстовая колонка ``horizon`` заполняется подписью того же горизонта
+        (``4`` → ``4h``): её читают выгрузка, бот и суточная сводка, и ломать их
+        ради переименования незачем.
+        """
         query = """
             INSERT INTO signal_evaluations
-                (signal_id, horizon, price_at_signal, price_at_close,
+                (signal_id, horizon, horizon_h, price_at_signal, price_at_close,
                  pnl_pct, drawdown_pct, success)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            ON CONFLICT (signal_id, horizon) DO NOTHING;
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            ON CONFLICT (signal_id, horizon_h) DO NOTHING;
         """
         await self.pool.execute(
             query,
             signal_id,
-            horizon,
+            horizon_label(int(horizon_h)),
+            int(horizon_h),
             float(price_at_signal),
             float(price_at_close),
             float(pnl_pct),
@@ -951,14 +1111,14 @@ class DB:
         """Статистика по decision×horizon: доля success и средний pnl_pct."""
         query = """
             SELECT s.decision,
-                   e.horizon,
+                   e.horizon_h AS horizon,
                    count(*) AS n,
                    avg(CASE WHEN e.success THEN 1.0 ELSE 0.0 END) AS success_rate,
                    avg(e.pnl_pct) AS avg_pnl_pct
             FROM signal_evaluations e
             JOIN signals s ON s.id = e.signal_id
-            GROUP BY s.decision, e.horizon
-            ORDER BY s.decision, e.horizon;
+            GROUP BY s.decision, e.horizon_h
+            ORDER BY s.decision, e.horizon_h;
         """
         rows = await self.pool.fetch(query)
         return [dict(r) for r in rows]

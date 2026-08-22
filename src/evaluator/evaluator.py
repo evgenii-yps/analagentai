@@ -1,8 +1,19 @@
 """Оценщик результатов сигналов: дооценка фактом движения цены.
 
-Для каждого сигнала и горизонта (1ч/4ч) считаем, пошла ли цена в предсказанную
+Для каждого сигнала и КАЖДОГО горизонта считаем, пошла ли цена в предсказанную
 сторону (pnl_pct), какова была макс. просадка против сигнала (drawdown_pct) и
 успех (pnl_pct > 0). Расчёт детерминирован и вынесен в чистые функции.
+
+ЭТАП 8.1 §5. Горизонтов теперь четыре: 1, 4, 12 и 24 часа, и каждый считается
+НЕЗАВИСИМО. Сигнал при этом остаётся ОДИН: горизонт не влияет ни на выводы
+агентов (Market считает по часовым свечам вне зависимости от горизонта), ни на
+решение — только на оценку исхода.
+
+ДОСЧЁТ ГОРИЗОНТОВ ЗАДНИМ ЧИСЛОМ ЗАПРЕЩЁН (§12 ТЗ 8.1). Сигналам, выданным до
+перехода на текущую версию логики, новые горизонты не считаются: этих
+горизонтов не существовало в момент их оценки, и появление таких строк
+означало бы, что система «знала» то, чего не знала. Граница берётся из
+``logic_version_windows`` (§6) — момент первого старта на текущей версии.
 """
 
 from __future__ import annotations
@@ -23,14 +34,23 @@ _HEARTBEAT_TTL = 300
 _WINDOW_TOLERANCE_SEC = 120
 
 
-def horizon_to_seconds(horizon: str) -> int:
-    """Переводит горизонт вида ``1h``/``30m``/``90s`` в секунды."""
-    horizon = horizon.strip().lower()
+def horizon_to_seconds(horizon: str | int) -> int:
+    """Переводит горизонт в секунды: ``4`` (часы), ``1h``, ``30m``, ``90s``.
+
+    Поведение для строк не изменено Этапом 8.1 (``1d`` по-прежнему ошибка):
+    функция осталась ради совместимости, а сам оценщик работает с горизонтами
+    в целых часах и вызывает её только для перевода.
+    """
+    if isinstance(horizon, int):
+        return horizon * 3600
+    text = horizon.strip().lower()
+    if text.isdigit():          # «4» — это часы (формат Этапа 8.1)
+        return int(text) * 3600
     units = {"h": 3600, "m": 60, "s": 1}
-    unit = horizon[-1]
-    if unit not in units:
+    unit = text[-1:]
+    if unit not in units or not text[:-1].isdigit():
         raise ValueError(f"Неизвестный горизонт: {horizon}")
-    return int(horizon[:-1]) * units[unit]
+    return int(text[:-1]) * units[unit]
 
 
 def compute_evaluation(
@@ -76,32 +96,43 @@ class Evaluator:
     def __init__(
         self,
         interval: float,
-        horizons: list[str],
-        primary_horizon: str,
+        horizons: list[int],
+        primary_horizon: int,
         stats_log_interval: float,
+        evaluate_from: datetime | None = None,
     ) -> None:
         self.interval = interval
-        self.horizons = horizons
-        self.primary_horizon = primary_horizon
+        # Горизонты — целые часы, по возрастанию (§5 ТЗ 8.1).
+        self.horizons = sorted({int(h) for h in horizons})
+        self.primary_horizon = int(primary_horizon)
         self.stats_log_interval = stats_log_interval
+        # Граница версии логики: сигналы старше неё не дооцениваются вовсе.
+        self.evaluate_from = evaluate_from
         self._last_stats_ts: datetime | None = None
         self._log = structlog.get_logger().bind(component="evaluator")
 
     async def evaluate_once(self) -> None:
-        """Один прогон оценки по всем горизонтам."""
-        for horizon in self.horizons:
-            horizon_sec = horizon_to_seconds(horizon)
-            signals = await db.get_signals_to_evaluate(horizon, horizon_sec)
+        """Один прогон оценки: каждый горизонт считается НЕЗАВИСИМО."""
+        for horizon_h in self.horizons:
+            signals = await db.get_signals_to_evaluate(
+                horizon_h, since=self.evaluate_from
+            )
             for signal in signals:
-                await self._evaluate_signal(signal, horizon, horizon_sec)
+                await self._evaluate_signal(signal, horizon_h, horizon_h * 3600)
 
     async def _evaluate_signal(
         self,
         signal: dict[str, Any],
-        horizon: str,
+        horizon_h: int,
         horizon_sec: int,
     ) -> None:
-        """Оценивает один сигнал по одному горизонту (мягко пропускает при нехватке)."""
+        """Оценивает один сигнал по ОДНОМУ горизонту (мягко пропускает при нехватке).
+
+        Пропуск (нет цены, нет свечей окна, окно неполно) — не ошибка: сигнал
+        будет оценён следующим прогоном, когда данные догрузятся. Именно
+        поэтому горизонты независимы: 24-часовой ждёт своих данных, не мешая
+        часовому.
+        """
         instrument_id = signal["instrument_id"]
         signal_ts = signal["ts"]
         decision = signal["decision"]
@@ -121,15 +152,16 @@ class Evaluator:
         result = compute_evaluation(decision, float(price_at_signal), window)
         await db.save_evaluation(
             signal["id"],
-            horizon,
+            horizon_h,
             float(price_at_signal),
             result["price_at_close"],
             result["pnl_pct"],
             result["drawdown_pct"],
             result["success"],
         )
-        # Главный горизонт → сводка в signals и закрытие сигнала.
-        if horizon == self.primary_horizon:
+        # Главный горизонт → сводка в signals и закрытие сигнала. Остальные
+        # горизонты статус сигнала не трогают: сигнал один, закрытие одно.
+        if horizon_h == self.primary_horizon:
             await db.finalize_signal(
                 signal["id"],
                 result["pnl_pct"],
@@ -139,7 +171,7 @@ class Evaluator:
         self._log.info(
             "Сигнал оценён",
             signal_id=signal["id"],
-            horizon=horizon,
+            horizon_h=horizon_h,
             decision=decision,
             pnl_pct=result["pnl_pct"],
             success=result["success"],
@@ -166,7 +198,12 @@ class Evaluator:
 
     async def run(self) -> None:
         """Бесконечный цикл: оценка → статистика → heartbeat → пауза. Не падает."""
-        self._log.info("Оценщик запущен", interval=self.interval, horizons=self.horizons)
+        self._log.info(
+            "Оценщик запущен", interval=self.interval, horizons_h=self.horizons,
+            primary_h=self.primary_horizon,
+            evaluate_from=None if self.evaluate_from is None
+            else self.evaluate_from.isoformat(timespec="minutes"),
+        )
         while True:
             try:
                 await self.evaluate_once()

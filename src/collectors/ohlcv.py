@@ -21,8 +21,9 @@ class OHLCVCollector(BaseCollector):
         symbol: str,
         timeframes: list[str],
         interval: float,
+        name_suffix: str = "",
     ) -> None:
-        super().__init__(name="ohlcv", interval=interval)
+        super().__init__(name="ohlcv", interval=interval, name_suffix=name_suffix)
         self.exchange = exchange
         self.instrument_id = instrument_id
         self.symbol = symbol

@@ -78,9 +78,18 @@ def _env_file() -> dict[str, str]:
 ENV = _env_file()
 PG_USER = os.environ.get("POSTGRES_USER", ENV.get("POSTGRES_USER", "agenttrade"))
 PG_DB = os.environ.get("POSTGRES_DB", ENV.get("POSTGRES_DB", "agenttrade"))
-PRIMARY_HORIZON = os.environ.get(
-    "EVAL_PRIMARY_HORIZON", ENV.get("EVAL_PRIMARY_HORIZON", "4h")
-)
+# Главный горизонт: в .env он может стоять как «4h» (до Этапа 8.1) или как «4»
+# (после). Сводка приводит его к подписи «4h», под которой лежит текстовая
+# колонка horizon в таблице оценок.
+def _primary_horizon() -> str:
+    raw = os.environ.get(
+        "EVAL_PRIMARY_HORIZON", ENV.get("EVAL_PRIMARY_HORIZON", "4h")
+    ) or "4h"
+    head = raw.split("#", 1)[0].strip()
+    return head if head.endswith("h") else f"{head}h"
+
+
+PRIMARY_HORIZON = _primary_horizon()
 # Порог индекса согласия для счётчика «кандидатов» — из .env, не зашивается.
 NOTIFY_MIN_PROBABILITY = os.environ.get(
     "NOTIFY_MIN_PROBABILITY", ENV.get("NOTIFY_MIN_PROBABILITY", "0.7")

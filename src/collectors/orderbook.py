@@ -18,8 +18,9 @@ class OrderBookCollector(BaseCollector):
         symbol: str,
         depth: int,
         interval: float,
+        name_suffix: str = "",
     ) -> None:
-        super().__init__(name="orderbook", interval=interval)
+        super().__init__(name="orderbook", interval=interval, name_suffix=name_suffix)
         self.exchange = exchange
         self.instrument_id = instrument_id
         self.symbol = symbol
