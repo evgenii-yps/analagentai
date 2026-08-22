@@ -150,7 +150,9 @@ echo
 echo "=== 5. Версия логики и граница данных (§6) ==="
 lv_env="$(env_value LOGIC_VERSION "")"
 lv_db="$(psql_q "SELECT max(logic_version) FROM signals;")"
-boundary="$(psql_q "SELECT to_char(started_at,'YYYY-MM-DD HH24:MI') FROM logic_version_windows WHERE logic_version = ${lv_env:-5};")"
+# Формат с 'T' вместо пробела: psql_q сжимает пробелы, и «2026-08-21 06:30»
+# превратилось бы в «2026-08-2106:30».
+boundary="$(psql_q "SELECT to_char(started_at,'YYYY-MM-DD\"T\"HH24:MI') FROM logic_version_windows WHERE logic_version = ${lv_env:-5};")"
 [ "$lv_env" = "5" ] && ok "LOGIC_VERSION=5 в .env" \
   || block "LOGIC_VERSION=${lv_env:-не задан}, ожидается 5 (§6)"
 [ "${lv_db:-0}" = "${lv_env:-5}" ] && ok "сигналы пишутся с logic_version=${lv_db}" \
