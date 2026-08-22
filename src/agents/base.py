@@ -93,11 +93,21 @@ class BaseAgent(abc.ABC):
     и не обращается к выводам других агентов — независимость заложена в коде.
     """
 
-    def __init__(self, name: str, interval: float, instrument_id: int) -> None:
+    def __init__(
+        self, name: str, interval: float, instrument_id: int, name_suffix: str = ""
+    ) -> None:
+        # ``name`` — плоское имя агента («market», «liquidity», «futures»). Оно
+        # попадает в колонку agent_outputs.agent, по нему Decision Agent ищет
+        # выводы и по нему же настроены веса. Токен сюда НЕ дописывается: пять
+        # токенов различаются instrument_id, а не именем агента.
         self.name = name
+        self.token = name_suffix
+        # Ключ для Redis (heartbeat, серия сбоев): здесь токен нужен, иначе
+        # сбои одного токена засчитывались бы другому.
+        self.key = f"{name}:{name_suffix}" if name_suffix else name
         self.interval = interval
         self.instrument_id = instrument_id
-        self._log = structlog.get_logger().bind(agent=name)
+        self._log = structlog.get_logger().bind(agent=name, token=name_suffix or None)
         # Серия сбоев подряд В ПАМЯТИ процесса (Этап 7.2). Отдельно от счётчика в
         # Redis (тот — для алерта): самовосстановление НЕ должно зависеть от Redis,
         # ведь испорченным может быть как раз внешнее состояние.
@@ -238,7 +248,8 @@ class BaseAgent(abc.ABC):
                 self.name,
                 FAILURE_AUTO_RESET,
                 None,
-                f"Автосброс после {streak} сбоев подряд (переоткрыты пул БД и Redis).",
+                f"[{self.key}] Автосброс после {streak} сбоев подряд "
+                f"(переоткрыты пул БД и Redis).",
             )
         except Exception as exc:  # noqa: BLE001
             self._log.warning("Не удалось записать авто-сброс в БД", error=str(exc))
@@ -272,7 +283,12 @@ class BaseAgent(abc.ABC):
         # Строка в БД — для подсчёта за период (суточная сводка). Для db_write
         # сам INSERT может не пройти (БД недоступна) — не падаем из-за этого.
         try:
-            await db.record_agent_failure(self.name, error_type, exc_type, detail)
+            # Токен пишется в detail, а не в колонку agent: схема таблицы не
+            # меняется, а различить пять экземпляров одного агента нужно.
+            await db.record_agent_failure(
+                self.name, error_type, exc_type,
+                detail if not self.token else f"[{self.key}]\n{detail}",
+            )
         except Exception as rec_exc:  # noqa: BLE001
             self._log.warning("Не удалось записать сбой в БД", error=str(rec_exc))
 
@@ -284,7 +300,7 @@ class BaseAgent(abc.ABC):
 
     async def _bump_failure_streak(self) -> None:
         """Инкремент серии сбоев; при кратности порогу — алерт в Telegram."""
-        key = f"agent:failures:streak:{self.name}"
+        key = f"agent:failures:streak:{self.key}"
         streak = await get_redis().incr(key)
         # TTL, чтобы «висящий» счётчик сам протух, если агент замолчал совсем.
         await get_redis().expire(key, _HEARTBEAT_TTL)
@@ -295,7 +311,7 @@ class BaseAgent(abc.ABC):
     async def _alert_failures(self, streak: int) -> None:
         """Шлёт алерт о серии сбоев. Не бросает (send_message сам гасит ошибки)."""
         text = (
-            f"⚠️ <b>Агент {self.name}</b>: {streak} сбоев подряд — "
+            f"⚠️ <b>Агент {self.key}</b>: {streak} сбоев подряд — "
             f"выводы не записываются. Проверьте логи сервиса agents."
         )
         await send_message(text)
@@ -306,14 +322,21 @@ class BaseAgent(abc.ABC):
         self._consecutive_failures = 0
         # В Redis — для алерта о серии сбоев.
         try:
-            await get_redis().delete(f"agent:failures:streak:{self.name}")
+            await get_redis().delete(f"agent:failures:streak:{self.key}")
         except Exception as exc:  # noqa: BLE001
             self._log.warning("Не удалось сбросить счётчик сбоев", error=str(exc))
 
     async def _heartbeat(self) -> None:
         """Пишет в Redis отметку времени последнего успешного анализа."""
         now_iso = datetime.now(UTC).isoformat()
-        await get_redis().set(
+        # Общий ключ читают вотчдог/бот/сводка — его обновляет любой токен;
+        # ключ с токеном (ниже) показывает, какой именно экземпляр отстал.
+        redis = get_redis()
+        if self.token:
+            await redis.set(
+                f"agent:heartbeat:{self.key}", now_iso, ex=_HEARTBEAT_TTL
+            )
+        await redis.set(
             f"agent:heartbeat:{self.name}",
             now_iso,
             ex=_HEARTBEAT_TTL,

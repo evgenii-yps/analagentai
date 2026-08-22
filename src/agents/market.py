@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import math
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pandas as pd
@@ -24,6 +25,7 @@ from src.agents.base import (
     BaseAgent,
     normalize_confidence,
 )
+from src.core.config import settings
 from src.core.db import db
 
 # Характеристический масштаб уверенности (Задача A). У Market Agent сырая
@@ -294,6 +296,54 @@ def analyze_ohlcv(
     return signal, confidence, metrics, rationale
 
 
+# Длительность таймфрейма в секундах — для отсечения незавершённого бара.
+_TIMEFRAME_SECONDS: dict[str, int] = {
+    "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
+    "1h": 3600, "2h": 7200, "4h": 14400, "6h": 21600, "12h": 43200, "1d": 86400,
+}
+
+
+def timeframe_seconds(timeframe: str) -> int | None:
+    """Длительность бара в секундах или None, если таймфрейм незнаком.
+
+    Незнакомый таймфрейм НЕ повод угадывать длительность: отсечение просто не
+    выполняется, и это видно в логе. Молча «прикинуть» час означало бы выкинуть
+    настоящие данные.
+    """
+    return _TIMEFRAME_SECONDS.get(timeframe.strip().lower())
+
+
+def drop_unclosed_bar(
+    df: pd.DataFrame, timeframe: str, now: datetime
+) -> pd.DataFrame:
+    """Убирает из выборки ПОСЛЕДНИЙ бар, если он ещё не закрылся (§8 ТЗ 8.1).
+
+    Бар с меткой ``ts`` закрыт, когда ``ts + длительность <= now``. Коллектор
+    сохраняет незавершённый бар и пересчитывает его на ходу (замер 22.08.2026:
+    за 90 секунд объём 53.86 → 55.19, close 77179.2 → 77158.7 при той же метке
+    17:00), поэтому в 17:01 Market видел бы бар из одной минуты торгов, а в
+    17:59 — из пятидесяти девяти.
+
+    Функция вызывается ТОЛЬКО при ``MARKET_CLOSED_BARS_ONLY=true``. При
+    значении по умолчанию (false) поведение системы не меняется ни в чём.
+    """
+    if df.empty or "ts" not in df.columns:
+        return df
+    seconds = timeframe_seconds(timeframe)
+    if seconds is None:
+        return df
+    last_ts = df["ts"].iloc[-1]
+    if not isinstance(last_ts, datetime):
+        return df
+    if last_ts.tzinfo is None:
+        last_ts = last_ts.replace(tzinfo=UTC)
+    # Закрыт ровно в момент закрытия: бар 17:00 при часовом таймфрейме закрыт
+    # в 18:00:00, а не в 18:00:01.
+    if last_ts + timedelta(seconds=seconds) <= now:
+        return df
+    return df.iloc[:-1]
+
+
 class MarketAgent(BaseAgent):
     """Агент технического анализа по свечам OHLCV."""
 
@@ -303,10 +353,18 @@ class MarketAgent(BaseAgent):
         timeframe: str,
         min_candles: int,
         interval: float,
+        name_suffix: str = "",
+        closed_bars_only: bool | None = None,
     ) -> None:
-        super().__init__(name="market", interval=interval, instrument_id=instrument_id)
+        super().__init__(name="market", interval=interval, instrument_id=instrument_id,
+                         name_suffix=name_suffix)
         self.timeframe = timeframe
         self.min_candles = min_candles
+        # None — берём значение из конфигурации (по умолчанию false).
+        self.closed_bars_only = (
+            settings.MARKET_CLOSED_BARS_ONLY if closed_bars_only is None
+            else bool(closed_bars_only)
+        )
 
     async def analyze(self, instrument_id: int) -> AgentOutput:
         """Читает свечи и формирует заключение по техническому анализу.
@@ -324,8 +382,21 @@ class MarketAgent(BaseAgent):
         await self._note_read(is_empty=(len(rows) == 0))
         df = pd.DataFrame([dict(r) for r in rows])
 
+        # §8 ТЗ 8.1: незавершённый бар. По умолчанию (false) окно остаётся
+        # ровно тем же, что и до Этапа 8.1, — включая недосчитанный последний
+        # бар. Переключатель введён, чтобы эффект можно было измерить, а не
+        # чтобы применить его сейчас.
+        bars_dropped = 0
+        if self.closed_bars_only:
+            before = len(df)
+            df = drop_unclosed_bar(df, self.timeframe, datetime.now(UTC))
+            bars_dropped = before - len(df)
+
         signal, confidence, metrics, rationale = analyze_ohlcv(df, self.min_candles)
         metrics["timeframe"] = self.timeframe
+        metrics["closed_bars_only"] = bool(self.closed_bars_only)
+        if bars_dropped:
+            metrics["unclosed_bar_dropped"] = bars_dropped
         return AgentOutput(
             agent=self.name,
             instrument_id=instrument_id,

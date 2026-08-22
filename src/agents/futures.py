@@ -220,9 +220,13 @@ def analyze_futures(
 class FuturesAgent(BaseAgent):
     """Агент анализа деривативов (funding + open interest)."""
 
-    def __init__(self, instrument_id: int, timeframe: str, interval: float) -> None:
+    def __init__(
+        self, instrument_id: int, timeframe: str, interval: float,
+        name_suffix: str = "",
+    ) -> None:
         super().__init__(
-            name="futures", interval=interval, instrument_id=instrument_id
+            name="futures", interval=interval, instrument_id=instrument_id,
+            name_suffix=name_suffix,
         )
         self.timeframe = timeframe
 

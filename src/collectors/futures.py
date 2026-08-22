@@ -21,8 +21,9 @@ class FuturesCollector(BaseCollector):
         instrument_id: int,
         swap_symbol: str,
         interval: float,
+        name_suffix: str = "",
     ) -> None:
-        super().__init__(name="futures", interval=interval)
+        super().__init__(name="futures", interval=interval, name_suffix=name_suffix)
         self.exchange = exchange
         self.instrument_id = instrument_id
         self.swap_symbol = swap_symbol

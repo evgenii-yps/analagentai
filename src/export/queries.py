@@ -122,15 +122,106 @@ async def fetch_unexported_for_sheets(
 
 
 async def fetch_independent_windows(conn: asyncpg.Connection) -> list[dict[str, Any]]:
-    """По одному (самому раннему) закрытому сигналу на каждое 4-часовое окно."""
+    """По одному (самому раннему) закрытому сигналу на каждое 4-часовое окно.
+
+    Оставлено ради совместимости прежнего листа. Этап 8.1 §7 требует разбиения
+    по КАЖДОМУ ТОКЕНУ и КАЖДОМУ ГОРИЗОНТУ — см. :func:`fetch_independent_by_token_horizon`.
+    """
     query = f"""
-        SELECT DISTINCT ON (win) {_SIGNAL_COLUMNS},
+        SELECT DISTINCT ON (i.id, win) {_SIGNAL_COLUMNS},
                {_WINDOW_EXPR} AS win
         {_SIGNAL_JOINS}
         WHERE s.status = 'closed'
-        ORDER BY win, s.ts ASC;
+        ORDER BY i.id, win, s.ts ASC;
     """
     rows = await conn.fetch(query)
+    return [dict(r) for r in rows]
+
+
+async def fetch_independent_by_token_horizon(
+    conn: asyncpg.Connection,
+    horizons_h: list[int],
+) -> list[dict[str, Any]]:
+    """Независимые наблюдения ПО ТОКЕНУ И ПО ГОРИЗОНТУ (§7 ТЗ 8.1).
+
+    Окно равно длине горизонта, границы кратны ему от эпохи; из окна берётся
+    ПЕРВЫЙ по времени сигнал. Прореживание считается отдельно для каждого
+    (токен, горизонт): решения выдаются раз в минуту, и без прореживания
+    соседние наблюдения описывали бы почти один отрезок рынка.
+
+    Ключ прореживания включает инструмент. Без него пять токенов делили бы одно
+    окно и от каждого окна оставался бы один сигнал — четыре пятых наблюдений
+    исчезли бы молча.
+    """
+    if not horizons_h:
+        return []
+    query = f"""
+        SELECT DISTINCT ON (e.horizon_h, i.id, win)
+               {_SIGNAL_COLUMNS},
+               e.horizon_h        AS horizon_h,
+               e.price_at_signal  AS h_price_at_signal,
+               e.price_at_close   AS h_price_at_close,
+               e.pnl_pct          AS h_pnl_pct,
+               e.drawdown_pct     AS h_drawdown_pct,
+               e.success          AS h_success,
+               to_timestamp(
+                   floor(extract(epoch FROM s.ts) / (e.horizon_h * 3600))
+                   * (e.horizon_h * 3600)
+               ) AS win
+        {_SIGNAL_JOINS}
+        JOIN signal_evaluations e ON e.signal_id = s.id
+        WHERE s.decision <> 'wait'
+          AND e.horizon_h = ANY($1::int[])
+        ORDER BY e.horizon_h, i.id, win, s.ts ASC;
+    """
+    rows = await conn.fetch(query, [int(h) for h in horizons_h])
+    return [dict(r) for r in rows]
+
+
+async def fetch_outcome_correlation(
+    conn: asyncpg.Connection,
+    horizons_h: list[int],
+) -> list[dict[str, Any]]:
+    """Корреляция исходов между токенами по каждому горизонту (§7 ТЗ 8.1).
+
+    Считается по НЕЗАВИСИМЫМ наблюдениям (одно на окно и токен) на совпадающих
+    окнах: корреляция попаданий (success как 1/0) для каждой пары токенов.
+    Именно эта величина показывает, почему пять токенов не дают пятикратного
+    роста статистической мощности.
+    """
+    if not horizons_h:
+        return []
+    query = """
+        WITH indep AS (
+            SELECT DISTINCT ON (e.horizon_h, s.instrument_id, win)
+                   e.horizon_h,
+                   s.instrument_id,
+                   i.base AS token,
+                   to_timestamp(
+                       floor(extract(epoch FROM s.ts) / (e.horizon_h * 3600))
+                       * (e.horizon_h * 3600)
+                   ) AS win,
+                   e.success
+            FROM signals s
+            JOIN instruments i ON i.id = s.instrument_id
+            JOIN signal_evaluations e ON e.signal_id = s.id
+            WHERE s.decision <> 'wait'
+              AND e.horizon_h = ANY($1::int[])
+            ORDER BY e.horizon_h, s.instrument_id, win, s.ts ASC
+        )
+        SELECT a.horizon_h,
+               a.token AS token_a,
+               b.token AS token_b,
+               count(*) AS n,
+               corr(CASE WHEN a.success THEN 1.0 ELSE 0.0 END,
+                    CASE WHEN b.success THEN 1.0 ELSE 0.0 END) AS r
+        FROM indep a
+        JOIN indep b
+          ON b.horizon_h = a.horizon_h AND b.win = a.win AND a.token < b.token
+        GROUP BY a.horizon_h, a.token, b.token
+        ORDER BY a.horizon_h, a.token, b.token;
+    """
+    rows = await conn.fetch(query, [int(h) for h in horizons_h])
     return [dict(r) for r in rows]
 
 

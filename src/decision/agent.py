@@ -198,9 +198,13 @@ class DecisionAgent:
         threshold: float,
         min_agents: int,
         freshness_sec: float,
+        token: str = "",
     ) -> None:
         # instrument_id — основной инструмент, под которым пишется сигнал.
         self.instrument_id = instrument_id
+        # Токен пары (Этап 8.1): различает пять одновременно работающих
+        # экземпляров в логах и в heartbeat-ключе.
+        self.token = token
         # У каждого агента может быть свой инструмент (spot/swap).
         self.agent_instruments = agent_instruments
         self.interval = interval
@@ -208,7 +212,9 @@ class DecisionAgent:
         self.threshold = threshold
         self.min_agents = min_agents
         self.freshness_sec = freshness_sec
-        self._log = structlog.get_logger().bind(agent="decision")
+        self._log = structlog.get_logger().bind(
+            agent="decision", token=token or None
+        )
 
     async def decide_once(self) -> None:
         """Читает последние выводы агентов, агрегирует и сохраняет решение."""
@@ -325,6 +331,16 @@ class DecisionAgent:
             await asyncio.sleep(self.interval)
 
     async def _heartbeat(self) -> None:
-        """Пишет в Redis отметку времени последнего успешного решения."""
+        """Отметка времени последнего успешного решения — двумя ключами.
+
+        Общий ключ ``decision:heartbeat`` читают вотчдог, бот и суточная сводка;
+        его обновляет любой токен. Ключ с токеном добавлен Этапом 8.1, чтобы
+        было видно, какой именно экземпляр отстал.
+        """
         now_iso = datetime.now(UTC).isoformat()
-        await get_redis().set("decision:heartbeat", now_iso, ex=_HEARTBEAT_TTL)
+        redis = get_redis()
+        await redis.set("decision:heartbeat", now_iso, ex=_HEARTBEAT_TTL)
+        if self.token:
+            await redis.set(
+                f"decision:heartbeat:{self.token}", now_iso, ex=_HEARTBEAT_TTL
+            )

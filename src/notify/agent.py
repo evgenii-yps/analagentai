@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -329,7 +329,29 @@ class NotifyAgent:
         self.symbol = symbol
         self.tz_name = tz_name
         self.fmt_cfg = SignalFormatConfig(symbol, tz_name, primary_horizon)
+        # Кэш «идентификатор инструмента → символ» (Этап 8.1). Токенов пять, и
+        # сообщение обязано называть ТОТ инструмент, по которому выдан сигнал:
+        # с одной подписью из настройки SYMBOL все пять уведомлений выглядели бы
+        # сигналами по биткоину. Символы инструментов не меняются, поэтому кэш
+        # без срока жизни: один запрос к БД на инструмент за всё время работы.
+        self._symbols: dict[int, str] = {}
         self._log = structlog.get_logger().bind(component="notify")
+
+    async def _format_config(self, instrument_id: int) -> SignalFormatConfig:
+        """Параметры форматирования для конкретного инструмента."""
+        symbol = self._symbols.get(instrument_id)
+        if symbol is None:
+            symbol = await db.get_instrument_symbol(instrument_id)
+            if symbol is None:
+                # Инструмента нет в справочнике — берём подпись из настройки и
+                # говорим об этом в логе, но уведомление не теряем.
+                self._log.warning(
+                    "Символ инструмента не найден, подпись из настройки",
+                    instrument_id=instrument_id, symbol=self.fmt_cfg.symbol,
+                )
+                return self.fmt_cfg
+            self._symbols[instrument_id] = symbol
+        return replace(self.fmt_cfg, symbol=symbol)
 
     async def process_once(self) -> None:
         """Обрабатывает все неотправленные сильные сигналы."""
@@ -377,7 +399,8 @@ class NotifyAgent:
         # Цена на момент сигнала — переиспользуем готовый get_price_at (ТЗ §6).
         # Чтение цены не влияет на условия отправки; при отсутствии — None.
         price = await db.get_price_at(instrument_id, signal["ts"])
-        sent = await send_message(format_signal_message(signal, price, self.fmt_cfg))
+        fmt_cfg = await self._format_config(instrument_id)
+        sent = await send_message(format_signal_message(signal, price, fmt_cfg))
         if sent:
             await db.mark_signal_notified(signal["id"])
             await self._set_last_state(instrument_id, signal["decision"], now)
