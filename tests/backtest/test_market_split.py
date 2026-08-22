@@ -386,3 +386,95 @@ async def test_parity_skips_futures_when_it_is_not_in_agents(bt_db, pool, monkey
     assert set(result.agents) == {"market"}
     assert result.agents["market"].compared == 5
     assert result.blocking_ok is True
+
+
+# --- Граница периода при загруженных «свежих» свечах ------------------------
+#
+# Загрузчик догружает ряд пары сверки ДО ТЕКУЩЕГО МОМЕНТА (иначе сверку §13.2
+# не с чем выполнять: её моменты лежат в живом окне, позже BT_PERIOD_TO).
+# Значит, в таблице заведомо есть свечи позже границы периода. Проверки ниже
+# требуют, чтобы за границу не «протекли» ни решения, ни исходы: иначе защита
+# §5.3 ТЗ (конец периода отодвинут назад намеренно) исчезает молча.
+
+
+def test_decision_times_never_leave_the_period() -> None:
+    """Моменты решения ограничены [BT_PERIOD_FROM, BT_PERIOD_TO] по построению."""
+    from backtest.clock import decision_times
+
+    cfg = make_config()
+    moments = decision_times(cfg)
+    assert moments, "моментов решения не оказалось вовсе"
+    assert min(moments) >= cfg.period_from
+    assert max(moments) <= cfg.period_to
+
+
+@requires_db
+async def test_replay_and_outcomes_stop_at_period_to(bt_db, pool) -> None:
+    """Свечи ЗА границей загружены, но ни решений, ни исходов за ней не появилось."""
+    from backtest import evaluate, replay
+
+    # Конфигурация с двумя агентами: при продакшновом MIN_AGENTS=2 один Market
+    # не набирает кворума и все решения были бы wait, а тогда исходов не будет
+    # вовсе и проверка стала бы холостой.
+    cfg = make_config(agents=("market", "futures"))
+    # Ряд заведомо длиннее периода прогона: как после догрузки для сверки.
+    await seed_candles(pool, inst_id=SPOT, hours=24 * 45)
+    await seed_funding(pool, inst_id=SWAP, points=140)
+    beyond = await pool.fetchval(
+        "SELECT count(*) FROM backtest.candles WHERE inst_id=$1 AND close_time > $2;",
+        SPOT, cfg.period_to,
+    )
+    assert beyond > max(cfg.horizons), "тест бессмыслен: свечей за границей нет"
+
+    run_id = await replay.start_run(
+        cfg, ["market", "futures"], {"описание": "тест границы"}
+    )
+    await replay.replay_instrument(run_id, PAIR, cfg, ["market", "futures"])
+    written = await evaluate.evaluate_run(run_id, cfg)
+    assert written > 0, "исходов не оказалось вовсе — проверка была бы холостой"
+
+    last_decision = await pool.fetchval(
+        "SELECT max(ts) FROM backtest.decisions WHERE run_id=$1;", run_id
+    )
+    assert last_decision is None or last_decision <= cfg.period_to
+
+    # Ни один исход не смотрит за границу: ts + горизонт <= BT_PERIOD_TO.
+    leaking = await pool.fetchval(
+        "SELECT count(*) FROM backtest.outcomes "
+        "WHERE run_id=$1 AND ts + make_interval(hours => horizon_h) > $2;",
+        run_id, cfg.period_to,
+    )
+    assert leaking == 0, "исход посчитан по свечам позже BT_PERIOD_TO"
+
+
+@requires_db
+async def test_outcome_count_does_not_depend_on_how_much_is_loaded(bt_db, pool) -> None:
+    """Догрузка свежих свечей НЕ добавляет исходов: прогон воспроизводим.
+
+    Если бы наблюдения у конца периода досчитывались свежими данными, число
+    исходов зависело бы от дня запуска, а результаты двух прогонов одной и той
+    же конфигурации перестали бы сравниваться между собой.
+    """
+    from backtest import evaluate, replay
+
+    cfg = make_config(agents=("market", "futures"))
+    criterion = {"описание": "тест воспроизводимости"}
+
+    # 1. Ряд обрывается ровно на границе периода.
+    hours_to_period_to = int((cfg.period_to - T0).total_seconds() // 3600) + 1
+    await seed_candles(pool, inst_id=SPOT, hours=hours_to_period_to)
+    await seed_funding(pool, inst_id=SWAP, points=140)
+    run_short = await replay.start_run(cfg, ["market", "futures"], criterion)
+    await replay.replay_instrument(run_short, PAIR, cfg, ["market", "futures"])
+    short_rows = await evaluate.evaluate_run(run_short, cfg)
+
+    # 2. Тот же прогон, но ряд догружен на десять суток вперёд.
+    await seed_candles(pool, inst_id=SPOT, hours=hours_to_period_to + 24 * 10)
+    run_long = await replay.start_run(cfg, ["market", "futures"], criterion)
+    await replay.replay_instrument(run_long, PAIR, cfg, ["market", "futures"])
+    long_rows = await evaluate.evaluate_run(run_long, cfg)
+
+    assert short_rows == long_rows, (
+        "число исходов изменилось от догрузки свежих свечей — "
+        "граница периода протекает"
+    )
