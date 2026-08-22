@@ -146,6 +146,34 @@ old_1h="$(psql_q "SELECT count(*) FROM ohlcv
                    WHERE timeframe <> '1m' AND ts < now() - interval '31 days';")"
 info "часовых (и прочих не 1m) свечей старше 31 дня: ${old_1h:-0} — они не удаляются никогда"
 
+# Лента сделок: сырьё живёт трое суток, итоги минут — навсегда (решение по §4.3).
+ret_tr="$(env_value RETENTION_TRADES_DAYS "")"
+[ "$ret_tr" = "3" ] && ok "RETENTION_TRADES_DAYS=3" \
+  || warn "RETENTION_TRADES_DAYS=${ret_tr:-не задан} (решение по §4.3 — 3)"
+has_flow="$(psql_q "SELECT count(*) FROM information_schema.tables
+                     WHERE table_schema='public' AND table_name='trade_flow_1m';")"
+if [ "${has_flow:-0}" != "1" ]; then
+  block "таблицы trade_flow_1m нет — миграция 010 не применена, а сырьё сделок"
+  info  "удаляется через трое суток: содержательная часть ленты потеряется"
+else
+  ok "таблица поминутных итогов trade_flow_1m есть"
+  # Свёртка не должна отставать: сырьё старше трёх суток удаляется, и если
+  # итоги отстают больше чем на сутки, часть ленты уйдёт несвёрнутой.
+  flow_lag="$(psql_q "SELECT coalesce(round(extract(epoch FROM
+                        (now() - max(ts))) / 3600.0), 999) FROM trade_flow_1m;")"
+  raw_from="$(psql_q "SELECT coalesce(round(extract(epoch FROM
+                        (now() - min(ts))) / 3600.0), 0) FROM trades;")"
+  if [ "${flow_lag:-999}" -gt 48 ] && [ "${raw_from:-0}" -gt 48 ]; then
+    block "поминутные итоги отстают на ${flow_lag} ч при сырье глубиной ${raw_from} ч:"
+    info  "ежесуточная задача не выполняется — сырьё удалится несвёрнутым"
+  else
+    ok "поминутные итоги свежие (отставание ${flow_lag} ч; свёртка идёт до удаления)"
+  fi
+fi
+ret_ao="$(env_value RETENTION_AGENT_OUTPUTS_DAYS "")"
+info "RETENTION_AGENT_OUTPUTS_DAYS=${ret_ao:-не задан} (журнал выводов агентов; "
+info "мнения, участвовавшие в решении, остаются навсегда в signals.agents_payload)"
+
 echo
 echo "=== 5. Версия логики и граница данных (§6) ==="
 lv_env="$(env_value LOGIC_VERSION "")"

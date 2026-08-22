@@ -42,6 +42,22 @@ CREATE TABLE IF NOT EXISTS trades (
 );
 CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades (instrument_id, ts DESC);
 
+-- Поминутные итоги ленты сделок (Этап 8.1, решение по §4.3). Сырьё в trades
+-- живёт трое суток, итоги минуты — НАВСЕГДА: при пяти токенах сырая лента не
+-- помещается на диск, а её содержательная часть помещается легко.
+CREATE TABLE IF NOT EXISTS trade_flow_1m (
+    instrument_id INTEGER       NOT NULL REFERENCES instruments(id),
+    ts            TIMESTAMPTZ   NOT NULL,   -- начало ЗАВЕРШЁННОЙ минуты
+    trades_n      INTEGER       NOT NULL,
+    buy_volume    NUMERIC(30,8) NOT NULL,
+    sell_volume   NUMERIC(30,8) NOT NULL,
+    buy_n         INTEGER       NOT NULL,
+    sell_n        INTEGER       NOT NULL,
+    vwap          NUMERIC(20,8) NOT NULL,
+    PRIMARY KEY (instrument_id, ts)
+);
+CREATE INDEX IF NOT EXISTS ix_trade_flow_1m_ts ON trade_flow_1m (ts);
+
 -- Ставки финансирования (funding rate) для деривативов.
 CREATE TABLE IF NOT EXISTS funding (
     instrument_id INT NOT NULL REFERENCES instruments(id),

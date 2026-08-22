@@ -403,3 +403,93 @@ async def test_notification_names_the_signals_own_token(monkeypatch) -> None:
 
     # Неизвестный инструмент не теряет уведомление — берётся подпись настройки.
     assert (await notifier._format_config(404)).symbol == "BTC/USDT"
+
+
+# --- Сырая лента сделок: кто её читает (решение по §4.3, пункт 3) ------------
+
+
+def test_no_component_reads_raw_trades() -> None:
+    """Ни один агент, отчёт или выгрузка не читает таблицу ``trades``.
+
+    От этого зависит решение хранить сырьё всего трое суток: содержательная
+    часть уходит в ``trade_flow_1m``, а сырьё нужно только для разбора
+    инцидентов. Если кто-то начнёт читать сделки напрямую, тест упадёт — и это
+    напоминание, что данных старше трёх суток там уже нет.
+
+    Разрешены ровно три места, и все три — счётчики за окно не длиннее суток
+    (детекторы «тихой поломки» потока), а не чтение самих сделок:
+      * ``src/health/daily_report.py`` и ``src/bot/queries.py`` — count(*) за
+        24 часа по белому списку таблиц ``DATA_STREAMS``;
+      * ``scripts/measure_load.sh`` — count(*) за час в замере §3.
+    Свёртка и удаление живут в ``scripts/retention.py`` — это работа с сырьём,
+    а не его чтение для анализа.
+    """
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    pattern = re.compile(r"\b(from|join)\s+trades\b", re.IGNORECASE)
+
+    offenders: list[str] = []
+    for path in sorted((root / "src").rglob("*.py")):
+        for number, line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            if pattern.search(line):
+                offenders.append(f"{path.relative_to(root)}:{number}: {line.strip()}")
+
+    assert not offenders, (
+        "появилось прямое чтение сырой ленты сделок — сырьё живёт трое суток, "
+        "используйте trade_flow_1m:\n" + "\n".join(offenders)
+    )
+
+
+def test_daily_report_counts_trades_by_whitelist() -> None:
+    """Счётчик потока сделок остаётся — он работает и при сроке в трое суток."""
+    from src.bot.queries import DATA_STREAMS
+
+    tables = {table for _label, table in DATA_STREAMS}
+    assert "trades" in tables, (
+        "счётчик потока сделок исчез: пропажу ленты станет нечем заметить"
+    )
+
+
+def test_trades_retention_is_three_days_and_rollup_runs_first() -> None:
+    """Решение по §4.3: сырьё — трое суток, свёртка — ДО удаления."""
+    import inspect
+
+    import scripts.retention as retention
+
+    rules = {table: days for table, days, _where in retention.RETENTION_RULES}
+    assert rules["trades"] == 3
+
+    source = inspect.getsource(retention.main)
+    rollup_at = source.index("rollup_sql()")
+    delete_at = source.index("_delete_in_batches")
+    assert rollup_at < delete_at, "удаление сырья идёт раньше свёртки"
+    assert "rollup_ok" in source, "нет защиты «не свернулось — не удаляем»"
+
+
+def test_agent_outputs_has_a_retention_rule_and_is_not_protected() -> None:
+    """Журнал выводов агентов чистится по сроку: §4 ТЗ не относит его к вечным.
+
+    Без срока он даёт 6.6 ГБ в год на пять токенов и один делает недостижимым
+    порог §3 (свободного места не меньше 40%) на горизонте года. Мнения,
+    участвовавшие в решении, остаются навсегда в ``signals.agents_payload``.
+    """
+    import scripts.retention as retention
+
+    rules = {table: days for table, days, _where in retention.RETENTION_RULES}
+    assert rules.get("agent_outputs") == 90
+    assert "agent_outputs" not in retention.PROTECTED_TABLES
+
+
+def test_protected_tables_match_the_specification() -> None:
+    """Перечень вечных таблиц — дословно из §4 ТЗ 8.1 плюс итоги сделок."""
+    import scripts.retention as retention
+
+    for table in ("funding", "open_interest", "signals", "signal_evaluations",
+                  "trade_flow_1m"):
+        assert table in retention.PROTECTED_TABLES
+        with pytest.raises(retention.RetentionRuleError):
+            retention._check_protected(table, "")
