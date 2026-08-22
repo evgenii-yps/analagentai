@@ -79,6 +79,11 @@ CREATE TABLE IF NOT EXISTS agent_outputs_daily (
 );
 CREATE INDEX IF NOT EXISTS ix_agent_outputs_daily_agent
     ON agent_outputs_daily (agent, day);
+COMMENT ON COLUMN agent_outputs_daily.logic_version IS
+    '0 — версия логики НЕИЗВЕСТНА (вывод сделан раньше самой ранней записанной '
+    'границы версий). Ближайшая известная версия не подставляется: это была бы '
+    'ложная запись в таблице, которая не удаляется никогда. Реальные версии '
+    'строго положительны (ограничение на logic_version_windows).';
 
 -- Ставки финансирования (funding rate) для деривативов.
 CREATE TABLE IF NOT EXISTS funding (
@@ -204,7 +209,10 @@ CREATE INDEX IF NOT EXISTS ix_eval_horizon
 -- Границы версий логики (Этап 8.1 §6). Данные версий не смешиваются в анализе,
 -- поэтому момент перехода хранится машиночитаемо, с точностью до минуты.
 CREATE TABLE IF NOT EXISTS logic_version_windows (
-    logic_version SMALLINT    PRIMARY KEY,
+    -- Строго положительна: ноль зарезервирован под признак «версия
+    -- неизвестна» в agent_outputs_daily (миграция 012). Без этого запрета
+    -- признак «неизвестно» нельзя было бы отличить от реальной версии.
+    logic_version SMALLINT    PRIMARY KEY CHECK (logic_version > 0),
     started_at    TIMESTAMPTZ NOT NULL,
     note          TEXT
 );
@@ -233,3 +241,7 @@ CREATE TABLE IF NOT EXISTS agent_outputs (
     rationale     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_agent_outputs ON agent_outputs (agent, instrument_id, ts DESC);
+-- Отбор ТОЛЬКО по времени: поиск незакрытых суток в свёртке и удаление
+-- журнала старше RETENTION_AGENT_OUTPUTS_DAYS. Индекс выше такой отбор
+-- не покрывает — ведущая колонка в нём agent.
+CREATE INDEX IF NOT EXISTS ix_agent_outputs_ts ON agent_outputs (ts);

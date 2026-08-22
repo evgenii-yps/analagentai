@@ -11,12 +11,13 @@
 from __future__ import annotations
 
 import os
+import pathlib
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
 
-from scripts.retention import rollup_daily_sql
+from scripts.retention import UNKNOWN_LOGIC_VERSION, rollup_daily_sql
 
 TEST_DSN = (
     os.environ.get("AGENT_TEST_DSN", "").strip()
@@ -194,15 +195,64 @@ async def test_version_boundary_inside_a_day_gives_two_rows(conn) -> None:
     )
 
 
-async def test_outputs_before_any_known_window_get_the_lowest_version(conn) -> None:
-    """Вывод раньше самого раннего окна получает минимальную известную версию."""
+async def test_outputs_before_any_known_window_get_unknown_version(conn) -> None:
+    """Вывод раньше самой ранней границы получает признак «неизвестно», а не версию.
+
+    Тест на дефект, найденный на сервере 22.08.2026: свёртка подставляла таким
+    выводам минимальную известную версию, и 33 895 выводов версий 1-3 были
+    записаны как версия 4. agent_outputs_daily не удаляется никогда, сырьё
+    живёт 90 суток — проверить утверждение стало бы нечем.
+    """
     instrument_id = await _instrument(conn)
     await _version(conn, 5, _yesterday() + timedelta(hours=12))
     await _outputs(conn, instrument_id, [(0, "bullish", 0.5)])   # раньше окна
     await conn.execute(rollup_daily_sql())
 
     row = await conn.fetchrow("SELECT logic_version FROM agent_outputs_daily;")
-    assert row["logic_version"] == 5
+    assert row["logic_version"] == UNKNOWN_LOGIC_VERSION, (
+        "выводу раньше самой ранней известной границы подставлена реальная "
+        "версия — это суррогатные данные вместо честного «неизвестно»"
+    )
+
+
+async def test_first_known_window_inside_a_day_splits_unknown_from_version(conn) -> None:
+    """Сутки, на которые пришлась ПЕРВАЯ известная граница, дают две строки."""
+    instrument_id = await _instrument(conn)
+    day = _yesterday()
+    await _version(conn, 4, day + timedelta(hours=12))   # самая ранняя граница
+    await _outputs(conn, instrument_id, [
+        (0, "bullish", 0.5), (60, "bullish", 0.5),             # раньше → неизвестно
+        (13 * 60, "bearish", 0.9), (14 * 60, "neutral", 0.1),  # позже  → версия 4
+    ])
+    await conn.execute(rollup_daily_sql())
+
+    rows = await conn.fetch(
+        "SELECT logic_version, n_total FROM agent_outputs_daily ORDER BY logic_version;"
+    )
+    assert [(r["logic_version"], r["n_total"]) for r in rows] == [
+        (UNKNOWN_LOGIC_VERSION, 2), (4, 2),
+    ], "неизвестный период слился с версией 4 в одну строку"
+
+
+async def test_outputs_after_the_last_known_window_get_the_last_version(conn) -> None:
+    """Вывод ПОЗЖЕ последней границы получает последнюю версию — и это верно.
+
+    Случай не симметричен предыдущему. У последнего окна нет конца: оно
+    действует до следующей границы, поэтому версия здесь ИЗВЕСТНА — та, что
+    работает сейчас. Незнание было только «слева», до первой записанной
+    границы.
+    """
+    instrument_id = await _instrument(conn)
+    day = _yesterday()
+    await _version(conn, 4, day - timedelta(days=10))
+    await _version(conn, 5, day - timedelta(days=2))   # последняя известная
+    await _outputs(conn, instrument_id, [(0, "bullish", 0.5), (60, "bearish", 0.7)])
+    await conn.execute(rollup_daily_sql())
+
+    rows = await conn.fetch("SELECT logic_version, n_total FROM agent_outputs_daily;")
+    assert [(r["logic_version"], r["n_total"]) for r in rows] == [(5, 2)], (
+        "вывод позже последней границы обязан получать последнюю версию"
+    )
 
 
 # --- Завершённость суток, идемпотентность, удаление сырья -------------------
@@ -308,3 +358,192 @@ async def test_single_output_gives_zero_repeat_rate(conn) -> None:
     row = await conn.fetchrow("SELECT * FROM agent_outputs_daily;")
     assert row["repeat_rate"] == Decimal("0.0000")
     assert row["n_total"] == 1
+
+
+# --- Исправление уже записанного: миграция 012 ------------------------------
+#
+# Дефект найден на сервере 22.08.2026: свёртка подставила выводам версий 1-3
+# минимальную известную версию 4 — 42 строки в вечной таблице. Миграция 012
+# переводит их в «неизвестно», а сутки границы пересчитывает ТЕМ ЖЕ SQL, что
+# и ежесуточная задача: второй реализации расчёта в проекте нет.
+
+_MIGRATION_012 = (
+    pathlib.Path(__file__).resolve().parents[1]
+    / "db" / "migrations" / "012_unknown_logic_version.sql"
+)
+
+
+def _migration_012_sql() -> str:
+    return _MIGRATION_012.read_text(encoding="utf-8")
+
+
+def _day(offset: int) -> datetime:
+    """Начало суток UTC, отстоящих от вчерашних на ``offset`` суток назад."""
+    return _yesterday() - timedelta(days=offset)
+
+
+async def _outputs_on(conn, instrument_id: int, day: datetime, rows,
+                      agent: str = "market") -> None:
+    """rows: список (минута от начала суток, сигнал, уверенность)."""
+    for minute, signal, confidence in rows:
+        await conn.execute(
+            "INSERT INTO agent_outputs (agent, instrument_id, ts, signal, confidence) "
+            "VALUES ($1, $2, $3, $4, $5);",
+            agent, instrument_id, day + timedelta(minutes=minute), signal, confidence,
+        )
+
+
+async def _daily_row(conn, day: datetime, instrument_id: int, version: int,
+                     n_total: int, agent: str = "market") -> None:
+    """Строка итогов, записанная СТАРЫМ (неверным) способом — для проверки правки."""
+    await conn.execute(
+        "INSERT INTO agent_outputs_daily "
+        "(day, agent, instrument_id, logic_version, n_total, n_bullish, n_bearish, "
+        " n_neutral, conf_avg, conf_p50, conf_p90, repeat_rate) "
+        "VALUES ($1::date, $2, $3, $4, $5, $5, 0, 0, 0.5, 0.5, 0.5, 0);",
+        day.date(), agent, instrument_id, version, n_total,
+    )
+
+
+async def test_migration_012_moves_whole_days_to_unknown(conn) -> None:
+    """Сутки целиком раньше границы переводятся в «неизвестно» без сырья."""
+    instrument_id = await _instrument(conn)
+    await _version(conn, 4, _day(0) + timedelta(hours=12))
+    await _daily_row(conn, _day(3), instrument_id, 4, 100)
+    await _daily_row(conn, _day(2), instrument_id, 4, 200)
+
+    await conn.execute(_migration_012_sql())
+
+    rows = await conn.fetch(
+        "SELECT day, logic_version, n_total FROM agent_outputs_daily ORDER BY day;"
+    )
+    assert [(r["logic_version"], r["n_total"]) for r in rows] == [
+        (UNKNOWN_LOGIC_VERSION, 100), (UNKNOWN_LOGIC_VERSION, 200),
+    ], "строки за период раньше границы остались с подставленной версией"
+
+
+async def test_migration_012_splits_the_boundary_day_through_the_rollup(conn) -> None:
+    """Сутки границы разделяются на две строки — пересчётом из живого сырья."""
+    instrument_id = await _instrument(conn)
+    boundary_day, last_day = _day(1), _day(0)
+    await _version(conn, 4, boundary_day + timedelta(hours=12))
+    # Сырьё: двое суток; в первых — граница внутри суток.
+    await _outputs_on(conn, instrument_id, boundary_day, [
+        (0, "bullish", 0.5), (60, "bullish", 0.5),             # раньше границы
+        (13 * 60, "bearish", 0.9), (14 * 60, "neutral", 0.1),  # позже границы
+    ])
+    await _outputs_on(conn, instrument_id, last_day, [
+        (0, "bullish", 0.3), (60, "bearish", 0.4),
+    ])
+    # Итоги, записанные старым способом: сутки границы одной смешанной строкой.
+    await _daily_row(conn, boundary_day, instrument_id, 4, 4)
+    await _daily_row(conn, last_day, instrument_id, 4, 2)
+
+    await conn.execute(_migration_012_sql())
+    await conn.execute(rollup_daily_sql())
+
+    rows = await conn.fetch(
+        "SELECT day, logic_version, n_total FROM agent_outputs_daily "
+        " ORDER BY day, logic_version;"
+    )
+    assert [(r["day"], r["logic_version"], r["n_total"]) for r in rows] == [
+        (boundary_day.date(), UNKNOWN_LOGIC_VERSION, 2),
+        (boundary_day.date(), 4, 2),
+        (last_day.date(), 4, 2),
+    ], "сутки границы не разделились на «неизвестно» и версию 4"
+
+
+async def test_migration_012_is_idempotent(conn) -> None:
+    """Повторное применение миграции и свёртки ничего не меняет."""
+    instrument_id = await _instrument(conn)
+    boundary_day, last_day = _day(1), _day(0)
+    await _version(conn, 4, boundary_day + timedelta(hours=12))
+    await _outputs_on(conn, instrument_id, boundary_day, [
+        (0, "bullish", 0.5), (13 * 60, "bearish", 0.9),
+    ])
+    await _outputs_on(conn, instrument_id, last_day, [(0, "bullish", 0.3)])
+    await _daily_row(conn, boundary_day, instrument_id, 4, 2)
+    await _daily_row(conn, last_day, instrument_id, 4, 1)
+
+    await conn.execute(_migration_012_sql())
+    await conn.execute(rollup_daily_sql())
+    first = await conn.fetch(
+        "SELECT day, logic_version, n_total, conf_avg FROM agent_outputs_daily "
+        " ORDER BY day, logic_version;"
+    )
+    await conn.execute(_migration_012_sql())
+    await conn.execute(rollup_daily_sql())
+    second = await conn.fetch(
+        "SELECT day, logic_version, n_total, conf_avg FROM agent_outputs_daily "
+        " ORDER BY day, logic_version;"
+    )
+    assert [tuple(r) for r in first] == [tuple(r) for r in second]
+
+
+async def test_migration_012_keeps_boundary_rows_when_raw_is_gone(conn) -> None:
+    """Без сырья сутки границы не трогаются: потерять строку хуже, чем оставить."""
+    instrument_id = await _instrument(conn)
+    boundary_day = _day(1)
+    await _version(conn, 4, boundary_day + timedelta(hours=12))
+    await _daily_row(conn, boundary_day, instrument_id, 4, 4)   # сырья нет вовсе
+
+    await conn.execute(_migration_012_sql())
+
+    rows = await conn.fetch("SELECT logic_version, n_total FROM agent_outputs_daily;")
+    assert [(r["logic_version"], r["n_total"]) for r in rows] == [(4, 4)], (
+        "строка суток границы удалена при отсутствии сырья — данные потеряны"
+    )
+
+
+async def test_zero_cannot_be_a_real_logic_version(conn) -> None:
+    """После миграции ноль в logic_version_windows невозможен по построению."""
+    import asyncpg
+
+    await conn.execute(_migration_012_sql())
+    with pytest.raises(asyncpg.exceptions.CheckViolationError):
+        await conn.execute(
+            "INSERT INTO logic_version_windows (logic_version, started_at) "
+            "VALUES (0, now());"
+        )
+
+
+# --- Дыра в итогах ----------------------------------------------------------
+
+
+async def test_rollup_fills_a_hole_in_daily_rows(conn) -> None:
+    """Сутки, по которым сырьё есть, а итогов нет, досчитываются, а не теряются."""
+    instrument_id = await _instrument(conn)
+    hole_day, last_day = _day(1), _day(0)
+    await _version(conn, 5, _day(9))
+    await _outputs_on(conn, instrument_id, hole_day, [(0, "bullish", 0.5)])
+    await _outputs_on(conn, instrument_id, last_day, [(0, "bearish", 0.7)])
+    await _daily_row(conn, last_day, instrument_id, 5, 1)   # итоги только за последние сутки
+
+    await conn.execute(rollup_daily_sql())
+
+    days = [r["day"] for r in await conn.fetch(
+        "SELECT day FROM agent_outputs_daily ORDER BY day;"
+    )]
+    assert days == [hole_day.date(), last_day.date()], (
+        "дыра в итогах не закрылась — счёт пошёл со следующих суток после последних"
+    )
+
+
+async def test_a_day_without_raw_is_not_a_hole(conn) -> None:
+    """Сутки простоя итогов не имеют законно и счёт на себе не держат."""
+    instrument_id = await _instrument(conn)
+    idle_day, last_day = _day(1), _day(0)
+    await _version(conn, 5, _day(9))
+    await _outputs_on(conn, instrument_id, _day(2), [(0, "bullish", 0.5)])
+    # За idle_day сырья нет вовсе — система не работала.
+    await _outputs_on(conn, instrument_id, last_day, [(0, "bearish", 0.7)])
+    await _daily_row(conn, _day(2), instrument_id, 5, 1)
+    await _daily_row(conn, last_day, instrument_id, 5, 1)
+
+    await conn.execute(rollup_daily_sql())
+
+    days = [r["day"] for r in await conn.fetch(
+        "SELECT day FROM agent_outputs_daily ORDER BY day;"
+    )]
+    assert idle_day.date() not in days
+    assert days == [_day(2).date(), last_day.date()]

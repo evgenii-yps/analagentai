@@ -112,6 +112,23 @@ PAUSE_SEC = float(os.environ.get("RETENTION_PAUSE_SEC", "0.5"))
 # а переписать его потом нельзя (см. ниже про идемпотентность).
 ROLLUP_LAG_MINUTES = int(os.environ.get("ROLLUP_LAG_MINUTES", "5"))
 
+# Признак «версия логики неизвестна» в agent_outputs_daily. Ставится выводам,
+# сделанным РАНЬШЕ самой ранней записанной границы версий: для них верного
+# значения нет ни в одной таблице, и взять его неоткуда.
+#
+# Почему именно ноль, а не отдельная колонка-признак. logic_version уже входит
+# в первичный ключ, поэтому сутки «неизвестно → версия 4» разделяются на две
+# строки тем же механизмом, что и любая другая граница версий, — без правок
+# схемы. И главное: любой существующий отбор вида «WHERE logic_version = 4»
+# строки с неизвестной версией НЕ ЗАХВАТИТ. Отдельная колонка-признак вела бы
+# себя наоборот: тот же отбор молча включал бы чужие данные у каждого, кто про
+# новую колонку не знает, — а смешивание версий в анализе запрещено.
+#
+# Отличимость от реальной версии обеспечена кодом, а не соглашением: в
+# logic_version_windows добавлено ограничение logic_version > 0 (миграция 012),
+# поэтому реальной версии 0 не существует и появиться не может.
+UNKNOWN_LOGIC_VERSION = 0
+
 
 def rollup_sql(lag_minutes: int = ROLLUP_LAG_MINUTES) -> str:
     """SQL свёртки ленты сделок в поминутные итоги.
@@ -194,12 +211,37 @@ def rollup_daily_sql() -> str:
     добавлять его туда задним числом нельзя: у старых строк верного значения
     взять неоткуда. Версия восстанавливается по окнам ``logic_version_windows``
     (§6 ТЗ 8.1): для вывода в момент ``ts`` берётся последнее окно, начавшееся
-    не позже ``ts``. Выводы, сделанные раньше самого раннего известного окна,
-    получают минимальную известную версию — их число печатается отдельной
-    строкой в логе, чтобы «неизвестная версия» не растворилась в данных.
+    не позже ``ts``.
+
+    ВЫВОДЫ РАНЬШЕ САМОГО РАННЕГО ИЗВЕСТНОГО ОКНА ПОЛУЧАЮТ
+    ``logic_version = 0`` — признак «версия неизвестна»
+    (:data:`UNKNOWN_LOGIC_VERSION`). Раньше им проставлялась минимальная
+    известная версия, и это было ошибкой: 33 895 выводов версий 1-3 на сервере
+    оказались записаны как версия 4. ``agent_outputs_daily`` — вечная таблица,
+    сырьё удаляется через 90 суток, проверить утверждение стало бы нечем, и в
+    проекте навсегда осталась бы правдоподобная ложь. Подстановка ближайшей
+    версии — это подстановка суррогатных данных вместо честного «неизвестно».
+    Ноль отличим от любой реальной версии по построению: ``logic_version_windows``
+    несёт ограничение ``logic_version > 0`` (миграция 012), поэтому реальная
+    версия нулём быть не может, а фильтр ``WHERE logic_version = 4`` строки с
+    неизвестной версией не захватит — молчаливое смешивание исключено.
+
+    СИММЕТРИЧНЫЙ СЛУЧАЙ РЕШАЕТСЯ ИНАЧЕ И ЭТО ВЕРНО. Вывод ПОЗЖЕ последней
+    известной границы получает последнюю версию: у последнего окна нет конца
+    (``ended_at IS NULL``), оно действует до следующей границы. Здесь версия
+    известна — это та, что работает сейчас. Незнание было только «слева», до
+    первой записанной границы.
+
+    ОТКУДА НАЧИНАТЬ СЧЁТ. Обычный ход — со следующих суток после последних
+    свёрнутых. Но если в итогах есть ДЫРА (сутки, по которым сырьё есть, а
+    строки итогов нет), счёт начинается с неё: иначе дыра не закрылась бы
+    никогда. Это же свойство закрывает исправление уже записанного (миграция
+    012): та удаляет неверные строки, а пересчитывает их ЭТОТ ЖЕ SQL — второй
+    реализации расчёта в проекте нет и быть не должно.
 
     Сутки, на которые пришлась граница версий, дают ДВЕ строки — по одной на
-    версию. Это прямо требуется: смешивать версии в анализе запрещено.
+    версию. Это прямо требуется: смешивать версии в анализе запрещено. Сутки
+    на границе «неизвестно → версия 4» дают строки 0 и 4 по тому же правилу.
 
     ``repeat_rate`` — доля ПОЛНЫХ повторов: вывод считается повтором, когда с
     предыдущим выводом того же агента по тому же инструменту совпали И
@@ -215,15 +257,35 @@ def rollup_daily_sql() -> str:
     поэтому сумма трёх направлений может быть меньше ``n_total``. Это не
     расхождение: «агенту не хватило данных» — не направление.
     """
-    return """
+    return f"""
         WITH ver AS (
             SELECT logic_version, started_at,
                    lead(started_at) OVER (ORDER BY started_at) AS ended_at
               FROM logic_version_windows
-        ), fallback AS (
-            SELECT coalesce(min(logic_version), 0) AS v FROM logic_version_windows
+        ), bounds AS (
+            SELECT (SELECT min(ts)::date FROM agent_outputs)       AS first_raw_day,
+                   (SELECT max(day)      FROM agent_outputs_daily) AS last_daily_day
+        ), gap AS (
+            -- Самые ранние сутки, по которым сырьё ЕСТЬ, а итогов НЕТ.
+            -- Проверка по сырью обязательна: сутки, когда система не работала,
+            -- итогов не имеют законно, и без неё счёт упирался бы в них вечно.
+            -- Порядок условий важен для стоимости: дыр обычно нет, и тогда
+            -- обращения к сырью не происходит вовсе.
+            SELECT min(g.d)::date AS day
+              FROM bounds b,
+                   generate_series(b.first_raw_day::timestamptz,
+                                   b.last_daily_day::timestamptz,
+                                   interval '1 day') g(d)
+             WHERE NOT EXISTS (
+                       SELECT 1 FROM agent_outputs_daily x WHERE x.day = g.d::date
+                   )
+               AND EXISTS (
+                       SELECT 1 FROM agent_outputs a
+                        WHERE a.ts >= g.d AND a.ts < g.d + interval '1 day'
+                   )
         ), target AS (
             SELECT coalesce(
+                       (SELECT day FROM gap),
                        (SELECT max(day) + 1 FROM agent_outputs_daily),
                        (SELECT min(ts)::date FROM agent_outputs),
                        CURRENT_DATE
@@ -234,12 +296,15 @@ def rollup_daily_sql() -> str:
                    a.ts::date AS day,
                    a.signal,
                    round(a.confidence::numeric, 4) AS conf,
+                   -- Нет подходящего окна — версия НЕИЗВЕСТНА. Ближайшая
+                   -- известная версия сюда не подставляется: это была бы
+                   -- ложная запись в вечной таблице.
                    coalesce(
                        (SELECT v.logic_version FROM ver v
                          WHERE v.started_at <= a.ts
                            AND (v.ended_at IS NULL OR a.ts < v.ended_at)
                          ORDER BY v.started_at DESC LIMIT 1),
-                       (SELECT v FROM fallback)
+                       {UNKNOWN_LOGIC_VERSION}
                    ) AS logic_version,
                    lag(a.signal) OVER w AS prev_signal,
                    lag(round(a.confidence::numeric, 4)) OVER w AS prev_conf
@@ -387,15 +452,22 @@ def main() -> int:
             "SELECT count(*) FROM agent_outputs a "
             "WHERE a.ts < (SELECT min(started_at) FROM logic_version_windows);"
         )
+        unknown_rows = _psql(
+            f"SELECT count(*) FROM agent_outputs_daily "
+            f"WHERE logic_version = {UNKNOWN_LOGIC_VERSION};"
+        )
         _log(
             f"agent_outputs_daily: свёрнуто суток (новых строк): "
             f"{int(after_daily or 0) - int(before_daily or 0)}; "
             f"всего строк итогов: {after_daily}."
         )
-        if int(unknown_version or 0) > 0:
+        if int(unknown_version or 0) > 0 or int(unknown_rows or 0) > 0:
             _log(
-                f"ВНИМАНИЕ: выводов раньше самого раннего известного окна версий: "
-                f"{unknown_version}. Им проставлена минимальная известная версия."
+                f"Выводов раньше самой ранней записанной границы версий: "
+                f"{unknown_version}; строк итогов с признаком «версия "
+                f"неизвестна» (logic_version = {UNKNOWN_LOGIC_VERSION}): "
+                f"{unknown_rows}. Ближайшая известная версия им НЕ "
+                f"подставляется: неизвестное остаётся неизвестным."
             )
         daily_ok = True
     except subprocess.CalledProcessError as exc:
@@ -426,9 +498,22 @@ def main() -> int:
             deleted = _delete_in_batches(table, days, extra_where)
             _log(f"{what}: удалено строк старше {days} дн.: {deleted}.")
             if deleted > 0:
-                _log(f"{table}: выполняю VACUUM ANALYZE…")
-                _psql(f"VACUUM ANALYZE {table};")
-                _log(f"{table}: VACUUM ANALYZE выполнен.")
+                _log(f"{table}: выполняю VACUUM (ANALYZE, PARALLEL 0)…")
+                # PARALLEL 0 — не украшение, а условие работоспособности.
+                # Параллельная чистка индексов раскладывает список мёртвых
+                # строк в РАЗДЕЛЯЕМОЙ памяти, а у контейнера postgres это
+                # /dev/shm размером 64 МБ по умолчанию. На сервере
+                # 22.08.2026 после удаления 3.57 млн строк trades обычный
+                # VACUUM ANALYZE упал с «could not resize shared memory
+                # segment to 67145248 bytes: No space left on device» —
+                # ежесуточная задача завершилась с ошибкой на штатной
+                # операции. С PARALLEL 0 та же чистка прошла за минуту.
+                # Размер /dev/shm поднят отдельно (shm_size в
+                # docker-compose.yml), но полагаться здесь на настройку
+                # окружения нельзя: скрипт обязан работать и там, где её
+                # не применили.
+                _psql(f"VACUUM (ANALYZE, PARALLEL 0) {table};")
+                _log(f"{table}: VACUUM (ANALYZE, PARALLEL 0) выполнен.")
             else:
                 _log(f"{table}: удалять нечего — VACUUM ANALYZE пропущен.")
         except subprocess.CalledProcessError as exc:
