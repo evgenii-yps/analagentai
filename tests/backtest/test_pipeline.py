@@ -17,7 +17,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
-from helpers import INST, T0, make_config, requires_db, seed_candles, seed_funding
+from helpers import INST, PAIR, T0, make_config, requires_db, seed_candles, seed_funding
 
 from backtest import evaluate, replay, report
 
@@ -59,7 +59,7 @@ async def test_criterion_is_registered_before_any_result(seeded, pool) -> None:
     assert decisions == 0, "результаты появились раньше критерия — предрегистрация нарушена"
 
     # Первая строка результата обязана быть позже открытия прогона.
-    await replay.replay_instrument(run_id, INST, cfg, ["market", "futures"])
+    await replay.replay_instrument(run_id, PAIR, cfg, ["market", "futures"])
     first_ts = await pool.fetchval(
         "SELECT min(ts) FROM backtest.decisions WHERE run_id=$1;", run_id
     )
@@ -70,7 +70,7 @@ async def test_full_pipeline_produces_report(seeded, tmp_path: Path, pool) -> No
     """Прогон → исходы → отчёт: файл создан и содержит все разделы §10."""
     cfg = make_config()
     run_id = await replay.start_run(cfg, ["market", "futures"], CRITERION)
-    decisions = await replay.replay_instrument(run_id, INST, cfg, ["market", "futures"])
+    decisions = await replay.replay_instrument(run_id, PAIR, cfg, ["market", "futures"])
     assert decisions > 0
 
     outcomes = await evaluate.evaluate_run(run_id, cfg)
@@ -103,11 +103,11 @@ async def test_replay_is_idempotent(seeded, pool) -> None:
     """Повторный прогон того же run_id не задваивает решения."""
     cfg = make_config()
     run_id = await replay.start_run(cfg, ["market"], CRITERION)
-    await replay.replay_instrument(run_id, INST, cfg, ["market"])
+    await replay.replay_instrument(run_id, PAIR, cfg, ["market"])
     first = await pool.fetchval(
         "SELECT count(*) FROM backtest.decisions WHERE run_id=$1;", run_id
     )
-    await replay.replay_instrument(run_id, INST, cfg, ["market"])
+    await replay.replay_instrument(run_id, PAIR, cfg, ["market"])
     second = await pool.fetchval(
         "SELECT count(*) FROM backtest.decisions WHERE run_id=$1;", run_id
     )
@@ -118,7 +118,7 @@ async def test_wait_decisions_have_no_outcomes(seeded, pool) -> None:
     """Решения wait не получают строк исхода: направления у них нет (§9.3 ТЗ)."""
     cfg = make_config()
     run_id = await replay.start_run(cfg, ["market", "futures"], CRITERION)
-    await replay.replay_instrument(run_id, INST, cfg, ["market", "futures"])
+    await replay.replay_instrument(run_id, PAIR, cfg, ["market", "futures"])
     await evaluate.evaluate_run(run_id, cfg)
 
     orphan = await pool.fetchval(
@@ -145,7 +145,7 @@ async def test_single_agent_configuration_uses_standard_mechanism(seeded, pool) 
 
     cfg = make_config()
     run_id = await replay.start_run(cfg, ["market"], CRITERION)
-    await replay.replay_instrument(run_id, INST, cfg, ["market"])
+    await replay.replay_instrument(run_id, PAIR, cfg, ["market"])
 
     rows = await pool.fetch(
         "SELECT DISTINCT direction FROM backtest.decisions WHERE run_id=$1;", run_id
@@ -162,7 +162,7 @@ async def test_production_tables_untouched(seeded, pool) -> None:
     before = await bt.production_row_counts()
     cfg = make_config()
     run_id = await replay.start_run(cfg, ["market", "futures"], CRITERION)
-    await replay.replay_instrument(run_id, INST, cfg, ["market", "futures"])
+    await replay.replay_instrument(run_id, PAIR, cfg, ["market", "futures"])
     await evaluate.evaluate_run(run_id, cfg)
     after = await bt.production_row_counts()
 
@@ -173,7 +173,7 @@ async def test_outcome_horizons_and_flags(seeded, pool) -> None:
     """Исходы считаются по всем горизонтам, флаги независимости расставлены."""
     cfg = make_config()
     run_id = await replay.start_run(cfg, ["market", "futures"], CRITERION)
-    await replay.replay_instrument(run_id, INST, cfg, ["market", "futures"])
+    await replay.replay_instrument(run_id, PAIR, cfg, ["market", "futures"])
     await evaluate.evaluate_run(run_id, cfg)
 
     rows = await pool.fetch(
@@ -197,7 +197,7 @@ async def test_price_end_comes_from_the_right_candle(seeded, pool) -> None:
     """price_end берётся из свечи, закрывшейся ровно через horizon часов."""
     cfg = make_config()
     run_id = await replay.start_run(cfg, ["market", "futures"], CRITERION)
-    await replay.replay_instrument(run_id, INST, cfg, ["market", "futures"])
+    await replay.replay_instrument(run_id, PAIR, cfg, ["market", "futures"])
     await evaluate.evaluate_run(run_id, cfg)
 
     row = await pool.fetchrow(

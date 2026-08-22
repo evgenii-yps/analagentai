@@ -203,18 +203,7 @@ async def build_report(run_id: int, out_path: Path) -> Path:
     run = await _run_row(run_id)
     config = run["config"]["config"]
     criterion = run["config"]["criterion"]
-    cfg = BacktestConfig(
-        instruments=tuple(config["instruments"]),
-        bar=config["bar"],
-        period_from=datetime.fromisoformat(config["period_from"]),
-        period_to=datetime.fromisoformat(config["period_to"]),
-        step_hours=int(config["step_hours"]),
-        horizons=tuple(int(h) for h in config["horizons"]),
-        fee_roundtrip_pct=_dec(config["fee_roundtrip_pct"]),
-        slippage_pct=_dec(config["slippage_pct"]),
-        oos_months=int(config["oos_months"]),
-        request_pause_ms=int(config["request_pause_ms"]),
-    )
+    cfg = BacktestConfig.from_dict(config)
 
     lines: list[str] = []
     lines.append("=" * WIDTH)
@@ -227,7 +216,15 @@ async def build_report(run_id: int, out_path: Path) -> Path:
     lines.append(f" Проверочный отрезок с: {config['oos_from']}")
     lines.append(f" Открыт:            {run['started_at']}")
     lines.append(f" Закрыт:            {run['finished_at']}")
-    lines.append(f" Инструменты:       {', '.join(cfg.instruments)}")
+    lines.append(
+        f" Инструменты:       {', '.join(pair.label for pair in cfg.instruments)}"
+    )
+    lines.append(f" Свечи (Market):    {', '.join(cfg.spot_ids)}")
+    lines.append(
+        " Funding (Futures): "
+        + (", ".join(cfg.swap_ids) if cfg.with_futures
+           else "не читался — Futures не участвует (BT_AGENTS=market)")
+    )
     lines.append(f" Издержки:          комиссия {config['fee_roundtrip_pct']}% + "
                  f"проскальзывание {config['slippage_pct']}%")
     lines.append("")
@@ -569,8 +566,3 @@ async def build_report(run_id: int, out_path: Path) -> Path:
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return out_path
 
-
-def _dec(value: str):
-    from decimal import Decimal
-
-    return Decimal(str(value))

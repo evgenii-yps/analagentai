@@ -4,6 +4,15 @@
 **Основание:** ТЗ Этапа 7.4 от 16.08.2026, отчёт Этапа 7.1, Этап 7.3 (LOGIC_VERSION = 4)
 **Ветка:** `claude/agent-trade-core-diagnostics-pvd1b9` от `main`, слита перемоткой; PR не открывался.
 
+> **ПОПРАВКА ОТ 22.08.2026 — РАЗДЕЛЕНИЕ РЫНКОВ.** Этот отчёт написан до
+> обнаружения ошибки §5.2 ТЗ: инструмент трактовался как ОДИН идентификатор на
+> оба ряда, тогда как продакшн ведёт пару «спот (свечи) → контракт (funding)».
+> Из-за этого первая сверка §13.2 дала `market 0/200`, а прогон на споте упал с
+> кодом 51000. Что изменено в конфигурации, коде и приёмке — см.
+> [`docs/STAGE_7_4_MARKET_SPLIT.md`](STAGE_7_4_MARKET_SPLIT.md). Ниже по тексту
+> `BT_INSTRUMENTS` везде читается как список ПАР `СПОТ:КОНТРАКТ`, и добавился
+> обязательный `BT_AGENTS`.
+
 ---
 
 ## 0. Главное, что нужно знать до чтения отчёта
@@ -332,8 +341,12 @@ sudo -u agent docker compose exec -T postgres \
 
 ```bash
 cd /opt/agent-trade && sudo -u agent docker compose --profile backtest run --rm backtest \
-  python scripts/probe_history_depth.py
+  python scripts/probe_history_depth.py \
+  --instruments BTC-USDT:BTC-USDT-SWAP,ETH-USDT:ETH-USDT-SWAP,SOL-USDT:SOL-USDT-SWAP
 ```
+
+Инструменты задаются ПАРАМИ «спот:контракт» (поправка от 22.08.2026): свечи
+зондируются на споте, funding — на контракте.
 
 Вывод скопировать целиком: он заполняет таблицу §2 этого отчёта и даёт два
 значения для конфигурации.
@@ -346,8 +359,20 @@ sudo -u agent cp backtest/.env.backtest.example backtest/.env.backtest
 sudo -u agent nano backtest/.env.backtest   # вписать BT_PERIOD_FROM и BT_REQUEST_PAUSE_MS
 ```
 
+Файл обязан существовать ДО первого запуска контейнера: иначе docker создаст на
+его месте каталог (дефект D-9), и конфигурация перестанет читаться.
+
 Если у какого-то инструмента глубина истории меньше 24 месяцев — убрать его из
-`BT_INSTRUMENTS` (§4.2). Файл `.env` продакшна не трогать.
+`BT_INSTRUMENTS` (§4.2). `BT_AGENTS` оставить равным `market`, пока речь идёт о
+главном вопросе этапа: при этом значении funding не запрашивается вовсе. Файл
+`.env` продакшна не трогать.
+
+После любого изменения кода образ пересобирается ТОЛЬКО с `--no-cache`:
+
+```bash
+cd /opt/agent-trade && sudo -u agent docker compose --profile backtest build \
+  --no-cache --build-arg CODE_REV=$(git rev-parse --short HEAD) backtest
+```
 
 ### Шаг 5. Проверка готовности
 

@@ -4,6 +4,15 @@
 досчитывается «по памяти» и не подставляется. Решения ``wait`` строк исхода не
 получают вовсе: направления у них нет, а значит нет и попадания направления.
 Их количество приводится в отчёте отдельной строкой.
+
+ГРАНИЦА ПЕРИОДА ЖЁСТКАЯ. В ``backtest.candles`` есть свечи ПОЗЖЕ
+``BT_PERIOD_TO``: ряд пары, на которой идёт сверка §13.2, догружается до живого
+окна, иначе сверку не с чем выполнять. Расчёт исходов их не видит вовсе —
+верхняя граница выборки стоит в SQL и равна ``BT_PERIOD_TO``, а наблюдение,
+горизонт которого выходит за границу, ИСКЛЮЧАЕТСЯ. Досчитывать его свежими
+данными нельзя по двум причинам: конец периода отодвинут назад намеренно
+(§5.3 ТЗ), чтобы результат нельзя было подогнать под уже известное поведение
+живой системы, и потому что иначе число исходов зависело бы от дня запуска.
 """
 
 from __future__ import annotations
@@ -103,24 +112,43 @@ def realized_vol(closes: list[float]) -> float:
     return math.sqrt(variance)
 
 
-async def _price_at_close(inst_id: str, bar: str, close_time) -> float | None:
+async def _price_at_close(
+    inst_id: str, bar: str, close_time, not_after
+) -> float | None:
+    """Цена закрытия конкретной свечи, но НЕ ПОЗЖЕ ``not_after``.
+
+    Верхняя граница стоит в самом SQL, а не в проверке вызывающего кода: свечи
+    позже BT_PERIOD_TO в таблице ЕСТЬ (ряд пары сверки догружается до живого
+    окна, §13.2), и запрос без границы молча брал бы их. Тогда исход решения у
+    конца периода считался бы по данным из-за границы — то есть исчезла бы
+    защита §5.3, ради которой конец периода отодвинут назад.
+    """
+    if close_time > not_after:
+        return None
     value = await db.fetchval(
         "SELECT close FROM backtest.candles "
-        "WHERE inst_id=$1 AND bar=$2 AND close_time=$3;",
-        inst_id, bar, close_time,
+        "WHERE inst_id=$1 AND bar=$2 AND close_time=$3 AND close_time <= $4;",
+        inst_id, bar, close_time, not_after,
     )
     return None if value is None else float(value)
 
 
 async def _context_series(inst_id: str, bar: str, cfg: BacktestConfig) -> dict:
-    """Готовит вспомогательные ряды: цены по времени закрытия для контекста."""
+    """Готовит вспомогательные ряды: цены по времени закрытия для контекста.
+
+    Верхняя граница выборки — РОВНО ``BT_PERIOD_TO``. Ни одна свеча позже
+    границы в расчёт исходов не попадает: ни как цена конца горизонта, ни как
+    контекст режима рынка или волатильности. Нижняя граница уходит на 32 суток
+    назад — режим рынка считается по доходности за предшествующие 30 суток
+    (§9.4), и это данные ДО решения, а не после него.
+    """
     rows = await db.fetch(
         "SELECT close_time, close FROM backtest.candles "
         "WHERE inst_id=$1 AND bar=$2 AND close_time BETWEEN $3 AND $4 "
         "ORDER BY close_time;",
         inst_id, bar,
         cfg.period_from - timedelta(days=REGIME_LOOKBACK_DAYS + 2),
-        cfg.period_to + timedelta(hours=max(cfg.horizons) + 1),
+        cfg.period_to,
     )
     return {r["close_time"]: float(r["close"]) for r in rows}
 
@@ -130,7 +158,10 @@ async def evaluate_run(run_id: int, cfg: BacktestConfig) -> int:
     costs = Costs(cfg.fee_roundtrip_pct, cfg.slippage_pct)
     written = 0
 
-    for inst_id in cfg.instruments:
+    for pair in cfg.instruments:
+        # Исходы считаются по свечам, а свечи есть только у спота: ключ
+        # инструмента в таблицах прогона — спот пары.
+        inst_id = pair.key
         prices = await _context_series(inst_id, cfg.bar, cfg)
         decisions = await db.fetch(
             "SELECT ts, direction, price_at_ts FROM backtest.decisions "
@@ -153,6 +184,7 @@ async def evaluate_run(run_id: int, cfg: BacktestConfig) -> int:
         edges = _quartile_edges(list(vols.values()))
 
         batch = []
+        skipped_after_period = 0
         for row in decisions:
             ts = row["ts"]
             direction = row["direction"]
@@ -168,10 +200,21 @@ async def evaluate_run(run_id: int, cfg: BacktestConfig) -> int:
             oos = ts >= cfg.oos_from
 
             for horizon in cfg.horizons:
-                price_end = prices.get(ts + timedelta(hours=horizon))
+                horizon_end = ts + timedelta(hours=horizon)
+                if horizon_end > cfg.period_to:
+                    # Горизонт выходит ЗА ГРАНИЦУ ПЕРИОДА. Наблюдение
+                    # ИСКЛЮЧАЕТСЯ, а не досчитывается свежими свечами, хотя они
+                    # в таблице есть (ряд пары сверки загружен до живого окна).
+                    # Конец периода отодвинут назад намеренно (§5.3 ТЗ): результат
+                    # не должен опираться на уже известное поведение живой
+                    # системы. Кроме того, это делает прогон воспроизводимым:
+                    # число исходов не зависит от того, в какой день его запустили.
+                    skipped_after_period += 1
+                    continue
+                price_end = prices.get(horizon_end)
                 if price_end is None:
                     price_end = await _price_at_close(
-                        inst_id, cfg.bar, ts + timedelta(hours=horizon)
+                        inst_id, cfg.bar, horizon_end, cfg.period_to
                     )
                 if price_end is None:
                     continue  # горизонт выходит за пределы истории — исхода нет
@@ -198,7 +241,12 @@ async def evaluate_run(run_id: int, cfg: BacktestConfig) -> int:
                 batch,
             )
             written += len(batch)
-        _log.info("Исходы посчитаны", run_id=run_id, inst_id=inst_id, rows=len(batch))
+        _log.info(
+            "Исходы посчитаны", run_id=run_id, inst_id=inst_id, rows=len(batch),
+            # Сколько наблюдений отброшено границей периода — величина должна
+            # быть видна, а не подразумеваться.
+            skipped_horizon_after_period_to=skipped_after_period,
+        )
 
     return written
 

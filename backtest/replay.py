@@ -24,7 +24,7 @@ import structlog
 
 from backtest import db
 from backtest.clock import build_snapshot, decision_times, to_hourly_funding
-from backtest.config import BacktestConfig
+from backtest.config import REPLAYABLE_AGENTS, BacktestConfig, InstrumentPair
 from backtest.integrity import is_excluded
 from src.agents.futures import analyze_futures
 from src.agents.market import analyze_ohlcv
@@ -36,7 +36,11 @@ _log = structlog.get_logger().bind(component="backtest.replay")
 # Агенты, для которых существует историческая реконструкция входов.
 # Liquidity сюда не входит и войти не может: истории стакана не существует
 # ни у одной биржи (§3.3 ТЗ), а суррогат вместо неё запрещён.
-REPLAYABLE = ("market", "futures")
+REPLAYABLE = REPLAYABLE_AGENTS
+
+# Как часто печатать строку хода прогона (в моментах решения). Дефект D-10:
+# без этого прогон на 39 408 свечах выглядит зависшим часами.
+PROGRESS_EVERY_DECISIONS = 2000
 
 # Числовое направление — та же таблица, что в src.decision.agent.
 _SIGNAL_VALUE = {"bullish": 1, "bearish": -1, "neutral": 0}
@@ -144,10 +148,14 @@ def agent_outputs_at(
             # (metrics.oi_enough = false): направление задаёт funding, а
             # подтверждение со стороны OI отсутствует. Следствие — уверенность
             # Futures в реплее систематически равна 0.4 от продакшновой.
+            #
+            # Цена — цена КОНТРАКТА, то есть None: свечей контракта нет ни в
+            # продакшне, ни в прогоне. Цена спота сюда не передаётся, иначе
+            # снова смешались бы два рынка (см. ``Snapshot.swap_price``).
             signal, confidence, _metrics, _rationale = analyze_futures(
                 funding_window,
                 [],
-                snapshot.price,
+                snapshot.swap_price,
                 pct_high=settings.FUTURES_PCT_HIGH,
                 pct_low=settings.FUTURES_PCT_LOW,
                 min_points=settings.FUTURES_MIN_POINTS,
@@ -196,6 +204,16 @@ async def start_run(
             "FUTURES_MIN_POINTS": settings.FUTURES_MIN_POINTS,
             "LOGIC_VERSION": settings.LOGIC_VERSION,
         },
+        "markets": {
+            # Что на каком рынке считалось — часть данных прогона, а не
+            # комментарий: без этого «market 0/200» в сверке нельзя отличить
+            # от сравнения разных рынков.
+            "candles_from": [pair.spot for pair in cfg.instruments],
+            "funding_from": (
+                [pair.swap for pair in cfg.instruments] if "futures" in agents
+                else "не читался: futures не участвует в этой конфигурации"
+            ),
+        },
         "limitations": {
             "liquidity": "не прогоняется: истории стакана не существует (§3.3 ТЗ)",
             "open_interest": (
@@ -236,29 +254,51 @@ async def finish_run(run_id: int, status: str) -> None:
 
 async def replay_instrument(
     run_id: int,
-    inst_id: str,
+    pair: InstrumentPair,
     cfg: BacktestConfig,
     agents: list[str],
     *,
     excluded: list[tuple[datetime, datetime]] | None = None,
+    progress_every: int = PROGRESS_EVERY_DECISIONS,
 ) -> int:
-    """Прогоняет один инструмент и пишет решения. Возвращает число решений.
+    """Прогоняет одну ПАРУ рынков и пишет решения. Возвращает число решений.
+
+    Свечи читаются по споту пары, ставки финансирования — по её контракту;
+    ключом решения служит спот (``pair.key``), потому что цена и исходы
+    считаются по свечам.
 
     Идемпотентность: строки пишутся с ``ON CONFLICT DO NOTHING`` по ключу
     (run_id, inst_id, ts), поэтому повторный прогон того же run_id не задваивает
     данные.
     """
     excluded = excluded or []
+    inst_id = pair.key
+    with_funding = "futures" in agents
     total = 0
     skipped_gap = 0
     skipped_no_data = 0
     batch: list[tuple[Any, ...]] = []
+    moments = decision_times(cfg)
+    _log.info(
+        "Прогон пары: начало", run_id=run_id, pair=pair.label,
+        candles_from=pair.spot,
+        funding_from=pair.swap if with_funding else "не читается (нет futures)",
+        agents=list(agents), moments=len(moments),
+    )
 
-    for ts in decision_times(cfg):
+    for index, ts in enumerate(moments, start=1):
+        if progress_every and index % progress_every == 0:
+            _log.info(
+                "Прогон пары: идёт", run_id=run_id, pair=pair.label,
+                processed=index, of=len(moments),
+                percent=round(100.0 * index / len(moments), 1),
+                decisions=total, skipped_gap=skipped_gap,
+                skipped_no_data=skipped_no_data, at=ts.isoformat(),
+            )
         if is_excluded(ts, excluded):
             skipped_gap += 1
             continue
-        snapshot = await build_snapshot(inst_id, ts, cfg)
+        snapshot = await build_snapshot(pair, ts, cfg, with_funding=with_funding)
         price = snapshot.price
         if price is None:
             skipped_no_data += 1
@@ -293,8 +333,8 @@ async def replay_instrument(
         await _flush(batch)
 
     _log.info(
-        "Инструмент прогнан",
-        run_id=run_id, inst_id=inst_id, decisions=total,
+        "Прогон пары: готово",
+        run_id=run_id, pair=pair.label, inst_id=inst_id, decisions=total,
         skipped_gap=skipped_gap, skipped_no_data=skipped_no_data,
     )
     return total
