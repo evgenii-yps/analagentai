@@ -17,7 +17,7 @@ from decimal import Decimal
 
 import pytest
 
-from backtest.config import BacktestConfig
+from backtest.config import BacktestConfig, InstrumentPair
 
 TEST_DSN = os.environ.get("BT_TEST_DSN", "").strip()
 
@@ -30,13 +30,23 @@ requires_db = pytest.mark.skipif(
 )
 
 T0 = datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
-INST = "TEST-USDT-SWAP"
+
+# Два РАЗНЫХ рынка одного актива, как в продакшне: свечи живут на споте,
+# ставки финансирования — на контракте. Совпадающих идентификаторов в тестах
+# нет намеренно: перепутанные рынки обязаны быть видны.
+SPOT = "TEST-USDT"
+SWAP = "TEST-USDT-SWAP"
+PAIR = InstrumentPair(spot=SPOT, swap=SWAP)
+
+# Ключ инструмента в таблицах прогона — спот пары.
+INST = SPOT
 
 
 def make_config(**overrides) -> BacktestConfig:
     """Конфигурация прогона для тестов (значения подобраны под короткий ряд)."""
     base = {
-        "instruments": (INST,),
+        "instruments": (PAIR,),
+        "agents": ("market", "futures"),
         "bar": "1H",
         "period_from": T0 + timedelta(days=20),
         "period_to": T0 + timedelta(days=30),
@@ -56,13 +66,13 @@ def make_config(**overrides) -> BacktestConfig:
 
 async def seed_candles(
     pool,
-    inst_id: str = INST,
+    inst_id: str = SPOT,
     bar: str = "1H",
     start: datetime | None = None,
     hours: int = 24 * 40,
     base_price: float = 100.0,
 ) -> None:
-    """Заливает непрерывный ряд часовых свечей с детерминированной формой."""
+    """Заливает непрерывный ряд часовых свечей СПОТА с детерминированной формой."""
     import math
 
     start = start or T0
@@ -91,12 +101,12 @@ async def seed_candles(
 
 async def seed_funding(
     pool,
-    inst_id: str = INST,
+    inst_id: str = SWAP,
     start: datetime | None = None,
     points: int = 120,
     step_hours: int = 8,
 ) -> None:
-    """Заливает ставки финансирования с шагом ``step_hours`` (как отдаёт биржа)."""
+    """Заливает ставки финансирования КОНТРАКТА с шагом ``step_hours``."""
     import math
 
     start = start or T0

@@ -130,7 +130,10 @@ async def evaluate_run(run_id: int, cfg: BacktestConfig) -> int:
     costs = Costs(cfg.fee_roundtrip_pct, cfg.slippage_pct)
     written = 0
 
-    for inst_id in cfg.instruments:
+    for pair in cfg.instruments:
+        # Исходы считаются по свечам, а свечи есть только у спота: ключ
+        # инструмента в таблицах прогона — спот пары.
+        inst_id = pair.key
         prices = await _context_series(inst_id, cfg.bar, cfg)
         decisions = await db.fetch(
             "SELECT ts, direction, price_at_ts FROM backtest.decisions "

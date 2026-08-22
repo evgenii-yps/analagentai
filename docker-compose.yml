@@ -175,10 +175,22 @@ services:
   #   docker compose --profile backtest run --rm backtest
   # Ресурсы ограничены намеренно (§12.3 ТЗ): продакшн работает на том же
   # сервере и не должен пострадать от прогона.
+  # ПЕРЕД ПЕРВЫМ ЗАПУСКОМ создайте файл backtest/.env.backtest на хосте
+  # (cp backtest/.env.backtest.example backtest/.env.backtest). Если файла нет,
+  # docker создаст на его месте КАТАЛОГ — это и был дефект D-9; лечится только
+  # удалением каталога и пересборкой с --no-cache.
+  #
+  # ПОСЛЕ ЛЮБОГО ИЗМЕНЕНИЯ КОДА пересобирайте образ так:
+  #   docker compose --profile backtest build --no-cache \
+  #       --build-arg CODE_REV=$(git rev-parse --short HEAD) backtest
   backtest:
     build:
       context: .
       dockerfile: backtest/Dockerfile
+      args:
+        # Ревизия кода в слое образа: меняется — кэш COPY со старым кодом
+        # больше не подхватывается (страховка к правилу --no-cache, D-9).
+        CODE_REV: ${CODE_REV:-dev}
     env_file: .env
     profiles: ["backtest"]
     depends_on: [postgres]

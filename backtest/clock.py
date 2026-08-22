@@ -19,6 +19,13 @@
 будущее. Ограничение, которое из этого следует, зафиксировано в отчёте:
 продакшн пишет ТЕКУЩУЮ (прогнозную) ставку, история — РАСЧЁТНУЮ; величины
 близки, но не тождественны, и именно это измеряет сверка §13.2.
+
+ДВА РЫНКА В ОДНОМ СНИМКЕ. Свечи берутся по СПОТУ, ставки финансирования — по
+БЕССРОЧНОМУ КОНТРАКТУ, ровно как в продакшне (MarketAgent получает spot_id,
+FuturesAgent — swap_id). Это не деталь оформления: снимок, собранный по одному
+идентификатору на оба ряда, сравнивает разные рынки — именно так сверка §13.2
+дала market 0/200. Когда Futures в прогоне не участвует (``BT_AGENTS=market``),
+ряд funding не запрашивается вовсе, и снимок содержит пустую рамку.
 """
 
 from __future__ import annotations
@@ -30,26 +37,53 @@ from datetime import UTC, datetime, timedelta
 import pandas as pd
 
 from backtest import db
-from backtest.config import BacktestConfig
+from backtest.config import BacktestConfig, InstrumentPair
 from src.agents.market import _EMA_SLOW
 from src.core.config import settings
 
 
 @dataclass(frozen=True)
 class Snapshot:
-    """Данные, видимые системе в момент ``ts``, и ничего сверх того."""
+    """Данные, видимые системе в момент ``ts``, и ничего сверх того.
+
+    Ряды разнесены по рынкам: ``candles`` — спот пары, ``funding`` — её
+    бессрочный контракт. Перепутать их местами нельзя даже случайно: у снимка
+    нет ни одного поля, где рынок не назван.
+    """
 
     ts: datetime
-    inst_id: str
-    candles: pd.DataFrame     # только close_time <= ts, по возрастанию
-    funding: pd.DataFrame     # только funding_time <= ts, по возрастанию
+    pair: InstrumentPair
+    candles: pd.DataFrame     # СПОТ, только close_time <= ts, по возрастанию
+    funding: pd.DataFrame     # КОНТРАКТ, только funding_time <= ts, по возрастанию
+
+    @property
+    def spot_id(self) -> str:
+        return self.pair.spot
+
+    @property
+    def swap_id(self) -> str | None:
+        return self.pair.swap
 
     @property
     def price(self) -> float | None:
-        """Цена на момент T — close последней закрытой свечи."""
+        """Цена на момент T — close последней закрытой свечи СПОТА."""
         if self.candles.empty:
             return None
         return float(self.candles["close"].iloc[-1])
+
+    @property
+    def swap_price(self) -> float | None:
+        """Цена контракта на момент T.
+
+        Всегда ``None``: свечи контракта не загружаются, потому что и продакшн
+        их не собирает — в таблице ``ohlcv`` по swap-инструменту ноль строк
+        (замер 22.08.2026). В продакшне ``FuturesAgent`` в такой ситуации
+        получает ``price=None``, и реплей обязан получать то же самое. На
+        направление и уверенность величина не влияет вовсе: ``analyze_futures``
+        кладёт её только в метрики. Подставлять сюда цену СПОТА нельзя — это
+        снова смешало бы рынки.
+        """
+        return None
 
 
 def market_window_size() -> int:
@@ -162,11 +196,32 @@ def to_hourly_funding(
     return result
 
 
-async def build_snapshot(inst_id: str, ts: datetime, cfg: BacktestConfig) -> Snapshot:
-    """Собирает снимок на момент ``ts``."""
-    candles = await candles_at(inst_id, cfg.bar, ts, market_window_size())
-    funding = await funding_at(inst_id, ts, settings.FUTURES_LOOKBACK_HOURS)
-    return Snapshot(ts=ts, inst_id=inst_id, candles=candles, funding=funding)
+EMPTY_FUNDING = pd.DataFrame(columns=["funding_time", "funding_rate"])
+
+
+async def build_snapshot(
+    pair: InstrumentPair,
+    ts: datetime,
+    cfg: BacktestConfig,
+    *,
+    with_funding: bool | None = None,
+) -> Snapshot:
+    """Собирает снимок на момент ``ts``: свечи со спота, funding с контракта.
+
+    ``with_funding`` по умолчанию берётся из конфигурации (``BT_AGENTS``). При
+    ``BT_AGENTS=market`` запрос funding не выполняется ВООБЩЕ — ни к бирже, ни
+    к БД: Futures в прогоне не участвует, и читать ряд, которым никто не
+    воспользуется, незачем (это ещё и снимает по одному запросу с каждого из
+    десятков тысяч моментов решения).
+    """
+    if with_funding is None:
+        with_funding = cfg.with_futures
+    candles = await candles_at(pair.spot, cfg.bar, ts, market_window_size())
+    if with_funding and pair.swap:
+        funding = await funding_at(pair.swap, ts, settings.FUTURES_LOOKBACK_HOURS)
+    else:
+        funding = EMPTY_FUNDING.copy()
+    return Snapshot(ts=ts, pair=pair, candles=candles, funding=funding)
 
 
 def decision_times(cfg: BacktestConfig) -> list[datetime]:
@@ -181,7 +236,9 @@ def decision_times(cfg: BacktestConfig) -> list[datetime]:
     return times
 
 
-async def iter_snapshots(inst_id: str, cfg: BacktestConfig) -> AsyncIterator[Snapshot]:
+async def iter_snapshots(
+    pair: InstrumentPair, cfg: BacktestConfig
+) -> AsyncIterator[Snapshot]:
     """Снимки по всем моментам решения (§11 ТЗ).
 
     Отличие от сигнатуры §11 ТЗ: возвращается АСИНХРОННЫЙ итератор
@@ -190,7 +247,7 @@ async def iter_snapshots(inst_id: str, cfg: BacktestConfig) -> AsyncIterator[Sna
     снимков на инструмент — держать их все в памяти незачем.
     """
     for ts in decision_times(cfg):
-        yield await build_snapshot(inst_id, ts, cfg)
+        yield await build_snapshot(pair, ts, cfg)
 
 
 def utcnow() -> datetime:

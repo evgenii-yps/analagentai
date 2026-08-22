@@ -16,7 +16,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from helpers import INST, T0, requires_db
+from helpers import SPOT, SWAP, T0, requires_db
 
 from backtest import loader
 
@@ -91,7 +91,7 @@ class FakeOkx:
         while len(rows) < limit and stamp >= self.first:
             rows.append(
                 {
-                    "instId": INST,
+                    "instId": SPOT,
                     "fundingRate": "0.00005",
                     "realizedRate": "0.00006",
                     "fundingTime": str(int(stamp.timestamp() * 1000)),
@@ -109,33 +109,33 @@ def test_parse_candles_drops_unconfirmed() -> None:
         ["1735689600000", "1", "2", "0.5", "1.5", "10", "100", "100", "1"],
         ["1735693200000", "1", "2", "0.5", "1.5", "10", "100", "100", "0"],
     ]
-    parsed = loader.parse_candles(rows, INST, BAR)
+    parsed = loader.parse_candles(rows, SPOT, BAR)
     assert len(parsed) == 1
     assert parsed[0][2] == datetime(2025, 1, 1, 0, 0, tzinfo=UTC)
 
 
 def test_parse_candles_computes_close_time_from_bar() -> None:
     rows = [["1735689600000", "1", "2", "0.5", "1.5", "10", "100", "100", "1"]]
-    open_time, close_time = loader.parse_candles(rows, INST, BAR)[0][2:4]
+    open_time, close_time = loader.parse_candles(rows, SPOT, BAR)[0][2:4]
     assert close_time - open_time == timedelta(hours=1)
 
 
 def test_parse_candles_rejects_unknown_bar() -> None:
     with pytest.raises(loader.LoaderError):
-        loader.parse_candles([], INST, "7H")
+        loader.parse_candles([], SPOT, "7H")
 
 
 def test_parse_funding_prefers_realized_rate() -> None:
     """История даёт расчётную ставку; именно она и берётся."""
     rows = [{"fundingTime": "1735689600000", "fundingRate": "0.0001",
              "realizedRate": "0.00007"}]
-    parsed = loader.parse_funding(rows, INST)
+    parsed = loader.parse_funding(rows, SWAP)
     assert float(parsed[0][2]) == pytest.approx(0.00007)
 
 
 def test_parse_funding_skips_rows_without_rate() -> None:
     rows = [{"fundingTime": "1735689600000"}, {"fundingRate": "0.0001"}]
-    assert loader.parse_funding(rows, INST) == []
+    assert loader.parse_funding(rows, SWAP) == []
 
 
 def test_bar_seconds_known_values() -> None:
@@ -154,14 +154,14 @@ async def test_backfill_candles_walks_backwards_and_stops(bt_db, pool) -> None:
     client = loader.OkxHistory(fake, pause_ms=0)
 
     written = await loader.backfill_candles(
-        INST, BAR, since, until, client=client, page_limit=50
+        SPOT, BAR, since, until, client=client, page_limit=50
     )
     assert written > 0
 
     row = await pool.fetchrow(
         "SELECT count(*) AS n, min(open_time) AS lo, max(open_time) AS hi "
         "FROM backtest.candles WHERE inst_id=$1;",
-        INST,
+        SPOT,
     )
     assert row["lo"] >= since
     assert row["hi"] <= until
@@ -177,20 +177,78 @@ async def test_backfill_is_idempotent(bt_db, pool) -> None:
     fake = FakeOkx(first=T0 - timedelta(days=2), last=until)
     client = loader.OkxHistory(fake, pause_ms=0)
 
-    await loader.backfill_candles(INST, BAR, since, until, client=client, page_limit=50)
+    await loader.backfill_candles(SPOT, BAR, since, until, client=client, page_limit=50)
     first_count = await pool.fetchval(
-        "SELECT count(*) FROM backtest.candles WHERE inst_id=$1;", INST
+        "SELECT count(*) FROM backtest.candles WHERE inst_id=$1;", SPOT
     )
     calls_after_first = fake.calls
 
-    await loader.backfill_candles(INST, BAR, since, until, client=client, page_limit=50)
+    await loader.backfill_candles(SPOT, BAR, since, until, client=client, page_limit=50)
     second_count = await pool.fetchval(
-        "SELECT count(*) FROM backtest.candles WHERE inst_id=$1;", INST
+        "SELECT count(*) FROM backtest.candles WHERE inst_id=$1;", SPOT
     )
 
     assert first_count == second_count
-    # Повторный проход начинается от самой ранней загруженной точки, а не от конца.
-    assert fake.calls > calls_after_first
+    # Запросы во второй раз всё же были (граница ряда проверяется по данным),
+    # но ни одной новой строки они не принесли.
+    assert fake.calls >= calls_after_first
+
+
+@requires_db
+async def test_already_loaded_history_gets_only_the_fresh_tail(bt_db, pool) -> None:
+    """Свежие свечи докачиваются к уже загруженному ряду, старое не перекачивается.
+
+    Именно этого не делал прежний однопроходный загрузчик: он начинал пагинацию
+    от самой ранней загруженной точки и шёл назад, поэтому ряд НИКОГДА не
+    пополнялся свежими свечами. Для сверки §13.2 это критично — её моменты
+    лежат позже BT_PERIOD_TO.
+    """
+    since = T0
+    middle = T0 + timedelta(days=5)
+    until = T0 + timedelta(days=8)
+    fake = FakeOkx(first=T0 - timedelta(days=2), last=until)
+    client = loader.OkxHistory(fake, pause_ms=0)
+
+    await loader.backfill_candles(SPOT, BAR, since, middle, client=client, page_limit=50)
+    before = await pool.fetchrow(
+        "SELECT count(*) AS n, max(open_time) AS hi FROM backtest.candles "
+        "WHERE inst_id=$1;",
+        SPOT,
+    )
+    assert before["hi"] <= middle
+
+    await loader.backfill_candles(SPOT, BAR, since, until, client=client, page_limit=50)
+    after = await pool.fetchrow(
+        "SELECT count(*) AS n, min(open_time) AS lo, max(open_time) AS hi "
+        "FROM backtest.candles WHERE inst_id=$1;",
+        SPOT,
+    )
+    assert after["hi"] > before["hi"], "свежие свечи не догрузились"
+    assert after["hi"] <= until
+    assert after["lo"] >= since
+    assert after["n"] > before["n"]
+
+
+@requires_db
+async def test_covered_period_costs_no_requests(bt_db, pool) -> None:
+    """Полностью покрытый период не порождает ни одного запроса к бирже."""
+    since = T0
+    until = T0 + timedelta(days=4)
+    fake = FakeOkx(first=T0 - timedelta(days=2), last=until)
+    client = loader.OkxHistory(fake, pause_ms=0)
+
+    await loader.backfill_candles(SPOT, BAR, since, until, client=client, page_limit=50)
+    # Границы ряда в БД совпали с периодом — второму проходу качать нечего.
+    row = await pool.fetchrow(
+        "SELECT min(open_time) AS lo, max(open_time) AS hi FROM backtest.candles "
+        "WHERE inst_id=$1;",
+        SPOT,
+    )
+    calls_before = fake.calls
+    await loader.backfill_candles(
+        SPOT, BAR, row["lo"], row["hi"], client=client, page_limit=50
+    )
+    assert fake.calls == calls_before
 
 
 @requires_db
@@ -200,9 +258,9 @@ async def test_unconfirmed_candles_never_reach_the_database(bt_db, pool) -> None
     fake = FakeOkx(first=T0, last=until, unconfirmed_tail=5)
     client = loader.OkxHistory(fake, pause_ms=0)
 
-    await loader.backfill_candles(INST, BAR, since, until, client=client, page_limit=50)
+    await loader.backfill_candles(SPOT, BAR, since, until, client=client, page_limit=50)
     newest = await pool.fetchval(
-        "SELECT max(open_time) FROM backtest.candles WHERE inst_id=$1;", INST
+        "SELECT max(open_time) FROM backtest.candles WHERE inst_id=$1;", SPOT
     )
     assert newest is not None
     assert newest <= until - timedelta(hours=5)
@@ -215,11 +273,11 @@ async def test_backfill_funding_respects_period(bt_db, pool) -> None:
     fake = FakeOkx(first=T0, last=until)
     client = loader.OkxHistory(fake, pause_ms=0)
 
-    await loader.backfill_funding(INST, since, until, client=client, page_limit=50)
+    await loader.backfill_funding(SWAP, since, until, client=client, page_limit=50)
     row = await pool.fetchrow(
         "SELECT count(*) AS n, min(funding_time) AS lo, max(funding_time) AS hi "
         "FROM backtest.funding WHERE inst_id=$1;",
-        INST,
+        SWAP,
     )
     assert row["n"] > 0
     assert row["lo"] >= since
@@ -242,7 +300,7 @@ async def test_rate_limit_code_is_retried() -> None:
 
     fake = Throttled()
     client = loader.OkxHistory(fake, pause_ms=0)
-    page = await client.candles_page(INST, BAR, None, 10)
+    page = await client.candles_page(SPOT, BAR, None, 10)
     assert page, "после кода 50011 запрос обязан быть повторён"
 
 
@@ -261,7 +319,7 @@ async def test_http_429_is_retried() -> None:
             return await super().get(path, params)
 
     client = loader.OkxHistory(Throttled(), pause_ms=0)
-    assert await client.candles_page(INST, BAR, None, 10)
+    assert await client.candles_page(SPOT, BAR, None, 10)
 
 
 async def test_refusal_by_signature_is_reported_verbatim() -> None:
@@ -279,7 +337,7 @@ async def test_refusal_by_signature_is_reported_verbatim() -> None:
         Forbidden(first=T0, last=T0 + timedelta(days=1)), pause_ms=0
     )
     with pytest.raises(loader.LoaderError) as excinfo:
-        await client.candles_page(INST, BAR, None, 10)
+        await client.candles_page(SPOT, BAR, None, 10)
     assert "403" in str(excinfo.value)
     assert "blocked by signature" in str(excinfo.value)
 
