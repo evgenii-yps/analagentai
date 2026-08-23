@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 from src.notify.agent import (
     NotifyConfig,
     SignalFormatConfig,
+    format_digest_message,
     rate_limit_reason,
     should_notify,
 )
@@ -371,3 +372,76 @@ def test_negative_thresholds_are_rejected_by_config() -> None:
         Settings(NOTIFY_HOLD_MIN=-1)
     with pytest.raises(ValueError, match="отрицательным"):
         Settings(NOTIFY_MAX_PER_HOUR=-1)
+
+
+# --- Сводное сообщение при исчерпанном потолке (§2 ТЗ 8.3) ------------------
+
+
+def _held(symbol: str, decision: str, strength: float) -> dict:
+    return {"symbol": symbol, "decision": decision, "strength": strength}
+
+
+def test_digest_orders_by_strength_descending() -> None:
+    """Порядок задаётся силой, а не тем, как сигналы попали в очередь."""
+    text = format_digest_message(
+        [
+            _held("ETH/USDT", "sell", 0.74),
+            _held("BTC/USDT", "buy", 0.91),
+            _held("SOL/USDT", "buy", 0.82),
+        ],
+        max_per_hour=6,
+    )
+    listed = [ln for ln in text.splitlines() if ln.startswith(("🟢", "🔴"))]
+    assert [ln.split(" —")[0].split()[-1] for ln in listed] == [
+        "BTC/USDT", "SOL/USDT", "ETH/USDT",
+    ], text
+
+
+def test_digest_names_the_number_held() -> None:
+    text = format_digest_message(
+        [_held("BTC/USDT", "buy", 0.9), _held("ETH/USDT", "sell", 0.8)], 6
+    )
+    assert "Придержано сигналов: 2" in text
+    assert "Потолок 6 уведомлений в час исчерпан" in text
+
+
+def test_digest_keeps_the_closing_line() -> None:
+    """Замыкающая строка обязательна и в сводке: это тоже уведомление."""
+    text = format_digest_message([_held("BTC/USDT", "buy", 0.9)], 6)
+    assert text.rstrip().endswith("Решение за вами. Система не торгует сама.")
+
+
+def test_digest_names_what_did_not_fit() -> None:
+    """Остаток назван числом, а не отброшен молча."""
+    entries = [_held(f"T{i}/USDT", "buy", 0.9 - i / 100) for i in range(25)]
+    text = format_digest_message(entries, 6, max_listed=20)
+    assert "Придержано сигналов: 25" in text
+    assert "и ещё 5" in text
+    assert len([ln for ln in text.splitlines() if ln.startswith(("🟢", "🔴"))]) == 20
+
+
+def test_digest_says_nothing_extra_when_everything_fits() -> None:
+    text = format_digest_message([_held("BTC/USDT", "buy", 0.9)], 6, max_listed=20)
+    assert "и ещё" not in text
+
+
+def test_digest_marks_direction() -> None:
+    text = format_digest_message(
+        [_held("BTC/USDT", "buy", 0.9), _held("ETH/USDT", "sell", 0.8)], 6
+    )
+    assert "🟢 BTC/USDT — ПОКУПАТЬ, 90%" in text
+    assert "🔴 ETH/USDT — ПРОДАВАТЬ, 80%" in text
+
+
+def test_cap_reason_is_recognisable_without_parsing_text() -> None:
+    """Потолок отличается от выдержки сравнением, а не разбором сообщения.
+
+    В сводку идёт придержанное ПОТОЛКОМ; придержанное выдержкой — нет.
+    Различать их по подстроке в человеческом тексте нельзя: текст меняется.
+    """
+    from src.notify.agent import _CAP_REASON_PREFIX
+
+    cap = rate_limit_reason(None, _NOW, 6, _GUARD)
+    hold = rate_limit_reason(_NOW - timedelta(minutes=1), _NOW, 0, _GUARD)
+    assert cap is not None and cap.startswith(_CAP_REASON_PREFIX)
+    assert hold is not None and not hold.startswith(_CAP_REASON_PREFIX)

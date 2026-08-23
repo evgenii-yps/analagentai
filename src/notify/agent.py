@@ -26,6 +26,20 @@ _HEARTBEAT_TTL = 300
 # Скользящее окно отправленных уведомлений (§2 ТЗ 8.3): один ключ на все
 # инструменты — потолок общий, потому что человек читает один поток.
 _SENT_KEY = "notify:sent:hour"
+# Очередь сигналов, придержанных ПОТОЛКОМ, и момент последней сводки
+# (§2 ТЗ 8.3). Придержанные ВЫДЕРЖКОЙ сюда не попадают: выдержка — это
+# нормальный ход по одному токену, а не переполнение.
+_DIGEST_KEY = "notify:digest:pending"
+_DIGEST_LAST_KEY = "notify:digest:last"
+# Сводка выходит не чаще одного раза в час: «одно сводное сообщение» на
+# исчерпанный потолок, иначе сводки сами стали бы потоком.
+_DIGEST_EVERY_SEC = 3600
+# Потолок строк в сводке: в сообщение Telegram помещается около 4096
+# знаков, а сводка из полусотни строк перестала бы читаться.
+_DIGEST_MAX_LISTED = 20
+# Начало причины «сработал потолок». Вынесено константой, чтобы отличать
+# потолок от выдержки сравнением, а не разбором текста сообщения.
+_CAP_REASON_PREFIX = "потолок уведомлений в час"
 
 # Порядок агентов, участвующих в решении (совпадает с src.decision.agent.AGENTS).
 AGENT_ORDER: tuple[str, ...] = ("market", "liquidity", "futures")
@@ -135,7 +149,7 @@ def rate_limit_reason(
             return f"выдержка по инструменту: осталось {left} с из {int(cfg.hold_sec)}"
     if cfg.max_per_hour > 0 and sent_last_hour >= cfg.max_per_hour:
         return (
-            f"потолок уведомлений в час: отправлено {sent_last_hour} "
+            f"{_CAP_REASON_PREFIX}: отправлено {sent_last_hour} "
             f"из {cfg.max_per_hour}"
         )
     return None
@@ -349,6 +363,45 @@ def format_signal_message(
     return "\n".join(lines)
 
 
+def format_digest_message(
+    entries: list[dict[str, Any]], max_per_hour: int, max_listed: int = _DIGEST_MAX_LISTED
+) -> str:
+    """Сводное сообщение о сигналах, придержанных потолком (§2 ТЗ 8.3).
+
+    Чистая функция: список уже отсортированных быть не обязан — сортировка по
+    убыванию силы делается здесь, чтобы порядок не зависел от того, в каком
+    порядке сигналы попали в очередь.
+
+    СИЛА — та же величина, по которой сигнал прошёл порог отправки: индекс
+    согласия либо калиброванная вероятность в калиброванном режиме. Брать здесь
+    другую величину нельзя: человек сравнивал бы строки сводки по одной шкале,
+    а отбирались они по другой.
+
+    Список ограничен ``max_listed`` строками: в сообщение Telegram помещается
+    около 4096 знаков, и сводка из полусотни строк перестала бы читаться —
+    ровно то, от чего защищает потолок. Остаток назван числом, а не отброшен
+    молча.
+    """
+    ordered = sorted(entries, key=lambda e: float(e.get("strength") or 0.0), reverse=True)
+    lines = [
+        f"📋 <b>Придержано сигналов: {len(ordered)}</b>",
+        f"Потолок {max_per_hour} уведомлений в час исчерпан. "
+        f"Ниже — придержанные сигналы по убыванию силы.",
+        "",
+    ]
+    for entry in ordered[:max_listed]:
+        emoji = "🟢" if entry.get("decision") == "buy" else "🔴"
+        action = "ПОКУПАТЬ" if entry.get("decision") == "buy" else "ПРОДАВАТЬ"
+        strength = round(float(entry.get("strength") or 0.0) * 100)
+        lines.append(f"{emoji} {entry.get('symbol', '?')} — {action}, {strength}%")
+    hidden = len(ordered) - max_listed
+    if hidden > 0:
+        lines.append(f"…и ещё {hidden} — не поместились в сообщение")
+    lines.append("")
+    lines.append(_CLOSING_LINE)
+    return "\n".join(lines)
+
+
 class NotifyAgent:
     """Сервис уведомлений: читает сильные сигналы и шлёт их в Telegram."""
 
@@ -417,6 +470,9 @@ class NotifyAgent:
         )
         for signal in signals:
             await self._process_signal(signal)
+        # Сводка — после разбора всех сигналов итерации: иначе в неё попадала бы
+        # часть очереди, а «одно сводное сообщение» превратилось бы в несколько.
+        await self._flush_digest(datetime.now(UTC))
 
     async def _process_signal(self, signal: dict[str, Any]) -> None:
         """Решает, слать ли конкретный сигнал, и при необходимости шлёт."""
@@ -455,6 +511,12 @@ class NotifyAgent:
         )
         if limited is not None:
             await db.mark_signal_absorbed(signal["id"])
+            # Придержанное ПОТОЛКОМ не пропадает молча: §2 ТЗ 8.3 требует одного
+            # сводного сообщения. Придержанное ВЫДЕРЖКОЙ в сводку не идёт —
+            # это нормальный ход по одному токену, а не переполнение, и попав
+            # туда, оно превратило бы сводку в тот же поток.
+            if limited.startswith(_CAP_REASON_PREFIX):
+                await self._queue_for_digest(signal, instrument_id)
             self._log.info(
                 "Уведомление придержано защитой от потока",
                 signal_id=signal["id"],
@@ -501,6 +563,85 @@ class NotifyAgent:
         """Сохраняет в Redis последнее отправленное решение и время."""
         data = json.dumps({"decision": decision, "sent_ts": sent_ts.isoformat()})
         await get_redis().set(f"notify:last:{instrument_id}", data)
+
+    def _strength(self, signal: dict[str, Any]) -> float:
+        """Сила сигнала — та же величина, по которой он отбирался к отправке."""
+        if self.cfg.use_calibrated:
+            calibrated = signal.get("calibrated_probability")
+            if calibrated is not None:
+                return float(calibrated)
+        return float(signal.get("probability") or 0.0)
+
+    async def _queue_for_digest(
+        self, signal: dict[str, Any], instrument_id: int
+    ) -> None:
+        """Кладёт придержанный потолком сигнал в очередь сводного сообщения."""
+        try:
+            fmt_cfg = await self._format_config(instrument_id)
+            entry = json.dumps({
+                "symbol": fmt_cfg.symbol,
+                "decision": signal["decision"],
+                "strength": self._strength(signal),
+            })
+            redis = get_redis()
+            await redis.rpush(_DIGEST_KEY, entry)
+            # Срок жизни заведомо больше периода сводки: очередь без сводки не
+            # должна копиться вечно, если сервис остановлен.
+            await redis.expire(_DIGEST_KEY, _DIGEST_EVERY_SEC * 2)
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning(
+                "Не удалось поставить сигнал в очередь сводки", error=str(exc)
+            )
+
+    async def _flush_digest(self, now: datetime) -> None:
+        """Отправляет ОДНО сводное сообщение о придержанных потолком сигналах.
+
+        Сводка выходит не чаще одного раза в час: она сама является сообщением,
+        и без ограничения сводки стали бы тем самым потоком, от которого
+        защищает потолок. В счёт потолка сводка НЕ идёт — иначе переполнение
+        отнимало бы слот у обычных уведомлений, то есть наказывало бы за то,
+        о чём отчитывается. Потолок пользовательских сообщений в час поэтому
+        равен ``max_per_hour`` плюс одна сводка.
+        """
+        try:
+            redis = get_redis()
+            if await redis.llen(_DIGEST_KEY) == 0:
+                return
+            last_raw = await redis.get(_DIGEST_LAST_KEY)
+            if last_raw:
+                elapsed = (now - datetime.fromisoformat(last_raw)).total_seconds()
+                if elapsed < _DIGEST_EVERY_SEC:
+                    return
+            raw_entries = await redis.lrange(_DIGEST_KEY, 0, -1)
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning("Не удалось прочитать очередь сводки", error=str(exc))
+            return
+
+        entries = []
+        for raw in raw_entries:
+            try:
+                entries.append(json.loads(raw))
+            except Exception:  # noqa: BLE001, S112
+                continue
+        if not entries:
+            return
+
+        sent = await send_message(
+            format_digest_message(entries, self.cfg.max_per_hour)
+        )
+        if not sent:
+            # Не отправилось — очередь НЕ чистим: сводка уйдёт следующей
+            # итерацией. Потерять её значит потерять единственное упоминание
+            # придержанных сигналов.
+            self._log.warning("Сводка не отправлена, повтор позже", held=len(entries))
+            return
+        try:
+            redis = get_redis()
+            await redis.delete(_DIGEST_KEY)
+            await redis.set(_DIGEST_LAST_KEY, now.isoformat(), ex=_DIGEST_EVERY_SEC * 2)
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning("Сводка отправлена, очередь не очищена", error=str(exc))
+        self._log.info("Отправлена сводка придержанных сигналов", held=len(entries))
 
     async def _sent_last_hour(self, now: datetime) -> int:
         """Сколько уведомлений ушло за последний час (по всем инструментам).
