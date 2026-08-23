@@ -254,46 +254,71 @@ def test_agents_stale_marked() -> None:
     assert "Работают 3 агента из 5. News и OnChain пока не реализованы." in text
 
 
-def test_stats_five_blocks_and_small_sample_warning() -> None:
-    block1 = {"n": 5, "buy": 3, "sell": 2, "wait": 0, "sr_buy": 0.66,
-              "sr_sell": 0.5, "avg_pnl": 0.4, "avg_dd": 0.2}
-    block2 = {"n": 300, "buy": 150, "sell": 150, "wait": 0, "sr_buy": 0.55,
-              "sr_sell": 0.52, "avg_pnl": 0.3, "avg_dd": 0.25}
-    block5 = {"sent": 12, "absorbed": 288}
-    text = handlers.render_stats(block1, block2, block5, "7d", _NOW)
-    for block in ("Блок 1", "Блок 2", "Блок 3", "Блок 4", "Блок 5"):
-        assert block in text
-    assert "Ориентируйтесь на блок 1" in text
-    assert "Данных пока мало" in text
-    assert "Реально отправлено: 12" in text
+# /stats переписан §4 ТЗ 8.3: попадания за 7 и 30 дней по ВЫБРАННОМУ горизонту,
+# число наблюдений рядом с каждым процентом, оговорка при N < 60, только текущая
+# версия логики с датой начала. Прежние проверки описывали разбивку «Блок 1…5»,
+# которую ТЗ прямо заменяет.
+
+def _stats_block(n: int, **over: object) -> dict:
+    block = {
+        "n": n, "buy": n // 2, "sell": n - n // 2, "wait": 0,
+        "sr_buy": 0.66, "sr_sell": 0.5, "n_buy": n // 2, "n_sell": n - n // 2,
+        "avg_pnl": 0.4, "avg_dd": 0.2,
+    }
+    block.update(over)
+    return block
 
 
-def test_stats_mixed_versions_warning() -> None:
-    block = {"n": 40, "buy": 20, "sell": 20, "wait": 0, "sr_buy": 0.6,
-             "sr_sell": 0.5, "avg_pnl": 0.4, "avg_dd": 0.2}
-    text = handlers.render_stats(
-        block, block, {"sent": 1, "absorbed": 2}, "7d", _NOW,
-        logic_version=2, mixed_versions=True,
-    )
-    assert "смешаны две версии логики" in text
-    assert "версия логики 2" in text
+def test_stats_shows_both_periods_and_chosen_horizon() -> None:
+    blocks = [
+        ("за 7 дней", _stats_block(80), _stats_block(300)),
+        ("за 30 дней", _stats_block(200), _stats_block(1200)),
+    ]
+    text = handlers.render_stats(blocks, horizon_h=12, now=_NOW)
+    assert "горизонт 12 ч" in text
+    assert "за 7 дней" in text
+    assert "за 30 дней" in text
+    assert "Честная выборка" in text
+    assert "Все сигналы подряд" in text
 
 
-def test_stats_single_version_no_warning() -> None:
-    block = {"n": 40, "buy": 20, "sell": 20, "wait": 0, "sr_buy": 0.6,
-             "sr_sell": 0.5, "avg_pnl": 0.4, "avg_dd": 0.2}
-    text = handlers.render_stats(
-        block, block, {"sent": 1, "absorbed": 2}, "7d", _NOW,
-        logic_version=2, mixed_versions=False,
-    )
-    assert "смешаны две версии" not in text
+def test_stats_puts_the_count_next_to_every_percent() -> None:
+    """§4 ТЗ: процент без знаменателя одинаково читается при 3 и при 300."""
+    blocks = [("за 7 дней", _stats_block(80, sr_buy=0.62, n_buy=84), _stats_block(90))]
+    text = handlers.render_stats(blocks, horizon_h=4, now=_NOW)
+    assert "buy 62% из 84" in text
+
+
+def test_stats_small_sample_warning() -> None:
+    """N < 60 → оговорка «наблюдений мало, цифра ненадёжна»."""
+    blocks = [("за 7 дней", _stats_block(12), _stats_block(300))]
+    text = handlers.render_stats(blocks, horizon_h=4, now=_NOW)
+    assert "наблюдений мало, цифра ненадёжна" in text
 
 
 def test_stats_no_warning_when_enough_sample() -> None:
-    block = {"n": 40, "buy": 20, "sell": 20, "wait": 0, "sr_buy": 0.6,
-             "sr_sell": 0.5, "avg_pnl": 0.4, "avg_dd": 0.2}
-    text = handlers.render_stats(block, block, {"sent": 1, "absorbed": 2}, "30d", _NOW)
-    assert "Данных пока мало" not in text
+    blocks = [("за 7 дней", _stats_block(80), _stats_block(300))]
+    text = handlers.render_stats(blocks, horizon_h=4, now=_NOW)
+    assert "наблюдений мало" not in text
+
+
+def test_stats_names_the_version_and_when_it_started() -> None:
+    """Версии логики не смешиваются: показана текущая и дата начала (§4, §7)."""
+    blocks = [("за 7 дней", _stats_block(80), _stats_block(300))]
+    text = handlers.render_stats(
+        blocks, horizon_h=4, now=_NOW,
+        logic_version=5,
+        version_started_at=datetime(2026, 8, 22, 22, 59, tzinfo=UTC),
+    )
+    assert "Версия логики 5" in text
+    assert "действует с 22.08.2026 22:59 UTC" in text
+    assert "Прежние версии не учтены." in text
+
+
+def test_stats_empty_sample_says_so() -> None:
+    blocks = [("за 7 дней", _stats_block(0), _stats_block(0))]
+    text = handlers.render_stats(blocks, horizon_h=4, now=_NOW)
+    assert "закрытых сигналов пока нет" in text
 
 
 def test_split_message_splits_long_text() -> None:

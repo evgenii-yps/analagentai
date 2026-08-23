@@ -500,6 +500,7 @@ class NotifyAgent:
         # сигналами по биткоину. Символы инструментов не меняются, поэтому кэш
         # без срока жизни: один запрос к БД на инструмент за всё время работы.
         self._symbols: dict[int, str] = {}
+        self._swap_ids: dict[int, int] = {}
         # Получатели уведомлений — белый список чатов бота (§1 ТЗ 8.3:
         # настройки принадлежат чату). По умолчанию это единственный чат
         # владельца, и тогда поведение ровно то же, что было до этапа.
@@ -702,6 +703,18 @@ class NotifyAgent:
         которых в нём не было, нельзя. Не нашлось — остаётся ``None``, и текст
         честно скажет, что показатели не сохранились.
         """
+        # РЫНКИ РАЗНЫЕ. Market и Liquidity работают по СПОТУ, Futures — по
+        # КОНТРАКТУ (Этап 7.4), и его выводы лежат в agent_outputs под другим
+        # инструментом. Искать их по инструменту сигнала (это спот) значило бы
+        # не найти никогда и писать «показатели не сохранились» в каждом
+        # сообщении. Соответствие агент → инструмент здесь то же, что у
+        # Decision Agent.
+        swap_id = await self._swap_instrument_id(instrument_id)
+        by_agent = {
+            "market": instrument_id,
+            "liquidity": instrument_id,
+            "futures": swap_id if swap_id is not None else instrument_id,
+        }
         result: dict[str, dict[str, Any] | None] = {}
         for entry in normalize_payload(signal.get("agents_payload")):
             agent = str(entry.get("agent"))
@@ -715,13 +728,37 @@ class NotifyAgent:
                 result[agent] = None
                 continue
             try:
-                result[agent] = await db.get_agent_metrics(agent, instrument_id, ts)
+                result[agent] = await db.get_agent_metrics(
+                    agent, by_agent.get(agent, instrument_id), ts
+                )
             except Exception as exc:  # noqa: BLE001
                 self._log.warning(
                     "Метрики агента не прочитаны", agent=agent, error=str(exc)
                 )
                 result[agent] = None
         return result
+
+    async def _swap_instrument_id(self, spot_instrument_id: int) -> int | None:
+        """Инструмент-контракт того же токена. Кэшируется: состав не меняется."""
+        cached = self._swap_ids.get(spot_instrument_id)
+        if cached is not None:
+            return cached
+        try:
+            spot_symbol = await db.get_instrument_symbol(spot_instrument_id)
+            if spot_symbol is None:
+                return None
+            pair = next(
+                (p for p in settings.symbol_pairs if p.spot == spot_symbol), None
+            )
+            if pair is None:
+                return None
+            swap_id = await db.get_instrument_id(pair.swap)
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning("Инструмент-контракт не найден", error=str(exc))
+            return None
+        if swap_id is not None:
+            self._swap_ids[spot_instrument_id] = int(swap_id)
+        return swap_id
 
     async def _get_last_state(
         self, chat_id: int, instrument_id: int

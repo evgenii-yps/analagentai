@@ -824,6 +824,12 @@ class DB:
             None if quiet_to is None else int(quiet_to),
         )
 
+    async def get_instrument_id(self, symbol: str) -> int | None:
+        """Идентификатор инструмента по символу или ``None``, если его нет."""
+        return await self.pool.fetchval(
+            "SELECT id FROM instruments WHERE symbol = $1;", symbol
+        )
+
     async def get_agent_metrics(
         self, agent: str, instrument_id: int, ts: datetime
     ) -> dict[str, Any] | None:
