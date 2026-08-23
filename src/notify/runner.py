@@ -34,6 +34,9 @@ async def run() -> None:
     # уведомлений тоже гарантирует их наличие (порядок старта сервисов не задан).
     await db.ensure_calibration_schema()
     await db.ensure_signals_inertia()
+    # Настройки пользователя (§1 ТЗ 8.3): порядок старта сервисов не задан,
+    # поэтому наличие таблицы гарантирует и тот, кто её только читает.
+    await db.ensure_user_settings_schema()
 
     if not settings.telegram_configured:
         log.warning("TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID не заданы — сервис простаивает")
@@ -52,6 +55,7 @@ async def run() -> None:
             min_calibrated=settings.NOTIFY_MIN_CALIBRATED,
             hold_sec=settings.NOTIFY_HOLD_MIN * 60,
             max_per_hour=settings.NOTIFY_MAX_PER_HOUR,
+            recipients=[int(chat) for chat in settings.bot_allowed_chat_ids],
         )
         tasks = [asyncio.create_task(agent.run(), name="notify")]
 

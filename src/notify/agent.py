@@ -12,14 +12,24 @@ import json
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
-from zoneinfo import ZoneInfo
 
 import structlog
 
 from src.core.config import settings
 from src.core.db import db
+from src.core.instruments import horizon_label
 from src.core.redis_client import get_redis
+from src.core.user_settings import (
+    UserSettings,
+    default_settings,
+    user_filter_reason,
+)
 from src.notify.telegram import send_message
+from src.notify.wording import (
+    agent_paragraph,
+    agent_silent_paragraph,
+    is_confident,
+)
 
 # TTL heartbeat-ключа (секунды).
 _HEARTBEAT_TTL = 300
@@ -37,6 +47,10 @@ _DIGEST_EVERY_SEC = 3600
 # Потолок строк в сводке: в сообщение Telegram помещается около 4096
 # знаков, а сводка из полусотни строк перестала бы читаться.
 _DIGEST_MAX_LISTED = 20
+# Кэш настроек получателя. Короткий намеренно: человек меняет их из
+# бота в любой момент, и уведомления обязаны это заметить без
+# перезапуска сервиса.
+_SETTINGS_CACHE_SEC = 30
 # Начало причины «сработал потолок». Вынесено константой, чтобы отличать
 # потолок от выдержки сравнением, а не разбором текста сообщения.
 _CAP_REASON_PREFIX = "потолок уведомлений в час"
@@ -80,6 +94,10 @@ class SignalFormatConfig:
     symbol: str
     tz_name: str
     primary_horizon: str
+    # Горизонт, выбранный ПОЛЬЗОВАТЕЛЕМ (§1 ТЗ 8.3). В отборе не участвует —
+    # сигнал един для всех горизонтов (Этап 8.1) — и влияет только на то, какой
+    # горизонт назван в тексте.
+    horizon_h: int = 4
 
 
 def should_notify(
@@ -160,6 +178,11 @@ _TZ_LABELS = {"Europe/Moscow": "МСК"}
 
 # Заключительная строка сообщения — обязательна и неизменна (ТЗ §6).
 _CLOSING_LINE = "Решение за вами. Система не торгует сама."
+# §3 ТЗ 8.3: обе оговорки присутствуют в КАЖДОМ сигнале и сокращению не
+# подлежат. Вынесены константами, чтобы «сократить на одну строку» нельзя было
+# случайно — правку константы видно в разборе изменений.
+CLOSING_LINE = "Решение за вами, система не торгует сама."
+UNPLUGGED_LINE = "Новостной и ончейн-анализ пока не подключены."
 
 
 def normalize_payload(agents_payload: Any) -> list[dict[str, Any]]:
@@ -247,9 +270,18 @@ def horizon_ru(horizon: str) -> str:
 
 
 def format_price(price: float, quote: str) -> str:
-    """Цена с разделением тысяч пробелом: ``64210.0`` → ``64 210 USDT``."""
-    grouped = f"{round(float(price)):,}".replace(",", " ")
-    return f"{grouped} {quote}"
+    """Цена с разделением тысяч пробелом: ``64210.0`` → ``64 210 USDT``.
+
+    Дробная часть показывается только у дешёвых инструментов. Округление до
+    целого было верно, пока в системе был один биткоин; с Этапа 8.1 в составе
+    DOGE и XRP, и «0 USDT» вместо «0.1234 USDT» — не округление, а потеря цены.
+    """
+    value = float(price)
+    magnitude = abs(value)
+    if magnitude >= 100:
+        return f"{round(value):,}".replace(",", " ") + f" {quote}"
+    digits = 4 if magnitude >= 1 else 6
+    return f"{value:.{digits}f}".rstrip("0").rstrip(".") + f" {quote}"
 
 
 def _split_symbol(symbol: str) -> tuple[str, str]:
@@ -286,81 +318,110 @@ def format_calibrated_line(signal: dict[str, Any]) -> str | None:
     percent = round(float(value) * 100)
     built_at = signal.get("calibration_built_at")
     sample = signal.get("calibration_sample_size")
-    marks: list[str] = []
-    if isinstance(built_at, datetime):
-        marks.append(f"кривая от {built_at.strftime('%d.%m')}")
-    if sample is not None:
-        marks.append(f"N={int(sample)}")
-    suffix = f"  [{', '.join(marks)}]" if marks else ""
-    return f"Вероятность успеха (по истории): <b>{percent}%</b>{suffix}"
+    since = built_at.strftime("%d.%m") if isinstance(built_at, datetime) else None
+    if sample is not None and since:
+        suffix = f" (по {int(sample)} наблюдениям с {since})"
+    elif sample is not None:
+        suffix = f" (по {int(sample)} наблюдениям)"
+    elif since:
+        suffix = f" (по наблюдениям с {since})"
+    else:
+        suffix = ""
+    return f"Такие сигналы сбывались раньше в {percent}% случаев{suffix}"
 
 
 def format_signal_message(
     signal: dict[str, Any],
     price: float | None,
     cfg: SignalFormatConfig,
+    metrics_by_agent: dict[str, dict[str, Any] | None] | None = None,
+    target_block: list[str] | None = None,
 ) -> str:
-    """Самодостаточное HTML-сообщение о сигнале (ТЗ §6). Чистая функция.
+    """Развёрнутый текст сигнала человеческим языком (§3 ТЗ 8.3). Чистая функция.
 
-    Показывает мнение каждого агента, ЯВНО отмечает отсутствующих (сигнал на
-    двух агентах из трёх слабее — человек должен это видеть), пересчитанную
-    согласованность, цену на момент сигнала, горизонт оценки. Если цены нет —
-    строка про цену пропускается, сообщение всё равно формируется.
+    СОБИРАЕТСЯ ИЗ БЛОКОВ, а не из плоского списка строк. Это не стилистика:
+    §3 требует предусмотреть место под блок цели так, чтобы Этап 8.2 добавлял
+    его, НЕ переписывая сборку текста. Блок цели уже стоит в порядке блоков и
+    сейчас пуст; пустые блоки выпадают из результата. Этапу 8.2 останется
+    передать ``target_block`` — ни одна строка этой функции не изменится.
+
+    ``metrics_by_agent`` — метрики каждого высказавшегося агента, взятые у
+    ТОГО САМОГО вывода, который участвовал в решении. Именно из них строится
+    объяснение (:mod:`src.notify.wording`); выдумывать наблюдения, которых в
+    метриках нет, запрещено (§7 ТЗ). Метрик нет — так и написано, а не
+    заменено правдоподобной фразой.
+
+    Внутренние термины («индекс согласия», «перцентиль», ``logic_version``,
+    ``confidence``) в тексте не появляются: он предназначен человеку, который
+    биржевых терминов не знает.
     """
-    base, quote = _split_symbol(cfg.symbol)
-    decision = signal["decision"]
-    if decision == "buy":
-        emoji, action = "🟢", "ПОКУПАТЬ"
-    else:
-        emoji, action = "🔴", "ПРОДАВАТЬ"
-    conviction = round(float(signal["probability"]) * 100)
+    base, _quote = _split_symbol(cfg.symbol)
+    action = "ПОКУПКА" if signal["decision"] == "buy" else "ПРОДАЖА"
+    metrics_by_agent = metrics_by_agent or {}
+
+    header = [
+        f"<b>{base} · {action} · горизонт {horizon_ru(horizon_label(cfg.horizon_h))}</b>"
+    ]
+
+    price_block = [] if price is None else [f"Цена сейчас: {format_price(price, _quote)}"]
+    # Единственное число, которое система называет вероятностью, и только когда
+    # оно выведено из фактических исходов (Этап 7.3 §4.1). Нет кривой — нет
+    # строки: подставлять вместо неё что-то похожее запрещено.
+    history_line = format_calibrated_line(signal)
+    if history_line:
+        price_block.append(history_line)
+
+    # --- Блок цели (Этап 8.2). Сейчас пуст: таблиц risk_targets и
+    # signal_targets ещё нет, а «Цель», «Вероятность достижения», «Возможная
+    # просадка» и «Комиссия» без них были бы выдуманными числами.
+    goal_block = list(target_block or ())
 
     payload = normalize_payload(signal.get("agents_payload"))
     present = {e.get("agent") for e in payload}
-
-    # Этап 7.3 §4.6: величина, которую считает Decision Agent, называется
-    # ИНДЕКСОМ СОГЛАСИЯ. Слово «вероятность» появляется ТОЛЬКО отдельной строкой
-    # и ТОЛЬКО когда она выведена из фактических исходов (есть кривая).
-    lines = [
-        f"{emoji} <b>СИГНАЛ: {action} {base}</b>",
-        f"Индекс согласия: <b>{conviction}%</b>",
-    ]
-    calibrated_line = format_calibrated_line(signal)
-    if calibrated_line:
-        lines.append(calibrated_line)
-    if price is not None:
-        lines.append(f"Цена сейчас: {format_price(price, quote)}")
-
-    lines.append("")
-    lines.append("Мнения агентов:")
+    reasons = ["Почему такой вывод:"]
     for name in AGENT_ORDER:
         entry = next((e for e in payload if e.get("agent") == name), None)
         if entry is not None:
-            lines.append(_agent_line(entry))
-    # Отсутствующие агенты — отдельными явными строками (важнее всего прочего).
+            reasons.append(agent_paragraph(
+                name,
+                str(entry.get("signal")),
+                float(entry.get("confidence", 0.0)),
+                metrics_by_agent.get(name),
+            ))
+    # Молчащий агент называется ЯВНО и НИКОГДА не пропускается (§3, §7 ТЗ):
+    # отсутствие мнения — это тоже сведение о качестве сигнала, и человек,
+    # не увидев строки, счёл бы, что высказались все.
     for name in AGENT_ORDER:
         if name not in present:
-            lines.append(
-                f"• {AGENT_RU[name]}: нет данных, в решении не участвовал"
-            )
+            reasons.append(agent_silent_paragraph(name))
 
-    agreement = compute_agreement(payload)
-    lines.append("")
-    if agreement is not None:
-        lines.append(
-            f"Согласованность: {agreement:.2f} — {agreement_wording(agreement)}"
-        )
-    lines.append(f"Горизонт оценки: {horizon_ru(cfg.primary_horizon)}")
+    agreement_block = _agreement_block(payload)
 
-    ts: datetime = signal["ts"]
-    local_ts = ts.astimezone(ZoneInfo(cfg.tz_name))
-    label = _TZ_LABELS.get(cfg.tz_name) or local_ts.tzname() or cfg.tz_name
-    when = local_ts.strftime("%d.%m.%Y %H:%M")
-    lines.append(f"Сигнал #{signal['id']} · {when} {label}")
+    disclaimer = [
+        "Важно: система не предсказывает цену. Она оценивает вероятность "
+        "и уменьшает неопределённость — гарантий не даёт. " + CLOSING_LINE,
+        "",
+        UNPLUGGED_LINE,
+    ]
 
-    lines.append("")
-    lines.append(_CLOSING_LINE)
-    return "\n".join(lines)
+    blocks = [header, price_block, goal_block, reasons, agreement_block, disclaimer]
+    return "\n\n".join("\n".join(block) for block in blocks if block)
+
+
+def _agreement_block(payload: list[dict[str, Any]]) -> list[str]:
+    """Строка «Согласие агентов: N из M уверенно, K слабо».
+
+    Считаются агенты, которые ВЫСКАЗАЛИСЬ: молчащий не входит ни в уверенные,
+    ни в слабые — он вообще не голосовал, и включать его в знаменатель значило
+    бы засчитывать молчание за мнение.
+    """
+    voiced = [e for e in payload if e.get("signal") in SIGNAL_VALUE]
+    if not voiced:
+        return []
+    confident = sum(1 for e in voiced if is_confident(float(e.get("confidence", 0.0))))
+    weak = len(voiced) - confident
+    tail = f", {weak} слабо" if weak else ""
+    return [f"Согласие агентов: {confident} из {len(voiced)} уверенно{tail}."]
 
 
 def format_digest_message(
@@ -418,6 +479,7 @@ class NotifyAgent:
         min_calibrated: float = 0.55,
         hold_sec: float = 0.0,
         max_per_hour: int = 0,
+        recipients: tuple[int, ...] | list[int] | None = None,
     ) -> None:
         self.interval = interval
         self.cfg = NotifyConfig(
@@ -438,6 +500,13 @@ class NotifyAgent:
         # сигналами по биткоину. Символы инструментов не меняются, поэтому кэш
         # без срока жизни: один запрос к БД на инструмент за всё время работы.
         self._symbols: dict[int, str] = {}
+        # Получатели уведомлений — белый список чатов бота (§1 ТЗ 8.3:
+        # настройки принадлежат чату). По умолчанию это единственный чат
+        # владельца, и тогда поведение ровно то же, что было до этапа.
+        self.recipients: tuple[int, ...] = tuple(
+            int(chat) for chat in sorted(recipients or ()) if str(chat).strip()
+        )
+        self._settings_cache: dict[int, tuple[UserSettings, datetime]] = {}
         self._log = structlog.get_logger().bind(component="notify")
 
     async def _format_config(self, instrument_id: int) -> SignalFormatConfig:
@@ -472,10 +541,18 @@ class NotifyAgent:
             await self._process_signal(signal)
         # Сводка — после разбора всех сигналов итерации: иначе в неё попадала бы
         # часть очереди, а «одно сводное сообщение» превратилось бы в несколько.
-        await self._flush_digest(datetime.now(UTC))
+        now = datetime.now(UTC)
+        for chat_id in self.recipients:
+            await self._flush_digest(chat_id, now)
 
     async def _process_signal(self, signal: dict[str, Any]) -> None:
-        """Решает, слать ли конкретный сигнал, и при необходимости шлёт."""
+        """Разбирает сигнал и рассылает его тем, кому он нужен (§2 ТЗ 8.3).
+
+        Получателей может быть несколько (белый список чатов), и настройки у
+        каждого свои, поэтому решение «слать или нет» принимается ДЛЯ КАЖДОГО
+        ОТДЕЛЬНО. Признак «сигнал обработан» ставится один раз в конце:
+        ``notified`` — если ушёл хотя бы одному, иначе «поглощён».
+        """
         instrument_id = signal["instrument_id"]
 
         # Деградированный режим (Задача A2): агентов со свежим содержательным
@@ -493,62 +570,168 @@ class NotifyAgent:
             )
             return
 
-        last_decision, last_sent_ts = await self._get_last_state(instrument_id)
         now = datetime.now(UTC)
+        strength = self._strength(signal)
+        metrics_by_agent: dict[str, dict[str, Any] | None] | None = None
+        price_loaded = False
+        price: float | None = None
+        sent_any = False
 
-        if not should_notify(signal, last_decision, last_sent_ts, now, self.cfg):
-            # Дубль/в пределах cooldown — «поглощаем» сигнал, чтобы не висел.
-            # notified_at НЕ ставим: отправки в Telegram здесь не было.
-            await db.mark_signal_absorbed(signal["id"])
-            return
+        for chat_id in self.recipients:
+            user = await self._user_settings(chat_id)
 
-        # Защита от потока (§2 ТЗ 8.3). Придержанный сигнал «поглощается», а не
-        # откладывается: уведомление о рыночном сигнале имеет смысл в свой
-        # момент, а через час это уже не уведомление, а история. Сигнал при этом
-        # сохранён и попадает в оценку — теряется только сообщение.
-        limited = rate_limit_reason(
-            last_sent_ts, now, await self._sent_last_hour(now), self.cfg
-        )
-        if limited is not None:
-            await db.mark_signal_absorbed(signal["id"])
-            # Придержанное ПОТОЛКОМ не пропадает молча: §2 ТЗ 8.3 требует одного
-            # сводного сообщения. Придержанное ВЫДЕРЖКОЙ в сводку не идёт —
-            # это нормальный ход по одному токену, а не переполнение, и попав
-            # туда, оно превратило бы сводку в тот же поток.
-            if limited.startswith(_CAP_REASON_PREFIX):
-                await self._queue_for_digest(signal, instrument_id)
-            self._log.info(
-                "Уведомление придержано защитой от потока",
-                signal_id=signal["id"],
-                instrument_id=instrument_id,
-                reason=limited,
+            # ПОРЯДОК ПРОВЕРОК ЗАДАН §2 ТЗ и не случаен: сначала отсекается то,
+            # что человеку не нужно, и только потом применяются ограничения
+            # потока. Иначе сигнал по невыбранному токену занимал бы выдержку и
+            # придерживал бы тот токен, который человек как раз ждёт.
+            unwanted = user_filter_reason(user, instrument_id, strength, now)
+            if unwanted is not None:
+                self._log.info(
+                    "Уведомление не нужно получателю",
+                    signal_id=signal["id"], chat_id=chat_id, reason=unwanted,
+                )
+                continue
+
+            last_decision, last_sent_ts = await self._get_last_state(
+                chat_id, instrument_id
             )
-            return
+            if not should_notify(signal, last_decision, last_sent_ts, now, self.cfg):
+                continue
 
-        # Цена на момент сигнала — переиспользуем готовый get_price_at (ТЗ §6).
-        # Чтение цены не влияет на условия отправки; при отсутствии — None.
-        price = await db.get_price_at(instrument_id, signal["ts"])
-        fmt_cfg = await self._format_config(instrument_id)
-        sent = await send_message(format_signal_message(signal, price, fmt_cfg))
-        if sent:
-            await db.mark_signal_notified(signal["id"])
-            await self._set_last_state(instrument_id, signal["decision"], now)
-            await self._record_sent(now)
+            # Защита от потока. Придержанный сигнал не откладывается:
+            # уведомление о рыночном сигнале имеет смысл в свой момент, а через
+            # час это уже не уведомление, а история. Сам сигнал сохранён и
+            # попадает в оценку — теряется только сообщение.
+            limited = rate_limit_reason(
+                last_sent_ts, now, await self._sent_last_hour(chat_id, now), self.cfg
+            )
+            if limited is not None:
+                # Придержанное ПОТОЛКОМ не пропадает молча: §2 требует одного
+                # сводного сообщения. Придержанное ВЫДЕРЖКОЙ в сводку не идёт —
+                # это нормальный ход по одному токену, а не переполнение.
+                if limited.startswith(_CAP_REASON_PREFIX):
+                    await self._queue_for_digest(chat_id, signal, instrument_id)
+                self._log.info(
+                    "Уведомление придержано защитой от потока",
+                    signal_id=signal["id"], chat_id=chat_id,
+                    instrument_id=instrument_id, reason=limited,
+                )
+                continue
+
+            # Цена и метрики читаются ОДИН раз на сигнал и только когда он
+            # кому-то нужен: это чтения из БД, и делать их ради сигнала, который
+            # никому не уйдёт, незачем.
+            if not price_loaded:
+                price = await db.get_price_at(instrument_id, signal["ts"])
+                price_loaded = True
+            if metrics_by_agent is None:
+                metrics_by_agent = await self._agent_metrics(signal, instrument_id)
+
+            fmt_cfg = replace(
+                await self._format_config(instrument_id), horizon_h=user.horizon_h
+            )
+            text = format_signal_message(signal, price, fmt_cfg, metrics_by_agent)
+            if not await send_message(text, chat_id=str(chat_id)):
+                # Не отправилось (сеть/Telegram) — состояние не двигаем, чтобы
+                # следующая итерация попробовала снова.
+                self._log.warning(
+                    "Отправка не удалась, повтор позже",
+                    signal_id=signal["id"], chat_id=chat_id,
+                )
+                continue
+
+            sent_any = True
+            await self._set_last_state(chat_id, instrument_id, signal["decision"], now)
+            await self._record_sent(chat_id, now)
             self._log.info(
                 "Уведомление отправлено",
-                signal_id=signal["id"],
-                decision=signal["decision"],
-                probability=signal["probability"],
+                signal_id=signal["id"], chat_id=chat_id,
+                decision=signal["decision"], probability=signal["probability"],
             )
+
+        if sent_any:
+            await db.mark_signal_notified(signal["id"])
         else:
-            # Не отправилось (сеть/Telegram) — не помечаем, повторим позже.
-            self._log.warning("Отправка не удалась, повтор позже", signal_id=signal["id"])
+            # Никому не ушло — «поглощаем», чтобы сигнал не висел в очереди
+            # вечно. notified_at НЕ ставится: отправки не было.
+            await db.mark_signal_absorbed(signal["id"])
+
+    async def _user_settings(self, chat_id: int) -> UserSettings:
+        """Настройки получателя; при отсутствии записи — значения по умолчанию.
+
+        Отсутствие записи не ошибка и не повод её создавать: человек мог ни
+        разу не открыть меню (§1 ТЗ). Кэш короткий — настройки меняются из бота
+        в любой момент, и уведомления обязаны это замечать без перезапуска.
+        """
+        cached = self._settings_cache.get(chat_id)
+        if cached is not None:
+            value, cached_at = cached
+            if (datetime.now(UTC) - cached_at).total_seconds() < _SETTINGS_CACHE_SEC:
+                return value
+        row = None
+        try:
+            row = await db.get_user_settings(chat_id)
+        except Exception as exc:  # noqa: BLE001
+            # Настройки недоступны — шлём по умолчанию, а не молчим: тишина
+            # выглядела бы как отсутствие сигналов.
+            self._log.warning(
+                "Настройки получателя не прочитаны, действуют значения по умолчанию",
+                chat_id=chat_id, error=str(exc),
+            )
+        settings_obj = (
+            default_settings(chat_id, self.cfg.min_probability)
+            if row is None
+            else UserSettings(
+                chat_id=chat_id,
+                instruments=tuple(int(i) for i in row["instruments"]),
+                horizon_h=int(row["horizon_h"]),
+                min_score=float(row["min_score"]),
+                quiet_from=None if row["quiet_from"] is None else int(row["quiet_from"]),
+                quiet_to=None if row["quiet_to"] is None else int(row["quiet_to"]),
+            )
+        )
+        self._settings_cache[chat_id] = (settings_obj, datetime.now(UTC))
+        return settings_obj
+
+    async def _agent_metrics(
+        self, signal: dict[str, Any], instrument_id: int
+    ) -> dict[str, dict[str, Any] | None]:
+        """Метрики каждого высказавшегося агента на момент ЕГО вывода (§3 ТЗ).
+
+        Момент берётся из ``agents_payload``: объяснять решение показаниями,
+        которых в нём не было, нельзя. Не нашлось — остаётся ``None``, и текст
+        честно скажет, что показатели не сохранились.
+        """
+        result: dict[str, dict[str, Any] | None] = {}
+        for entry in normalize_payload(signal.get("agents_payload")):
+            agent = str(entry.get("agent"))
+            ts_raw = entry.get("ts")
+            if not ts_raw:
+                result[agent] = None
+                continue
+            try:
+                ts = datetime.fromisoformat(str(ts_raw))
+            except ValueError:
+                result[agent] = None
+                continue
+            try:
+                result[agent] = await db.get_agent_metrics(agent, instrument_id, ts)
+            except Exception as exc:  # noqa: BLE001
+                self._log.warning(
+                    "Метрики агента не прочитаны", agent=agent, error=str(exc)
+                )
+                result[agent] = None
+        return result
 
     async def _get_last_state(
-        self, instrument_id: int
+        self, chat_id: int, instrument_id: int
     ) -> tuple[str | None, datetime | None]:
-        """Читает из Redis последнее отправленное решение по инструменту."""
-        raw = await get_redis().get(f"notify:last:{instrument_id}")
+        """Последнее отправленное ЭТОМУ получателю решение по инструменту.
+
+        Ключ несёт и получателя: настройки у людей разные, и выдержка одного не
+        должна затыкать уведомления другому.
+        """
+        raw = await get_redis().get(f"notify:last:{chat_id}:{instrument_id}")
         if not raw:
             return None, None
         try:
@@ -558,11 +741,11 @@ class NotifyAgent:
             return None, None
 
     async def _set_last_state(
-        self, instrument_id: int, decision: str, sent_ts: datetime
+        self, chat_id: int, instrument_id: int, decision: str, sent_ts: datetime
     ) -> None:
-        """Сохраняет в Redis последнее отправленное решение и время."""
+        """Сохраняет последнее отправленное решение и время по получателю."""
         data = json.dumps({"decision": decision, "sent_ts": sent_ts.isoformat()})
-        await get_redis().set(f"notify:last:{instrument_id}", data)
+        await get_redis().set(f"notify:last:{chat_id}:{instrument_id}", data)
 
     def _strength(self, signal: dict[str, Any]) -> float:
         """Сила сигнала — та же величина, по которой он отбирался к отправке."""
@@ -573,9 +756,9 @@ class NotifyAgent:
         return float(signal.get("probability") or 0.0)
 
     async def _queue_for_digest(
-        self, signal: dict[str, Any], instrument_id: int
+        self, chat_id: int, signal: dict[str, Any], instrument_id: int
     ) -> None:
-        """Кладёт придержанный потолком сигнал в очередь сводного сообщения."""
+        """Кладёт придержанный потолком сигнал в очередь сводки получателя."""
         try:
             fmt_cfg = await self._format_config(instrument_id)
             entry = json.dumps({
@@ -584,16 +767,16 @@ class NotifyAgent:
                 "strength": self._strength(signal),
             })
             redis = get_redis()
-            await redis.rpush(_DIGEST_KEY, entry)
+            await redis.rpush(f"{_DIGEST_KEY}:{chat_id}", entry)
             # Срок жизни заведомо больше периода сводки: очередь без сводки не
             # должна копиться вечно, если сервис остановлен.
-            await redis.expire(_DIGEST_KEY, _DIGEST_EVERY_SEC * 2)
+            await redis.expire(f"{_DIGEST_KEY}:{chat_id}", _DIGEST_EVERY_SEC * 2)
         except Exception as exc:  # noqa: BLE001
             self._log.warning(
                 "Не удалось поставить сигнал в очередь сводки", error=str(exc)
             )
 
-    async def _flush_digest(self, now: datetime) -> None:
+    async def _flush_digest(self, chat_id: int, now: datetime) -> None:
         """Отправляет ОДНО сводное сообщение о придержанных потолком сигналах.
 
         Сводка выходит не чаще одного раза в час: она сама является сообщением,
@@ -605,14 +788,16 @@ class NotifyAgent:
         """
         try:
             redis = get_redis()
-            if await redis.llen(_DIGEST_KEY) == 0:
+            queue_key = f"{_DIGEST_KEY}:{chat_id}"
+            last_key = f"{_DIGEST_LAST_KEY}:{chat_id}"
+            if await redis.llen(queue_key) == 0:
                 return
-            last_raw = await redis.get(_DIGEST_LAST_KEY)
+            last_raw = await redis.get(last_key)
             if last_raw:
                 elapsed = (now - datetime.fromisoformat(last_raw)).total_seconds()
                 if elapsed < _DIGEST_EVERY_SEC:
                     return
-            raw_entries = await redis.lrange(_DIGEST_KEY, 0, -1)
+            raw_entries = await redis.lrange(queue_key, 0, -1)
         except Exception as exc:  # noqa: BLE001
             self._log.warning("Не удалось прочитать очередь сводки", error=str(exc))
             return
@@ -627,7 +812,8 @@ class NotifyAgent:
             return
 
         sent = await send_message(
-            format_digest_message(entries, self.cfg.max_per_hour)
+            format_digest_message(entries, self.cfg.max_per_hour),
+            chat_id=str(chat_id),
         )
         if not sent:
             # Не отправилось — очередь НЕ чистим: сводка уйдёт следующей
@@ -637,13 +823,19 @@ class NotifyAgent:
             return
         try:
             redis = get_redis()
-            await redis.delete(_DIGEST_KEY)
-            await redis.set(_DIGEST_LAST_KEY, now.isoformat(), ex=_DIGEST_EVERY_SEC * 2)
+            await redis.delete(f"{_DIGEST_KEY}:{chat_id}")
+            await redis.set(
+                f"{_DIGEST_LAST_KEY}:{chat_id}", now.isoformat(),
+                ex=_DIGEST_EVERY_SEC * 2,
+            )
         except Exception as exc:  # noqa: BLE001
             self._log.warning("Сводка отправлена, очередь не очищена", error=str(exc))
-        self._log.info("Отправлена сводка придержанных сигналов", held=len(entries))
+        self._log.info(
+            "Отправлена сводка придержанных сигналов",
+            chat_id=chat_id, held=len(entries),
+        )
 
-    async def _sent_last_hour(self, now: datetime) -> int:
+    async def _sent_last_hour(self, chat_id: int, now: datetime) -> int:
         """Сколько уведомлений ушло за последний час (по всем инструментам).
 
         Хранится упорядоченным множеством Redis: ключ — момент отправки, вес —
@@ -660,23 +852,25 @@ class NotifyAgent:
             return 0
         try:
             redis = get_redis()
+            key = f"{_SENT_KEY}:{chat_id}"
             edge = now.timestamp() - 3600
-            await redis.zremrangebyscore(_SENT_KEY, "-inf", edge)
-            return int(await redis.zcard(_SENT_KEY))
+            await redis.zremrangebyscore(key, "-inf", edge)
+            return int(await redis.zcard(key))
         except Exception as exc:  # noqa: BLE001
             self._log.warning(
                 "Не удалось прочитать счётчик уведомлений за час", error=str(exc)
             )
             return 0
 
-    async def _record_sent(self, now: datetime) -> None:
-        """Отмечает факт отправки в скользящем окне часа."""
+    async def _record_sent(self, chat_id: int, now: datetime) -> None:
+        """Отмечает факт отправки в скользящем окне часа этого получателя."""
         try:
             redis = get_redis()
-            await redis.zadd(_SENT_KEY, {now.isoformat(): now.timestamp()})
+            key = f"{_SENT_KEY}:{chat_id}"
+            await redis.zadd(key, {now.isoformat(): now.timestamp()})
             # Ключ живёт заведомо дольше окна: чистка идёт по весу, а срок жизни
             # нужен только чтобы ключ не оставался навсегда после остановки.
-            await redis.expire(_SENT_KEY, 7200)
+            await redis.expire(key, 7200)
         except Exception as exc:  # noqa: BLE001
             self._log.warning(
                 "Не удалось записать отправку в счётчик часа", error=str(exc)

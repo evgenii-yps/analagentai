@@ -208,6 +208,26 @@ CREATE INDEX IF NOT EXISTS ix_eval_horizon
 
 -- Границы версий логики (Этап 8.1 §6). Данные версий не смешиваются в анализе,
 -- поэтому момент перехода хранится машиночитаемо, с точностью до минуты.
+-- Настройки уведомлений по чату Telegram (Этап 8.3 §1). Отсутствие строки —
+-- не ошибка: действуют значения по умолчанию из кода. instruments хранит
+-- идентификаторы инструментов, а не названия: имя пары может смениться.
+CREATE TABLE IF NOT EXISTS user_settings (
+    chat_id     BIGINT       PRIMARY KEY,
+    instruments INTEGER[]    NOT NULL
+        CHECK (array_length(instruments, 1) >= 1),
+    horizon_h   SMALLINT     NOT NULL DEFAULT 4 CHECK (horizon_h > 0),
+    min_score   NUMERIC(4,3) NOT NULL DEFAULT 0.700,
+    -- Часы UTC; NULL в обоих означает «тишина выключена». Диапазон может
+    -- пересекать полночь (22 → 6), поэтому порядок часов не ограничивается.
+    quiet_from  SMALLINT,
+    quiet_to    SMALLINT,
+    updated_at  TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    CONSTRAINT user_settings_quiet_hours_valid CHECK (
+        (quiet_from IS NULL AND quiet_to IS NULL)
+        OR (quiet_from BETWEEN 0 AND 23 AND quiet_to BETWEEN 0 AND 23)
+    )
+);
+
 CREATE TABLE IF NOT EXISTS logic_version_windows (
     -- Строго положительна: ноль зарезервирован под признак «версия
     -- неизвестна» в agent_outputs_daily (миграция 012). Без этого запрета
