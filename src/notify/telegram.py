@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from typing import Any
 
 import httpx
 import structlog
@@ -26,7 +27,11 @@ def _verify() -> str | bool:
     return ca_file if ca_file else True
 
 
-async def send_message(text: str, chat_id: str | None = None) -> bool:
+async def send_message(
+    text: str,
+    chat_id: str | None = None,
+    reply_markup: dict[str, Any] | None = None,
+) -> bool:
     """Отправляет HTML-сообщение в чат. Возвращает True при успехе.
 
     ``chat_id`` необязателен: по умолчанию берётся ``TELEGRAM_CHAT_ID`` из конфига
@@ -49,6 +54,10 @@ async def send_message(text: str, chat_id: str | None = None) -> bool:
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
+    # Кнопки меню настроек (§1 ТЗ 8.3). Поле добавляется только когда клавиатура
+    # есть: у обычных уведомлений её быть не должно.
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT, verify=_verify()) as client:
             response = await client.post(url, json=payload)

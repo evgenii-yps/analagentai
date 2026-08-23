@@ -14,6 +14,7 @@ import asyncpg
 
 from src.core.config import settings
 from src.core.instruments import horizon_label
+from src.core.user_settings import USER_SETTINGS_DDL
 
 if TYPE_CHECKING:
     # Импорт только для аннотаций — без циклической зависимости в рантайме.
@@ -753,6 +754,94 @@ class DB:
         return int(curve_id)
 
     # --- Уведомления (Этап 5) ---
+
+    async def ensure_user_settings_schema(self) -> None:
+        """Идемпотентно создаёт таблицу настроек пользователя (§1 ТЗ 8.3).
+
+        Порядок старта сервисов не задан, а таблица нужна и боту (пишет), и
+        сервису уведомлений (читает), — поэтому её наличие гарантирует каждый.
+        """
+        await self.pool.execute(USER_SETTINGS_DDL)
+
+    async def get_user_settings(self, chat_id: int) -> dict[str, Any] | None:
+        """Настройки чата или ``None``, если человек их ни разу не открывал.
+
+        ``None`` — не ошибка и не повод создавать строку: значения по умолчанию
+        задаёт код (:mod:`src.core.user_settings`). Запись настроек, которых
+        человек не задавал, позже выглядела бы как его собственный выбор.
+        """
+        row = await self.pool.fetchrow(
+            "SELECT chat_id, instruments, horizon_h, min_score, quiet_from, "
+            "       quiet_to, updated_at "
+            "  FROM user_settings WHERE chat_id = $1;",
+            int(chat_id),
+        )
+        return dict(row) if row else None
+
+    async def save_user_settings(
+        self,
+        chat_id: int,
+        instruments: list[int],
+        horizon_h: int,
+        min_score: float,
+        quiet_from: int | None,
+        quiet_to: int | None,
+    ) -> None:
+        """Сохраняет настройки чата целиком (создаёт или заменяет)."""
+        await self.pool.execute(
+            """
+            INSERT INTO user_settings
+                (chat_id, instruments, horizon_h, min_score, quiet_from, quiet_to,
+                 updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, now())
+            ON CONFLICT (chat_id) DO UPDATE SET
+                instruments = EXCLUDED.instruments,
+                horizon_h   = EXCLUDED.horizon_h,
+                min_score   = EXCLUDED.min_score,
+                quiet_from  = EXCLUDED.quiet_from,
+                quiet_to    = EXCLUDED.quiet_to,
+                updated_at  = now();
+            """,
+            int(chat_id), [int(i) for i in instruments], int(horizon_h),
+            float(min_score),
+            None if quiet_from is None else int(quiet_from),
+            None if quiet_to is None else int(quiet_to),
+        )
+
+    async def get_instrument_id(self, symbol: str) -> int | None:
+        """Идентификатор инструмента по символу или ``None``, если его нет."""
+        return await self.pool.fetchval(
+            "SELECT id FROM instruments WHERE symbol = $1;", symbol
+        )
+
+    async def get_agent_metrics(
+        self, agent: str, instrument_id: int, ts: datetime
+    ) -> dict[str, Any] | None:
+        """Метрики вывода агента ровно на момент ``ts`` (§3 ТЗ 8.3).
+
+        Текст сигнала объясняет мнение агента ЕГО СОБСТВЕННЫМИ метриками, и
+        брать их можно только у того самого вывода, который участвовал в
+        решении: ``agents_payload`` хранит момент каждого мнения, поэтому поиск
+        точный, а не «последний по этому агенту». Взять свежайший вывод значило
+        бы объяснять одно решение показаниями, которых в нём не было.
+
+        Метрики НЕ добавляются в ``agents_payload``: это меняло бы то, что
+        пишет Decision Agent, а §7 ТЗ 8.3 запрещает его трогать.
+        """
+        row = await self.pool.fetchrow(
+            "SELECT metrics FROM agent_outputs "
+            " WHERE agent = $1 AND instrument_id = $2 AND ts = $3 LIMIT 1;",
+            agent, int(instrument_id), ts,
+        )
+        if not row or row["metrics"] is None:
+            return None
+        metrics = row["metrics"]
+        if isinstance(metrics, str):
+            try:
+                return json.loads(metrics)
+            except (TypeError, ValueError):
+                return None
+        return dict(metrics)
 
     async def ensure_notify_schema(self) -> None:
         """Идемпотентно добавляет колонки ``notified`` и ``notified_at``.

@@ -433,6 +433,10 @@ NOTIFY_INTERVAL=30
 NOTIFY_MIN_PROBABILITY=0.7
 NOTIFY_MIN_AGENTS=3
 NOTIFY_COOLDOWN_SEC=1800
+# Защита от потока уведомлений (§2 ТЗ 8.3). Значения предварительные:
+# заданы вслепую и уточняются по измеренному потоку. 0 — выключено.
+NOTIFY_HOLD_MIN=${NOTIFY_HOLD_MIN:-60}
+NOTIFY_MAX_PER_HOUR=${NOTIFY_MAX_PER_HOUR:-6}
 NOTIFY_TIMEZONE=Europe/Moscow
 # --- Калибровка вероятности (Этап 7.3, Блок B) ---
 CALIBRATION_MIN_SAMPLES=${CALIBRATION_MIN_SAMPLES:-60}
