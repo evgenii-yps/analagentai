@@ -501,3 +501,31 @@ def test_protected_tables_match_the_specification() -> None:
         assert table in retention.PROTECTED_TABLES
         with pytest.raises(retention.RetentionRuleError):
             retention._check_protected(table, "")
+
+
+# --- Ноль не может быть настоящей версией логики (дефект 22.08.2026) ---------
+
+
+def test_logic_version_zero_is_rejected_by_config() -> None:
+    """LOGIC_VERSION=0 отвергается на старте, а не роняет сервис ошибкой БД.
+
+    Ноль зарезервирован под признак «версия неизвестна» в agent_outputs_daily.
+    Если бы его можно было задать настоящей версией, отличить «версия 0» от
+    «версии нет» стало бы невозможно — а вечную таблицу переписать нечем.
+    """
+    import pytest as _pytest
+
+    from src.core.config import Settings
+
+    with _pytest.raises(ValueError, match="LOGIC_VERSION"):
+        Settings(LOGIC_VERSION=0)
+
+
+def test_logic_version_negative_is_rejected_by_config() -> None:
+    """Отрицательная версия тоже отвергается: версии нумеруются с единицы."""
+    import pytest as _pytest
+
+    from src.core.config import Settings
+
+    with _pytest.raises(ValueError, match="LOGIC_VERSION"):
+        Settings(LOGIC_VERSION=-1)

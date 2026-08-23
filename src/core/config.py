@@ -3,6 +3,7 @@
 Значения читаются из переменных окружения и файла ``.env``.
 """
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from src.core.instruments import SymbolPair, parse_horizon_hours, parse_symbol_pairs
@@ -217,6 +218,25 @@ class Settings(BaseSettings):
     # Пароль роли БД только на чтение (agenttrade_ro). Генерируется установщиком;
     # пусто → сервис бота простаивает (не подключается основным пользователем).
     POSTGRES_RO_PASSWORD: str = ""
+
+    @field_validator("LOGIC_VERSION")
+    @classmethod
+    def _logic_version_is_positive(cls, value: int) -> int:
+        """Версия логики строго положительна: ноль означает «неизвестна».
+
+        Ноль зарезервирован под признак «версия неизвестна» в
+        ``agent_outputs_daily`` (миграция 012), и таблица ``logic_version_windows``
+        отвергает его ограничением. Без этой проверки ``LOGIC_VERSION=0`` в
+        ``.env`` ронял бы decision и evaluator на старте невнятной ошибкой БД —
+        а хуже того, до миграции 012 записал бы ноль как настоящую версию, и
+        отличить «версия 0» от «версия неизвестна» стало бы невозможно.
+        """
+        if value < 1:
+            raise ValueError(
+                "LOGIC_VERSION должен быть >= 1: ноль зарезервирован под признак "
+                "«версия логики неизвестна» и настоящей версией быть не может"
+            )
+        return value
 
     @property
     def bot_allowed_chat_ids(self) -> set[str]:
