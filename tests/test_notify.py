@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 from src.notify.agent import (
     NotifyConfig,
     SignalFormatConfig,
+    rate_limit_reason,
     should_notify,
 )
 
@@ -281,3 +282,92 @@ def test_message_shows_probability_only_with_curve() -> None:
     assert "Вероятность успеха (по истории): <b>31%</b>" in text
     assert "кривая от 16.08" in text
     assert "N=87" in text
+
+
+# --- Защита от потока уведомлений (§2 ТЗ 8.3) -------------------------------
+#
+# Пороги заданы вслепую и уточняются по измеренному потоку, поэтому тесты
+# проверяют ПОВЕДЕНИЕ при заданных значениях, а не сами значения.
+
+_GUARD = NotifyConfig(
+    min_probability=0.7, cooldown_sec=1800, hold_sec=3600, max_per_hour=6
+)
+
+
+def test_no_limits_when_thresholds_are_zero() -> None:
+    """Нули выключают защиту: поведение как до Этапа 8.3."""
+    off = NotifyConfig(min_probability=0.7, cooldown_sec=1800)
+    assert rate_limit_reason(_NOW - timedelta(seconds=1), _NOW, 1000, off) is None
+
+
+def test_first_notification_passes_the_hold() -> None:
+    """По инструменту ещё ничего не слали — выдержке не от чего отсчитывать."""
+    assert rate_limit_reason(None, _NOW, 0, _GUARD) is None
+
+
+def test_hold_blocks_within_the_window() -> None:
+    last_sent = _NOW - timedelta(minutes=30)      # 30 мин < 60 мин выдержки
+    reason = rate_limit_reason(last_sent, _NOW, 0, _GUARD)
+    assert reason is not None and "выдержка" in reason
+
+
+def test_hold_releases_after_the_window() -> None:
+    last_sent = _NOW - timedelta(minutes=61)
+    assert rate_limit_reason(last_sent, _NOW, 0, _GUARD) is None
+
+
+def test_hold_ignores_the_decision() -> None:
+    """Главное отличие выдержки от cooldown: смена решения её НЕ обходит.
+
+    cooldown придерживает только повтор того же решения, поэтому пара,
+    колеблющаяся buy → sell → buy, слала бы уведомления без пауз. Выдержка
+    получает лишь время последней отправки — решение до неё не доходит по
+    сигнатуре, и обойти её сменой решения нельзя.
+    """
+    last_sent = _NOW - timedelta(minutes=5)
+    # То же решение и смена решения дают ОДИН И ТОТ ЖЕ результат.
+    assert rate_limit_reason(last_sent, _NOW, 0, _GUARD) is not None
+    assert should_notify(_sig("sell", 0.9), "buy", last_sent, _NOW, _GUARD) is True
+
+
+def test_hourly_cap_blocks_at_the_limit() -> None:
+    reason = rate_limit_reason(None, _NOW, 6, _GUARD)
+    assert reason is not None and "потолок" in reason
+
+
+def test_hourly_cap_allows_below_the_limit() -> None:
+    assert rate_limit_reason(None, _NOW, 5, _GUARD) is None
+
+
+def test_hold_is_reported_before_the_cap() -> None:
+    """Причина в логе — та, что сработала первой по инструменту."""
+    last_sent = _NOW - timedelta(minutes=1)
+    reason = rate_limit_reason(last_sent, _NOW, 6, _GUARD)
+    assert reason is not None and "выдержка" in reason
+
+
+def test_thresholds_are_independent() -> None:
+    """Каждый порог выключается отдельно: значения ещё будут уточняться."""
+    only_cap = NotifyConfig(
+        min_probability=0.7, cooldown_sec=1800, hold_sec=0, max_per_hour=6
+    )
+    only_hold = NotifyConfig(
+        min_probability=0.7, cooldown_sec=1800, hold_sec=3600, max_per_hour=0
+    )
+    just_sent = _NOW - timedelta(seconds=1)
+    assert rate_limit_reason(just_sent, _NOW, 0, only_cap) is None
+    assert rate_limit_reason(just_sent, _NOW, 0, only_hold) is not None
+    assert rate_limit_reason(None, _NOW, 99, only_cap) is not None
+    assert rate_limit_reason(None, _NOW, 99, only_hold) is None
+
+
+def test_negative_thresholds_are_rejected_by_config() -> None:
+    """Отрицательный порог молча выключал бы защиту, выглядя заданным."""
+    import pytest
+
+    from src.core.config import Settings
+
+    with pytest.raises(ValueError, match="отрицательным"):
+        Settings(NOTIFY_HOLD_MIN=-1)
+    with pytest.raises(ValueError, match="отрицательным"):
+        Settings(NOTIFY_MAX_PER_HOUR=-1)

@@ -22,6 +22,8 @@ async def run() -> None:
         interval=settings.NOTIFY_INTERVAL,
         min_probability=settings.NOTIFY_MIN_PROBABILITY,
         telegram_configured=settings.telegram_configured,
+        hold_min=settings.NOTIFY_HOLD_MIN,
+        max_per_hour=settings.NOTIFY_MAX_PER_HOUR,
     )
 
     await db.connect()
@@ -48,6 +50,8 @@ async def run() -> None:
             min_agents=settings.NOTIFY_MIN_AGENTS,
             use_calibrated=settings.NOTIFY_USE_CALIBRATED,
             min_calibrated=settings.NOTIFY_MIN_CALIBRATED,
+            hold_sec=settings.NOTIFY_HOLD_MIN * 60,
+            max_per_hour=settings.NOTIFY_MAX_PER_HOUR,
         )
         tasks = [asyncio.create_task(agent.run(), name="notify")]
 

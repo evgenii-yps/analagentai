@@ -23,6 +23,9 @@ from src.notify.telegram import send_message
 
 # TTL heartbeat-ключа (секунды).
 _HEARTBEAT_TTL = 300
+# Скользящее окно отправленных уведомлений (§2 ТЗ 8.3): один ключ на все
+# инструменты — потолок общий, потому что человек читает один поток.
+_SENT_KEY = "notify:sent:hour"
 
 # Порядок агентов, участвующих в решении (совпадает с src.decision.agent.AGENTS).
 AGENT_ORDER: tuple[str, ...] = ("market", "liquidity", "futures")
@@ -51,6 +54,9 @@ class NotifyConfig:
     # активной кривой нет, calibrated_probability = NULL, и не уходит ничего.
     use_calibrated: bool = False
     min_calibrated: float = 0.55
+    # Защита от потока уведомлений (§2 ТЗ 8.3). 0 — ограничение выключено.
+    hold_sec: float = 0.0        # выдержка по одному токену, независимо от решения
+    max_per_hour: int = 0        # потолок уведомлений в час по всем токенам
 
 
 @dataclass
@@ -93,6 +99,46 @@ def should_notify(
     if signal["decision"] != last_decision:
         return True
     return (now - last_sent_ts).total_seconds() >= cfg.cooldown_sec
+
+
+def rate_limit_reason(
+    last_sent_ts: datetime | None,
+    now: datetime,
+    sent_last_hour: int,
+    cfg: NotifyConfig,
+) -> str | None:
+    """Почему уведомление придержано потоковой защитой. ``None`` — можно слать.
+
+    Чистая, детерминированная: всё состояние приходит параметрами.
+
+    Проверки НАМЕРЕННО разделены с :func:`should_notify`. Та отвечает на вопрос
+    «стоит ли вообще говорить об этом сигнале»; эта — «не слишком ли часто мы
+    говорим». Смешивать их нельзя: причина, по которой уведомление не ушло,
+    попадает в лог, и «сигнал слабый» и «уведомлений и так много» — разные
+    события, требующие разных действий.
+
+    ВЫДЕРЖКА не смотрит на решение — этим она и отличается от
+    ``cooldown_sec``. Cooldown придерживает только повтор ТОГО ЖЕ решения, а
+    смена решения проходит мимо него; именно смена и даёт поток, когда пара
+    колеблется. Выдержка держит паузу по токену в любом случае.
+
+    ПОТОЛОК считается по скользящему часу и общий на все токены: он ограничивает
+    то, что видит человек, а человек читает один поток, а не пять.
+
+    Ноль в любом из порогов выключает соответствующее ограничение — поведение
+    возвращается к тому, что было до Этапа 8.3.
+    """
+    if cfg.hold_sec > 0 and last_sent_ts is not None:
+        elapsed = (now - last_sent_ts).total_seconds()
+        if elapsed < cfg.hold_sec:
+            left = int(cfg.hold_sec - elapsed)
+            return f"выдержка по инструменту: осталось {left} с из {int(cfg.hold_sec)}"
+    if cfg.max_per_hour > 0 and sent_last_hour >= cfg.max_per_hour:
+        return (
+            f"потолок уведомлений в час: отправлено {sent_last_hour} "
+            f"из {cfg.max_per_hour}"
+        )
+    return None
 
 
 # Короткие метки для часто используемых зон (иначе берём abbr из самой зоны).
@@ -317,6 +363,8 @@ class NotifyAgent:
         min_agents: int = 3,
         use_calibrated: bool = False,
         min_calibrated: float = 0.55,
+        hold_sec: float = 0.0,
+        max_per_hour: int = 0,
     ) -> None:
         self.interval = interval
         self.cfg = NotifyConfig(
@@ -325,6 +373,8 @@ class NotifyAgent:
             min_agents,
             use_calibrated=use_calibrated,
             min_calibrated=min_calibrated,
+            hold_sec=hold_sec,
+            max_per_hour=max_per_hour,
         )
         self.symbol = symbol
         self.tz_name = tz_name
@@ -396,6 +446,23 @@ class NotifyAgent:
             await db.mark_signal_absorbed(signal["id"])
             return
 
+        # Защита от потока (§2 ТЗ 8.3). Придержанный сигнал «поглощается», а не
+        # откладывается: уведомление о рыночном сигнале имеет смысл в свой
+        # момент, а через час это уже не уведомление, а история. Сигнал при этом
+        # сохранён и попадает в оценку — теряется только сообщение.
+        limited = rate_limit_reason(
+            last_sent_ts, now, await self._sent_last_hour(now), self.cfg
+        )
+        if limited is not None:
+            await db.mark_signal_absorbed(signal["id"])
+            self._log.info(
+                "Уведомление придержано защитой от потока",
+                signal_id=signal["id"],
+                instrument_id=instrument_id,
+                reason=limited,
+            )
+            return
+
         # Цена на момент сигнала — переиспользуем готовый get_price_at (ТЗ §6).
         # Чтение цены не влияет на условия отправки; при отсутствии — None.
         price = await db.get_price_at(instrument_id, signal["ts"])
@@ -404,6 +471,7 @@ class NotifyAgent:
         if sent:
             await db.mark_signal_notified(signal["id"])
             await self._set_last_state(instrument_id, signal["decision"], now)
+            await self._record_sent(now)
             self._log.info(
                 "Уведомление отправлено",
                 signal_id=signal["id"],
@@ -433,6 +501,45 @@ class NotifyAgent:
         """Сохраняет в Redis последнее отправленное решение и время."""
         data = json.dumps({"decision": decision, "sent_ts": sent_ts.isoformat()})
         await get_redis().set(f"notify:last:{instrument_id}", data)
+
+    async def _sent_last_hour(self, now: datetime) -> int:
+        """Сколько уведомлений ушло за последний час (по всем инструментам).
+
+        Хранится упорядоченным множеством Redis: ключ — момент отправки, вес —
+        он же в секундах. Скользящее окно, а не счётчик с обнулением в начале
+        часа: со счётчиком шесть уведомлений в 10:59 и ещё шесть в 11:01
+        уложились бы в «потолок 6 в час», хотя человек получил бы двенадцать за
+        две минуты.
+
+        Недоступность Redis не должна затыкать уведомления совсем, поэтому при
+        ошибке возвращается 0 — ограничение по потолку в этот момент не
+        действует, а выдержка по инструменту продолжает работать.
+        """
+        if self.cfg.max_per_hour <= 0:
+            return 0
+        try:
+            redis = get_redis()
+            edge = now.timestamp() - 3600
+            await redis.zremrangebyscore(_SENT_KEY, "-inf", edge)
+            return int(await redis.zcard(_SENT_KEY))
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning(
+                "Не удалось прочитать счётчик уведомлений за час", error=str(exc)
+            )
+            return 0
+
+    async def _record_sent(self, now: datetime) -> None:
+        """Отмечает факт отправки в скользящем окне часа."""
+        try:
+            redis = get_redis()
+            await redis.zadd(_SENT_KEY, {now.isoformat(): now.timestamp()})
+            # Ключ живёт заведомо дольше окна: чистка идёт по весу, а срок жизни
+            # нужен только чтобы ключ не оставался навсегда после остановки.
+            await redis.expire(_SENT_KEY, 7200)
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning(
+                "Не удалось записать отправку в счётчик часа", error=str(exc)
+            )
 
     async def run(self) -> None:
         """Бесконечный цикл: process_once → heartbeat → пауза. Не падает на ошибках."""
