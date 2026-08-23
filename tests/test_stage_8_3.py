@@ -250,6 +250,123 @@ def test_all_agents_silent_are_all_stated() -> None:
         assert f"{title}: недостаточно данных, голоса нет." in text
 
 
+# --- Итог по голосам: четыре состояния не смешиваются ------------------------
+#
+# Прежняя строка «N из M уверенно, K слабо» сваливала воздержавшегося в «слабо»
+# наравне с тем, у кого голос есть, просто неуверенный. Для человека это разные
+# вещи: «агент посмотрел и не увидел перевеса» и «агент увидел перевес, но
+# слабый» ведут к разным решениям.
+
+
+def _vote_lines(payload: list[dict], decision: str = "buy") -> list[str]:
+    text = format_signal_message(
+        _signal(decision, payload=payload), 117240.0,
+        SignalFormatConfig("BTC/USDT", "UTC", "4h", horizon_h=4), _METRICS,
+    )
+    return [ln for ln in text.splitlines() if ln.startswith(("Голосов", "Остальные"))]
+
+
+def test_vote_summary_separates_all_four_states() -> None:
+    """За направление, против, воздержался, без данных — четыре разных счёта."""
+    lines = _vote_lines([
+        {"agent": "market", "signal": "bullish", "confidence": 0.9},    # за, уверенно
+        {"agent": "liquidity", "signal": "neutral", "confidence": 0.1},  # воздержался
+        {"agent": "futures", "signal": "bearish", "confidence": 0.3},    # против
+    ])
+    assert lines[0] == "Голосов за покупку: 1 из 3 высказавшихся (уверенно 1)."
+    assert lines[1] == (
+        "Остальные: против — 1; воздержались (перевеса не увидели) — 1."
+    )
+
+
+def test_vote_summary_does_not_count_abstention_as_a_weak_vote() -> None:
+    """Воздержавшийся НЕ попадает в «слабо»: голоса у него нет вовсе.
+
+    Тест на дефект, найденный заказчиком на примере ETH 23.08.2026.
+    """
+    abstained = _vote_lines([
+        {"agent": "market", "signal": "bullish", "confidence": 0.9},
+        {"agent": "liquidity", "signal": "neutral", "confidence": 0.1},
+        {"agent": "futures", "signal": "neutral", "confidence": 0.1},
+    ])
+    assert abstained[0] == "Голосов за покупку: 1 из 3 высказавшихся (уверенно 1)."
+    assert "слабо" not in abstained[0]
+    assert "воздержались" in abstained[1]
+
+    # А слабый голос ЗА — считается именно слабым и стоит в числителе.
+    weak = _vote_lines([
+        {"agent": "market", "signal": "bullish", "confidence": 0.9},
+        {"agent": "liquidity", "signal": "bullish", "confidence": 0.1},
+        {"agent": "futures", "signal": "bullish", "confidence": 0.2},
+    ])
+    assert weak[0] == "Голосов за покупку: 3 из 3 высказавшихся (уверенно 1, слабо 2)."
+    assert len(weak) == 1, "нечего писать в «Остальные», когда все высказались за"
+
+
+def test_vote_summary_denominator_counts_only_agents_with_data() -> None:
+    """Знаменатель — агенты, У КОТОРЫХ БЫЛИ ДАННЫЕ, а не общее число.
+
+    Молчание не голос против, и в знаменатель оно не идёт; промолчавшие
+    названы отдельной строкой, поэтому общее число агентов по-прежнему видно.
+    """
+    silent = _vote_lines([
+        {"agent": "market", "signal": "bullish", "confidence": 0.9},
+        {"agent": "liquidity", "signal": "neutral", "confidence": 0.1},
+    ])
+    assert "1 из 2 высказавшихся" in silent[0]
+    assert "без данных — 1" in silent[1]
+
+    only_one = _vote_lines([{"agent": "market", "signal": "bullish",
+                             "confidence": 0.9}])
+    assert "1 из 1 высказавшихся" in only_one[0]
+    assert "без данных — 2" in only_one[1]
+
+
+def test_insufficient_data_is_silence_not_abstention() -> None:
+    """``insufficient_data`` — это молчание, а не «сторону не выбрал»."""
+    text = format_signal_message(
+        _signal("buy", payload=[
+            {"agent": "market", "signal": "bullish", "confidence": 0.9},
+            {"agent": "futures", "signal": "insufficient_data", "confidence": 0.0},
+        ]),
+        117240.0, SignalFormatConfig("BTC/USDT", "UTC", "4h", horizon_h=4), _METRICS,
+    )
+    assert "Деривативы: недостаточно данных, голоса нет." in text
+    assert "Деривативы: показатели" not in text
+    lines = [ln for ln in text.splitlines() if ln.startswith(("Голосов", "Остальные"))]
+    assert "1 из 1 высказавшихся" in lines[0]
+    assert "без данных — 2" in lines[1]
+    assert "воздержались" not in lines[1]
+
+
+def test_vote_summary_for_a_sell_signal() -> None:
+    """Направление считается от решения: для продажи «за» — это bearish."""
+    lines = _vote_lines([
+        {"agent": "market", "signal": "bearish", "confidence": 0.9},
+        {"agent": "liquidity", "signal": "bullish", "confidence": 0.8},
+        {"agent": "futures", "signal": "neutral", "confidence": 0.1},
+    ], decision="sell")
+    assert lines[0] == "Голосов за продажу: 1 из 3 высказавшихся (уверенно 1)."
+    assert "против — 1" in lines[1]
+
+
+def test_vote_summary_absent_when_nobody_had_data() -> None:
+    """Данных не было ни у кого — счёт не пишется: считать нечего."""
+    assert _vote_lines([]) == []
+
+
+def test_agent_order_is_stable_whoever_spoke() -> None:
+    """Порядок агентов один и тот же, кто бы ни промолчал."""
+    text = format_signal_message(
+        _signal("buy", payload=[
+            {"agent": "futures", "signal": "bullish", "confidence": 0.9},
+        ]),
+        117240.0, SignalFormatConfig("BTC/USDT", "UTC", "4h", horizon_h=4), _METRICS,
+    )
+    titles = [ln.split(":")[0] for ln in text.splitlines() if ln.startswith("· ")]
+    assert titles == ["· Теханализ", "· Ликвидность", "· Деривативы"]
+
+
 # --- 10.9 test_no_internal_terms --------------------------------------------
 
 FORBIDDEN_TERMS = (

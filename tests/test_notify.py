@@ -109,7 +109,7 @@ def test_format_message_header_names_token_action_and_horizon() -> None:
     assert "BTC · ПОКУПКА · горизонт 4 часа" in text
     assert "Цена сейчас: 117 240 USDT" in text
     assert "Почему такой вывод:" in text
-    assert "Согласие агентов: 2 из 3 уверенно, 1 слабо." in text
+    assert "Голосов за покупку: 3 из 3 высказавшихся (уверенно 2, слабо 1)." in text
 
 
 def test_format_message_explains_each_agent_from_its_metrics() -> None:
@@ -186,8 +186,10 @@ def test_format_message_neutral_agent_is_not_counted_as_a_voice() -> None:
         _sig_full("buy", 0.8, payload), 64000.0, _FMT, _METRICS
     )
     assert "Ясной стороны не выбрал." in text
-    # Нейтральный агент высказался, поэтому он в знаменателе согласия.
-    assert "Согласие агентов: 2 из 3 уверенно, 1 слабо." in text
+    # Нейтральный агент высказался: он в знаменателе, но НЕ в числителе и не в
+    # «слабо» — голоса за направление у него нет вовсе.
+    assert "Голосов за покупку: 2 из 3 высказавшихся (уверенно 2)." in text
+    assert "воздержались (перевеса не увидели) — 1" in text
 
 
 def test_format_message_target_block_has_a_place_reserved() -> None:

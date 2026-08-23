@@ -377,25 +377,27 @@ def format_signal_message(
     goal_block = list(target_block or ())
 
     payload = normalize_payload(signal.get("agents_payload"))
-    present = {e.get("agent") for e in payload}
-    reasons = ["Почему такой вывод:"]
-    for name in AGENT_ORDER:
-        entry = next((e for e in payload if e.get("agent") == name), None)
-        if entry is not None:
-            reasons.append(agent_paragraph(
-                name,
-                str(entry.get("signal")),
-                float(entry.get("confidence", 0.0)),
-                metrics_by_agent.get(name),
-            ))
+    # Порядок агентов ВСЕГДА один и тот же, независимо от того, кто высказался:
+    # человек читает сообщения подряд и ищет знакомую строку на знакомом месте.
     # Молчащий агент называется ЯВНО и НИКОГДА не пропускается (§3, §7 ТЗ):
     # отсутствие мнения — это тоже сведение о качестве сигнала, и человек,
     # не увидев строки, счёл бы, что высказались все.
+    reasons = ["Почему такой вывод:"]
     for name in AGENT_ORDER:
-        if name not in present:
+        entry = next((e for e in payload if e.get("agent") == name), None)
+        # Нет записи вовсе или запись с «данных не хватило» — и то и другое
+        # означает молчание. «Сторону не выбрал» — совсем другое состояние.
+        if entry is None or entry.get("signal") not in SIGNAL_VALUE:
             reasons.append(agent_silent_paragraph(name))
+            continue
+        reasons.append(agent_paragraph(
+            name,
+            str(entry.get("signal")),
+            float(entry.get("confidence", 0.0)),
+            metrics_by_agent.get(name),
+        ))
 
-    agreement_block = _agreement_block(payload)
+    agreement_block = _agreement_block(payload, signal["decision"])
 
     disclaimer = [
         "Важно: система не предсказывает цену. Она оценивает вероятность "
@@ -408,20 +410,70 @@ def format_signal_message(
     return "\n\n".join("\n".join(block) for block in blocks if block)
 
 
-def _agreement_block(payload: list[dict[str, Any]]) -> list[str]:
-    """Строка «Согласие агентов: N из M уверенно, K слабо».
+def _agreement_block(payload: list[dict[str, Any]], decision: str) -> list[str]:
+    """Итог по голосам агентов: сколько ЗА направление сигнала, сколько нет.
 
-    Считаются агенты, которые ВЫСКАЗАЛИСЬ: молчащий не входит ни в уверенные,
-    ни в слабые — он вообще не голосовал, и включать его в знаменатель значило
-    бы засчитывать молчание за мнение.
+    РАЗЛИЧАЮТСЯ ЧЕТЫРЕ СОСТОЯНИЯ, и смешивать их нельзя:
+
+    * высказался ЗА направление сигнала — уверенно или слабо;
+    * высказался ПРОТИВ — голос есть, но в другую сторону;
+    * ВОЗДЕРЖАЛСЯ — данные есть, перевеса нет (нейтральное мнение);
+    * НЕ ВЫСКАЗАЛСЯ — данных нет вовсе.
+
+    Прежняя строка «N из M уверенно, K слабо» сваливала воздержавшегося в
+    «слабо» наравне с тем, у кого голос есть, просто неуверенный. Для человека
+    это разные вещи: «агент посмотрел и не увидел перевеса» и «агент увидел
+    перевес, но слабый» ведут к разным решениям.
+
+    ЗНАМЕНАТЕЛЬ — число агентов, У КОТОРЫХ БЫЛИ ДАННЫЕ. Считать от общего числа
+    значило бы засчитывать молчание за голос против. Промолчавшие названы
+    отдельно, поэтому «сколько всего агентов» из строки по-прежнему видно.
     """
-    voiced = [e for e in payload if e.get("signal") in SIGNAL_VALUE]
-    if not voiced:
+    with_data = [e for e in payload if e.get("signal") in SIGNAL_VALUE]
+    silent = len(AGENT_ORDER) - len(with_data)
+    if not with_data:
+        # Данных не было ни у кого — об этом уже сказано построчно выше,
+        # повторять счётом нечего.
         return []
-    confident = sum(1 for e in voiced if is_confident(float(e.get("confidence", 0.0))))
-    weak = len(voiced) - confident
-    tail = f", {weak} слабо" if weak else ""
-    return [f"Согласие агентов: {confident} из {len(voiced)} уверенно{tail}."]
+
+    wanted = "bullish" if decision == "buy" else "bearish"
+    against = "bearish" if decision == "buy" else "bullish"
+    direction_ru = "покупку" if decision == "buy" else "продажу"
+
+    for_confident = sum(
+        1 for e in with_data
+        if e.get("signal") == wanted and is_confident(float(e.get("confidence", 0.0)))
+    )
+    for_weak = sum(
+        1 for e in with_data
+        if e.get("signal") == wanted
+        and not is_confident(float(e.get("confidence", 0.0)))
+    )
+    n_for = for_confident + for_weak
+    n_against = sum(1 for e in with_data if e.get("signal") == against)
+    n_abstained = sum(1 for e in with_data if e.get("signal") == "neutral")
+
+    split = []
+    if for_confident:
+        split.append(f"уверенно {for_confident}")
+    if for_weak:
+        split.append(f"слабо {for_weak}")
+    tail = f" ({', '.join(split)})" if split else ""
+    lines = [
+        f"Голосов за {direction_ru}: {n_for} из {len(with_data)}"
+        f" высказавшихся{tail}."
+    ]
+
+    rest = []
+    if n_against:
+        rest.append(f"против — {n_against}")
+    if n_abstained:
+        rest.append(f"воздержались (перевеса не увидели) — {n_abstained}")
+    if silent > 0:
+        rest.append(f"без данных — {silent}")
+    if rest:
+        lines.append(f"Остальные: {'; '.join(rest)}.")
+    return lines
 
 
 def format_digest_message(
