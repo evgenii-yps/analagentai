@@ -14,6 +14,7 @@ import asyncpg
 
 from src.core.config import settings
 from src.core.instruments import horizon_label
+from src.core.user_settings import USER_SETTINGS_DDL
 
 if TYPE_CHECKING:
     # Импорт только для аннотаций — без циклической зависимости в рантайме.
@@ -760,24 +761,7 @@ class DB:
         Порядок старта сервисов не задан, а таблица нужна и боту (пишет), и
         сервису уведомлений (читает), — поэтому её наличие гарантирует каждый.
         """
-        await self.pool.execute(
-            """
-            CREATE TABLE IF NOT EXISTS user_settings (
-                chat_id     BIGINT       PRIMARY KEY,
-                instruments INTEGER[]    NOT NULL
-                    CHECK (array_length(instruments, 1) >= 1),
-                horizon_h   SMALLINT     NOT NULL DEFAULT 4 CHECK (horizon_h > 0),
-                min_score   NUMERIC(4,3) NOT NULL DEFAULT 0.700,
-                quiet_from  SMALLINT,
-                quiet_to    SMALLINT,
-                updated_at  TIMESTAMPTZ  NOT NULL DEFAULT now(),
-                CONSTRAINT user_settings_quiet_hours_valid CHECK (
-                    (quiet_from IS NULL AND quiet_to IS NULL)
-                    OR (quiet_from BETWEEN 0 AND 23 AND quiet_to BETWEEN 0 AND 23)
-                )
-            );
-            """
-        )
+        await self.pool.execute(USER_SETTINGS_DDL)
 
     async def get_user_settings(self, chat_id: int) -> dict[str, Any] | None:
         """Настройки чата или ``None``, если человек их ни разу не открывал.

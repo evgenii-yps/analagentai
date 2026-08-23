@@ -16,6 +16,8 @@ from typing import Any
 import asyncpg
 import structlog
 
+from src.core.user_settings import USER_SETTINGS_DDL
+
 _log = structlog.get_logger().bind(component="bot-queries")
 
 # Выражение начала непересекающегося 4-часового окна UTC.
@@ -83,6 +85,12 @@ async def ensure_readonly_role(
         "ALTER DEFAULT PRIVILEGES IN SCHEMA public "
         "GRANT SELECT ON TABLES TO agenttrade_ro;"
     )
+    # Таблица настроек создаётся ЗДЕСЬ же, до выдачи прав на неё. Порядок
+    # старта сервисов не задан: бот может подняться раньше уведомлений, и тогда
+    # GRANT на несуществующую таблицу срывал бы подготовку роли — бот повторял
+    # бы попытку бесконечно и не отвечал бы вообще. DDL общий (один источник).
+    await conn.execute(USER_SETTINGS_DDL)
+
     # ЕДИНСТВЕННОЕ исключение из «только чтение»: настройки самого пользователя
     # (§1 ТЗ 8.3). Бот обязан их сохранять, иначе меню было бы декорацией.
     # Право выдано ТОЧЕЧНО на одну таблицу: испортить данные наблюдений или
