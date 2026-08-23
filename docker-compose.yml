@@ -9,6 +9,14 @@ services:
       - pg_data:/var/lib/postgresql/data
       # DDL применяется автоматически при первой инициализации БД.
       - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    # Разделяемая память контейнера. По умолчанию docker даёт /dev/shm 64 МБ, и
+    # этого не хватает параллельным операциям PostgreSQL: 22.08.2026 после
+    # удаления 3.57 млн строк trades обычный VACUUM ANALYZE упал с
+    # «could not resize shared memory segment to 67145248 bytes: No space left
+    # on device». Тот же предел ждёт параллельное чтение больших таблиц —
+    # например count(*) по trades в суточной сводке и в /summary бота.
+    # /dev/shm — tmpfs: память расходуется только по факту использования.
+    shm_size: 512mb
     # Порт публикуется ТОЛЬКО на localhost сервера (§6.3 ТЗ 6.5): наружу 5432
     # закрыт навсегда (доступ к БД — только с самого сервера / из docker-сети).
     ports:

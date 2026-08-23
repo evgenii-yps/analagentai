@@ -953,14 +953,40 @@ class DB:
         )
 
     async def ensure_logic_version_schema(self) -> None:
-        """Идемпотентно создаёт таблицу границ версии логики (§6 ТЗ 8.1)."""
+        """Идемпотентно создаёт таблицу границ версии логики (§6 ТЗ 8.1).
+
+        Ограничение ``logic_version > 0`` обязательно: ноль зарезервирован под
+        признак «версия неизвестна» в ``agent_outputs_daily``. Без запрета этот
+        признак нельзя было бы отличить от реальной версии, а вечная таблица
+        итогов не должна допускать двусмысленности. Для уже созданных таблиц
+        ограничение добавляется отдельно — ``CREATE TABLE IF NOT EXISTS``
+        существующую таблицу не меняет.
+        """
         await self.pool.execute(
             """
             CREATE TABLE IF NOT EXISTS logic_version_windows (
-                logic_version SMALLINT    PRIMARY KEY,
+                logic_version SMALLINT    PRIMARY KEY CHECK (logic_version > 0),
                 started_at    TIMESTAMPTZ NOT NULL,
                 note          TEXT
             );
+            """
+        )
+        await self.pool.execute(
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                     WHERE conrelid = 'logic_version_windows'::regclass
+                       AND conname = 'logic_version_windows_version_positive'
+                ) AND NOT EXISTS (
+                    SELECT 1 FROM logic_version_windows WHERE logic_version <= 0
+                ) THEN
+                    ALTER TABLE logic_version_windows
+                        ADD CONSTRAINT logic_version_windows_version_positive
+                        CHECK (logic_version > 0);
+                END IF;
+            END $$;
             """
         )
 

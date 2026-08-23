@@ -194,7 +194,54 @@ else
                           SELECT day, agent, instrument_id FROM agent_outputs_daily
                            GROUP BY day, agent, instrument_id
                           HAVING count(DISTINCT logic_version) > 1) q;")"
-  info "суток с несколькими версиями логики: ${mixed_days:-0} (они разделены по строкам)"
+  info "суток с несколькими значениями logic_version: ${mixed_days:-0} (разделены по строкам)"
+  info "в это число входят и сутки «неизвестно → версия», где 0 не версия, а её отсутствие"
+
+  # Дефект 22.08.2026: выводам раньше самой ранней записанной границы
+  # подставлялась минимальная известная версия. Строка, целиком лежащая раньше
+  # начала СВОЕЙ версии, — признак этой подстановки. Таблица вечная, сырьё
+  # живёт 90 суток: не поймав это сейчас, проверить будет уже нечем.
+  # Два признака, потому что дефект даёт два вида строк:
+  #  а) сутки ЦЕЛИКОМ раньше начала своей версии — видно по одной дате, и это
+  #     видно всегда, даже когда сырьё уже удалено;
+  #  б) сутки границы, слитые в одну строку, — по дате неотличимы, видно только
+  #     по сырью: среди выводов строки есть сделанные раньше начала её версии,
+  #     а отдельной строки на раннюю часть суток нет.
+  false_version="$(psql_q "SELECT count(*) FROM agent_outputs_daily d
+                             JOIN logic_version_windows w USING (logic_version)
+                            WHERE d.logic_version > 0
+                              AND (d.day < w.started_at::date
+                                   OR (EXISTS (SELECT 1 FROM agent_outputs a
+                                                WHERE a.agent = d.agent
+                                                  AND a.instrument_id = d.instrument_id
+                                                  AND a.ts >= d.day::timestamptz
+                                                  AND a.ts < d.day::timestamptz + interval '1 day'
+                                                  AND a.ts < w.started_at)
+                                       AND NOT EXISTS (SELECT 1 FROM agent_outputs_daily z
+                                                        WHERE z.day = d.day
+                                                          AND z.agent = d.agent
+                                                          AND z.instrument_id = d.instrument_id
+                                                          AND z.logic_version < d.logic_version)));")"
+  if [ "${false_version:-0}" != "0" ]; then
+    block "строк итогов с ЗАВЕДОМО ЛОЖНОЙ версией: ${false_version}"
+    info  "сутки целиком раньше начала версии, которой они помечены — примените"
+    info  "миграцию 012 (db/migrations/012_unknown_logic_version.sql)"
+  else
+    ok "ложных версий в суточных итогах нет"
+  fi
+  unknown_rows="$(psql_q "SELECT count(*) FROM agent_outputs_daily
+                           WHERE logic_version = 0;")"
+  info "строк с признаком «версия неизвестна» (logic_version = 0): ${unknown_rows:-0}"
+  info "это честное «неизвестно» для выводов раньше первой записанной границы,"
+  info "а не сбой: подстановка ближайшей версии запрещена"
+  has_check="$(psql_q "SELECT count(*) FROM pg_constraint
+                        WHERE conname = 'logic_version_windows_version_positive';")"
+  if [ "${has_check:-0}" != "1" ]; then
+    block "нет ограничения logic_version > 0 на logic_version_windows:"
+    info  "ноль перестанет быть отличим от реальной версии — миграция 012 не применена"
+  else
+    ok "ноль зарезервирован под «неизвестно» ограничением на logic_version_windows"
+  fi
 fi
 info "мнения, участвовавшие в решении, остаются навсегда в signals.agents_payload"
 

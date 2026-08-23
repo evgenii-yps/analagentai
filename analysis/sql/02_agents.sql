@@ -55,6 +55,10 @@ ORDER BY agent;
 
 \echo
 \echo '--- 2.2 То же по ВСЕМ выводам agent_outputs за период целевой версии (наблюдения зависимы) ---'
+-- Здесь «целевая версия» — первая (v1), и отбор идёт по её ВЕРХНЕЙ границе.
+-- Перечисления версий тут нет и подстановки ближайшей версии тоже: всё, что
+-- раньше старта v2, относится к v1 по построению — v1 была первой, раньше неё
+-- версий не существовало.
 WITH bounds AS (
     SELECT COALESCE(
                (SELECT min(ts) FROM signals WHERE logic_version = 2),
@@ -302,23 +306,20 @@ ORDER BY 1, 2, 3;
 \echo
 \echo '--- 2.10 ЭТАП 7.3: направления Futures по версиям логики (проверка симметрии агента) ---'
 \echo '(ожидание после 7.3: bearish строго больше нуля — до 7.3 их было РОВНО НОЛЬ за 8 суток)'
-WITH bounds AS (
-    SELECT COALESCE((SELECT min(ts) FROM signals WHERE logic_version = 2),
-                    (SELECT min(ts) FROM signals WHERE logic_version = 3),
-                    (SELECT min(ts) FROM signals WHERE logic_version = 4),
-                    'infinity'::timestamptz) AS v2_start,
-           COALESCE((SELECT min(ts) FROM signals WHERE logic_version = 3),
-                    (SELECT min(ts) FROM signals WHERE logic_version = 4),
-                    'infinity'::timestamptz) AS v3_start,
-           COALESCE((SELECT min(ts) FROM signals WHERE logic_version = 4),
-                    'infinity'::timestamptz) AS v4_start
+WITH ver_windows AS (
+    -- Границы версий берутся из самих данных: в agent_outputs колонки версии
+    -- нет. Перечисление версий 1-4 убрано: оно помечало ЧЕТВЁРКОЙ выводы любой
+    -- более новой версии, а с Этапа 8.1 таких выводов большинство.
+    SELECT logic_version, min(ts) AS started_at FROM signals GROUP BY logic_version
 ), ao AS (
     SELECT a.agent, a.signal,
-           CASE WHEN a.ts < b.v2_start THEN 1
-                WHEN a.ts < b.v3_start THEN 2
-                WHEN a.ts < b.v4_start THEN 3
-                ELSE 4 END AS ver
-    FROM agent_outputs a CROSS JOIN bounds b
+           -- 0 — версия НЕИЗВЕСТНА: вывод сделан раньше первого сигнала
+           -- вообще, и определить её нечем. Тот же признак, что в
+           -- agent_outputs_daily: подставлять ближайшую версию запрещено.
+           coalesce((SELECT v.logic_version FROM ver_windows v
+                      WHERE v.started_at <= a.ts
+                      ORDER BY v.started_at DESC LIMIT 1), 0) AS ver
+    FROM agent_outputs a
     WHERE a.agent = 'futures'
 )
 SELECT ver AS logic_version,
