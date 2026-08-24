@@ -89,22 +89,66 @@ for p in settings.symbol_pairs:
 
 echo
 echo "── C. Свидетельство в журнале выгрузки ────────────────────────────────────"
+# ПРАВИЛО (Этап 8.5 §3): проверка, ищущая текст в журнале, обязана искать его в
+# том виде, в каком журнал его хранит. В проде stdout не TTY, structlog пишет
+# JSONRenderer, а он экранирует кириллицу: «Служебные листы пересобраны» лежит
+# в файле как "\u0421\u043b\u0443...". Поиск русского текста подстрокой не
+# находил НИЧЕГО и объявлял блокирующую находку на полностью исправной системе.
+# Теперь строка сначала разбирается как JSON, а признак версии берётся
+# машиночитаемым ключом horizons_h, который в файле лежит как есть.
 if [[ -r "${LOG}" ]]; then
-  echo "    последние строки «Служебные листы пересобраны»:"
-  grep 'Служебные листы пересобраны' "${LOG}" 2>/dev/null | tail -3 | sed 's/^/      /'
-  if grep -q 'Служебные листы пересобраны.*horizons_h' "${LOG}" 2>/dev/null; then
-    note_ok "в журнале есть ключ horizons_h — писавший код не старше Этапа 8.1"
+  SUMMARY=$(python3 - "${LOG}" <<'PYEOF'
+import json
+import sys
+
+has_horizons = 0
+rebuilds = []
+errors = []
+for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+    line = line.strip()
+    if not line.startswith("{"):
+        continue
+    try:
+        rec = json.loads(line)
+    except ValueError:
+        continue
+    if "horizons_h" in rec:
+        has_horizons = 1
+        rebuilds.append(rec)
+    if rec.get("level") == "error":
+        errors.append(rec)
+
+print("HAS_HORIZONS=%d" % has_horizons)
+print("ERRORS=%d" % len(errors))
+print("REBUILDS=%d" % len(rebuilds))
+for rec in rebuilds[-3:]:
+    keep = {k: rec.get(k) for k in
+            ("timestamp", "event", "windows", "horizons_h", "correlation_pairs")}
+    print("REBUILD=" + json.dumps(keep, ensure_ascii=False))
+for rec in errors[-3:]:
+    keep = {k: rec.get(k) for k in ("timestamp", "event", "error")}
+    print("ERROR=" + json.dumps(keep, ensure_ascii=False))
+PYEOF
+)
+  echo "    последние пересборки служебных листов (строки с ключом horizons_h):"
+  echo "${SUMMARY}" | sed -n 's/^REBUILD=/      /p'
+  if [[ "$(echo "${SUMMARY}" | sed -n 's/^HAS_HORIZONS=//p')" == "1" ]]; then
+    note_ok "ключ horizons_h в журнале есть — писавший код не старше Этапа 8.1"
   else
-    note_block "в журнале НЕТ ключа horizons_h: строку писал код СТАРШЕ Этапа 8.1"
+    note_block "ключа horizons_h в журнале нет: строку писал код СТАРШЕ Этапа 8.1"
   fi
-  echo "    отказы листа «Независимые окна» за всё время:"
-  grep -c 'Независимые окна' "${LOG}" 2>/dev/null | sed 's/^/      найдено строк: /'
-  grep 'Независимые окна' "${LOG}" 2>/dev/null | tail -3 | sed 's/^/      /'
+  ERR_N=$(echo "${SUMMARY}" | sed -n 's/^ERRORS=//p')
+  echo "    записей уровня error за всё время журнала: ${ERR_N:-0}"
+  echo "${SUMMARY}" | sed -n 's/^ERROR=/      /p'
+  if [[ "${ERR_N:-0}" -gt 0 ]]; then
+    note_warn "в журнале есть записи уровня error — разобрать их выше"
+  else
+    note_ok "записей уровня error в журнале нет"
+  fi
 else
   note_warn "журнал ${LOG} недоступен для чтения — свидетельство не получено"
 fi
 
-echo
 echo "── D. Истина по базе: независимые окна в разрезе токен × горизонт × версия ─"
 echo "    (окно равно длине горизонта, выравнивание по началу суток UTC)"
 psql_q "SELECT i.base AS token, e.horizon_h, s.logic_version, count(*) AS independent_windows, min(s.ts) AS ts_min, max(s.ts) AS ts_max FROM (SELECT DISTINCT ON (e2.horizon_h, s2.instrument_id, s2.logic_version, to_timestamp(floor(extract(epoch FROM s2.ts)/(e2.horizon_h*3600))*(e2.horizon_h*3600))) s2.id, s2.instrument_id, s2.logic_version, s2.ts, e2.horizon_h FROM signals s2 JOIN signal_evaluations e2 ON e2.signal_id = s2.id WHERE s2.decision <> 'wait' ORDER BY e2.horizon_h, s2.instrument_id, s2.logic_version, to_timestamp(floor(extract(epoch FROM s2.ts)/(e2.horizon_h*3600))*(e2.horizon_h*3600)), s2.ts ASC, s2.id ASC) q JOIN signals s ON s.id = q.id JOIN instruments i ON i.id = q.instrument_id JOIN signal_evaluations e ON e.signal_id = s.id AND e.horizon_h = q.horizon_h GROUP BY i.base, e.horizon_h, s.logic_version ORDER BY e.horizon_h, s.logic_version, i.base;" | sed 's/^/    /'
