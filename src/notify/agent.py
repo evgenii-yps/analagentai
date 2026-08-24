@@ -29,6 +29,7 @@ from src.notify.wording import (
     agent_paragraph,
     agent_silent_paragraph,
     is_confident,
+    target_block,
 )
 
 # TTL heartbeat-ключа (секунды).
@@ -560,6 +561,9 @@ class NotifyAgent:
             int(chat) for chat in sorted(recipients or ()) if str(chat).strip()
         )
         self._settings_cache: dict[int, tuple[UserSettings, datetime]] = {}
+        # Блок цели по горизонту в пределах ОДНОГО обрабатываемого сигнала
+        # (§8 ТЗ 8.2). Сбрасывается в начале обработки каждого сигнала.
+        self._target_cache: dict[int, list[str]] = {}
         self._log = structlog.get_logger().bind(component="notify")
 
     async def _format_config(self, instrument_id: int) -> SignalFormatConfig:
@@ -625,6 +629,9 @@ class NotifyAgent:
 
         now = datetime.now(UTC)
         strength = self._strength(signal)
+        # Цель у одного сигнала своя на каждый горизонт, но одна и та же для всех
+        # получателей с одинаковым горизонтом: читаем её один раз на горизонт.
+        self._target_cache.clear()
         metrics_by_agent: dict[str, dict[str, Any] | None] | None = None
         price_loaded = False
         price: float | None = None
@@ -683,7 +690,13 @@ class NotifyAgent:
             fmt_cfg = replace(
                 await self._format_config(instrument_id), horizon_h=user.horizon_h
             )
-            text = format_signal_message(signal, price, fmt_cfg, metrics_by_agent)
+            # Цель показывается ТОЛЬКО для горизонта, выбранного этим человеком
+            # (§8 ТЗ 8.2). Горизонты у получателей разные, поэтому цель читается
+            # на каждого получателя, а не один раз на сигнал.
+            targets = await self._signal_target(signal, user.horizon_h)
+            text = format_signal_message(
+                signal, price, fmt_cfg, metrics_by_agent, target_block=targets
+            )
             if not await send_message(text, chat_id=str(chat_id)):
                 # Не отправилось (сеть/Telegram) — состояние не двигаем, чтобы
                 # следующая итерация попробовала снова.
@@ -745,6 +758,35 @@ class NotifyAgent:
         )
         self._settings_cache[chat_id] = (settings_obj, datetime.now(UTC))
         return settings_obj
+
+    async def _signal_target(
+        self, signal: dict[str, Any], horizon_h: int
+    ) -> list[str]:
+        """Блок цели для выбранного человеком горизонта (§8 ТЗ 8.2).
+
+        Читается ЗАМОРОЖЕННАЯ цель этого сигнала (``signal_targets``), а не
+        сегодняшняя из ``risk_targets``: человеку показывается то, что было
+        измерено В МОМЕНТ СИГНАЛА. Иначе сообщение о вчерашнем сигнале меняло бы
+        свою цель вместе с рынком, и сверить сказанное со случившимся было бы
+        нельзя.
+
+        Сбой чтения не отменяет уведомление: сигнал важнее цели (§6 ТЗ). В этом
+        случае блок цели пуст — выдуманное число не подставляется.
+        """
+        cached = self._target_cache.get(horizon_h)
+        if cached is not None:
+            return cached
+        try:
+            row = await db.get_signal_target(int(signal["id"]), int(horizon_h))
+        except Exception as exc:  # noqa: BLE001 — уведомление важнее цели
+            self._log.warning(
+                "risk_targets_read_failed=1",
+                signal_id=signal.get("id"), horizon_h=horizon_h, error=str(exc),
+            )
+            return []
+        block = target_block(row)
+        self._target_cache[horizon_h] = block
+        return block
 
     async def _agent_metrics(
         self, signal: dict[str, Any], instrument_id: int

@@ -22,6 +22,7 @@ from src.notify.agent import (
     compute_agreement,
     normalize_payload,
 )
+from src.notify.wording import target_block
 
 # Часовой пояс отображения (заказчик в МСК). Сервер и БД живут в UTC.
 _MSK = ZoneInfo("Europe/Moscow")
@@ -303,8 +304,17 @@ def render_last(signals: list[dict[str, Any]], notified_only: bool, now: datetim
     return "\n".join(lines)
 
 
-def render_signal_card(card: dict[str, Any] | None, now: datetime) -> str:
-    """/signal <id>: полная карточка одного сигнала."""
+def render_signal_card(
+    card: dict[str, Any] | None,
+    now: datetime,
+    horizon_h: int | None = None,
+) -> str:
+    """/signal <id>: полная карточка одного сигнала.
+
+    ``horizon_h`` — горизонт, выбранный человеком в /settings. Цель показывается
+    ТОЛЬКО для него (§8 ТЗ 8.2): показ всех четырёх целей сразу превратил бы
+    карточку в набор чисел, из которых человек выбирал бы удобное.
+    """
     if card is None:
         return "Сигнал с таким id не найден. Проверьте номер и повторите."
 
@@ -348,6 +358,15 @@ def render_signal_card(card: dict[str, Any] | None, now: datetime) -> str:
     price = card.get("price_at_signal")
     if price is not None:
         lines.append(f"Цена на момент сигнала: {round(float(price)):,}".replace(",", " "))
+
+    # Цель и доля её достижения — ВСЕГДА вместе, одним блоком (§8, §12 ТЗ 8.2).
+    # Решение 'wait' целей не имеет: цель — это ход в сторону сделки, а сделки нет.
+    if card.get("decision") in ("buy", "sell") and horizon_h is not None:
+        targets = card.get("targets_by_horizon") or {}
+        block = target_block(targets.get(int(horizon_h)))
+        lines.append("")
+        lines.append(f"<b>Цель на {horizon_h} ч:</b>")
+        lines.extend(block)
 
     payload = normalize_payload(card.get("agents_payload"))
     present = {e.get("agent") for e in payload}

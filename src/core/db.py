@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 import asyncpg
@@ -609,8 +610,11 @@ class DB:
         calibration_id: int | None = None,
         inputs_hash: str | None = None,
         is_repeat: bool = False,
-    ) -> None:
+        targets: list[dict[str, Any]] | None = None,
+    ) -> int:
         """INSERT итогового решения в ``signals`` (status остаётся 'open').
+
+        Возвращает идентификатор записанного сигнала.
 
         ``logic_version`` — версия логики агрегации/агентов, фиксирует границу
         режимов Этапов 7.0/7.2/7.3.
@@ -620,16 +624,23 @@ class DB:
         ``calibrated_probability`` — вероятность по накопленным исходам; NULL,
         пока активной кривой нет. ``inputs_hash``/``is_repeat`` — учёт инерции
         входов (Блок C).
+
+        ``targets`` (Этап 8.2 §6) — замороженные цели по горизонтам. Пишутся В
+        ТОЙ ЖЕ ТРАНЗАКЦИИ, что и сам сигнал: иначе возможна пара «сигнал есть,
+        цели нет» или наоборот, и постфактум нельзя восстановить, что именно
+        было сказано человеку. Все значения целей вычисляются ДО транзакции,
+        внутри неё только вставки — чтобы расчёт целей не мог удержать
+        транзакцию сигнала открытой.
         """
         query = """
             INSERT INTO signals
                 (instrument_id, decision, probability, agents_payload, rationale,
                  logic_version, degraded, calibrated_probability, calibration_id,
                  inputs_hash, is_repeat)
-            VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11);
+            VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11)
+            RETURNING id;
         """
-        await self.pool.execute(
-            query,
+        args = (
             instrument_id,
             decision,
             float(probability),
@@ -642,6 +653,123 @@ class DB:
             inputs_hash,
             bool(is_repeat),
         )
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                signal_id = int(await conn.fetchval(query, *args))
+                for target in targets or ():
+                    await conn.execute(SIGNAL_TARGET_INSERT, *_signal_target_args(
+                        signal_id, target
+                    ))
+        return signal_id
+
+    # --- Цели по вероятности (Этап 8.2) ---
+
+    async def ensure_risk_targets_schema(self) -> None:
+        """Идемпотентно создаёт таблицы целей (миграция 014).
+
+        Сервисы проекта гарантируют свою схему при старте: миграция могла быть
+        не применена на уже работающем томе, а падать из-за отсутствия
+        УКРАШЕНИЯ сигнал не должен (§6 ТЗ 8.2 — сигнал важнее цели).
+        """
+        await self.pool.execute(RISK_TARGETS_DDL)
+        await self.pool.execute(SIGNAL_TARGETS_DDL)
+        await self.pool.execute(
+            "CREATE INDEX IF NOT EXISTS ix_risk_targets_latest "
+            "ON risk_targets (instrument_id, horizon_h, direction, computed_at DESC);"
+        )
+
+    async def save_risk_target(self, row: dict[str, Any]) -> None:
+        """INSERT строки risk_targets. Существующие строки НЕ обновляются.
+
+        Ежесуточный пересчёт пишет НОВУЮ строку с новым ``computed_at``: старые
+        остаются историей изменения целей. ``ON CONFLICT DO NOTHING`` защищает
+        только от повторного запуска в ту же микросекунду.
+        """
+        await self.pool.execute(
+            """
+            INSERT INTO risk_targets
+                (instrument_id, horizon_h, direction, computed_at, window_days,
+                 data_from, data_to, n_observations, target_pct, hit_rate,
+                 mfe_p25, mfe_p50, mfe_p75, cost_roundtrip_pct, covers_fees,
+                 no_target_reason, source, targets_version)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                    $14, $15, $16, $17, $18)
+            ON CONFLICT (instrument_id, horizon_h, direction, computed_at)
+            DO NOTHING;
+            """,
+            int(row["instrument_id"]),
+            int(row["horizon_h"]),
+            str(row["direction"]),
+            row["computed_at"],
+            int(row["window_days"]),
+            row["data_from"],
+            row["data_to"],
+            int(row["n_observations"]),
+            _num(row.get("target_pct")),
+            _num(row.get("hit_rate")),
+            _num(row.get("mfe_p25")),
+            _num(row.get("mfe_p50")),
+            _num(row.get("mfe_p75")),
+            _num(row["cost_roundtrip_pct"]),
+            bool(row.get("covers_fees", False)),
+            row.get("no_target_reason"),
+            str(row["source"]),
+            int(row["targets_version"]),
+        )
+
+    async def get_latest_risk_target(
+        self, instrument_id: int, horizon_h: int, direction: str
+    ) -> dict[str, Any] | None:
+        """Самая свежая строка risk_targets по (инструмент, горизонт, направление)."""
+        row = await self.pool.fetchrow(
+            """
+            SELECT instrument_id, horizon_h, direction, computed_at, window_days,
+                   n_observations, target_pct, hit_rate, cost_roundtrip_pct,
+                   covers_fees, no_target_reason, targets_version
+            FROM risk_targets
+            WHERE instrument_id = $1 AND horizon_h = $2 AND direction = $3
+            ORDER BY computed_at DESC
+            LIMIT 1;
+            """,
+            int(instrument_id), int(horizon_h), str(direction),
+        )
+        return dict(row) if row is not None else None
+
+    async def get_signal_target(
+        self, signal_id: int, horizon_h: int
+    ) -> dict[str, Any] | None:
+        """Замороженная цель сигнала по горизонту (или None, если её не писали)."""
+        row = await self.pool.fetchrow(
+            """
+            SELECT signal_id, horizon_h, direction, price_at_signal, target_pct,
+                   target_price, hit_rate, covers_fees, no_target_reason,
+                   risk_target_computed_at, targets_version, frozen_at
+            FROM signal_targets
+            WHERE signal_id = $1 AND horizon_h = $2;
+            """,
+            int(signal_id), int(horizon_h),
+        )
+        return dict(row) if row is not None else None
+
+    async def get_backtest_candles(
+        self, inst_id: str, bar: str, since: datetime
+    ) -> list[dict[str, Any]]:
+        """Часовые свечи спота из ``backtest.candles`` по возрастанию времени.
+
+        Читается ИМЕННО эта таблица, а не ``public.ohlcv``: в ней лежит история
+        нужной глубины (90 суток), и она хранит внутрисвечные максимум и
+        минимум, без которых цель по касанию посчитать нельзя.
+        """
+        rows = await self.pool.fetch(
+            """
+            SELECT open_time, open, high, low, close
+            FROM backtest.candles
+            WHERE inst_id = $1 AND bar = $2 AND open_time >= $3
+            ORDER BY open_time ASC;
+            """,
+            inst_id, bar, since,
+        )
+        return [dict(r) for r in rows]
 
     # --- Калибровочные кривые (Этап 7.3, Блок B) ---
 
@@ -1293,3 +1421,93 @@ def _split_symbol(symbol: str) -> tuple[str, str]:
 
 # Глобальный синглтон слоя доступа к БД.
 db = DB()
+
+
+# --- DDL и вспомогательные функции целей по вероятности (Этап 8.2) ---
+# Повторяют миграцию 014 дословно. Дублирование намеренное и принято в проекте:
+# миграция применяется руками, а сервис обязан подниматься и на томе, где её
+# ещё не применили, — иначе отсутствие УКРАШЕНИЯ (цели) останавливало бы выдачу
+# сигналов, что прямо запрещено §6 ТЗ 8.2.
+
+RISK_TARGETS_DDL = """
+CREATE TABLE IF NOT EXISTS risk_targets (
+    instrument_id      INT         NOT NULL REFERENCES instruments(id),
+    horizon_h          SMALLINT    NOT NULL,
+    direction          TEXT        NOT NULL CHECK (direction IN ('buy','sell')),
+    computed_at        TIMESTAMPTZ NOT NULL,
+    window_days        SMALLINT    NOT NULL,
+    data_from          TIMESTAMPTZ NOT NULL,
+    data_to            TIMESTAMPTZ NOT NULL,
+    n_observations     INT         NOT NULL,
+    target_pct         NUMERIC(10,5),
+    hit_rate           NUMERIC(6,5),
+    mfe_p25            NUMERIC(10,5),
+    mfe_p50            NUMERIC(10,5),
+    mfe_p75            NUMERIC(10,5),
+    cost_roundtrip_pct NUMERIC(6,4)  NOT NULL,
+    covers_fees        BOOLEAN       NOT NULL DEFAULT FALSE,
+    no_target_reason   TEXT,
+    source             TEXT        NOT NULL,
+    targets_version    SMALLINT    NOT NULL,
+    PRIMARY KEY (instrument_id, horizon_h, direction, computed_at)
+);
+"""
+
+SIGNAL_TARGETS_DDL = """
+CREATE TABLE IF NOT EXISTS signal_targets (
+    signal_id            BIGINT      NOT NULL REFERENCES signals(id),
+    horizon_h            SMALLINT    NOT NULL,
+    direction            TEXT        NOT NULL CHECK (direction IN ('buy','sell')),
+    price_at_signal      DOUBLE PRECISION NOT NULL,
+    target_pct           NUMERIC(10,5),
+    target_price         DOUBLE PRECISION,
+    hit_rate             NUMERIC(6,5),
+    covers_fees          BOOLEAN     NOT NULL DEFAULT FALSE,
+    no_target_reason     TEXT,
+    risk_target_computed_at TIMESTAMPTZ,
+    targets_version      SMALLINT,
+    frozen_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (signal_id, horizon_h)
+);
+"""
+
+# Строки signal_targets НИКОГДА не обновляются (§3, §12 ТЗ 8.2), поэтому
+# запрос — чистый INSERT без UPDATE в конфликте. ``DO NOTHING`` нужен на случай
+# повторной попытки записи того же сигнала после сбоя сети: он оставляет
+# ПЕРВУЮ версию строки, а не переписывает её второй.
+SIGNAL_TARGET_INSERT = """
+    INSERT INTO signal_targets
+        (signal_id, horizon_h, direction, price_at_signal, target_pct,
+         target_price, hit_rate, covers_fees, no_target_reason,
+         risk_target_computed_at, targets_version)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+    ON CONFLICT (signal_id, horizon_h) DO NOTHING;
+"""
+
+
+def _num(value: Any) -> Any:
+    """Число для колонки NUMERIC: asyncpg принимает Decimal, но не float.
+
+    Округление до знаков, заданных типом колонки, выполняет сама база.
+    """
+    if value is None:
+        return None
+    return Decimal(str(float(value)))
+
+
+def _signal_target_args(signal_id: int, target: dict[str, Any]) -> tuple[Any, ...]:
+    """Аргументы INSERT замороженной цели в порядке SIGNAL_TARGET_INSERT."""
+    return (
+        int(signal_id),
+        int(target["horizon_h"]),
+        str(target["direction"]),
+        float(target["price_at_signal"]),
+        _num(target.get("target_pct")),
+        None if target.get("target_price") is None else float(target["target_price"]),
+        _num(target.get("hit_rate")),
+        bool(target.get("covers_fees", False)),
+        target.get("no_target_reason"),
+        target.get("risk_target_computed_at"),
+        None if target.get("targets_version") is None
+        else int(target["targets_version"]),
+    )
