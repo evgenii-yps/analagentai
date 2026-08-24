@@ -364,6 +364,80 @@ def section_agent_failures() -> list[str]:
     return lines
 
 
+# Порог доли insufficient_data, выше которого молчание агента попадает в сводку
+# как замечание (§6 ТЗ 8.6). Ниже порога строка не печатается вовсе: сводку
+# читают каждый день, и шум в ней хуже отсутствия строки.
+SILENCE_SHARE_WARN = 0.50
+
+# Сколько часов подряд молчания по одному инструменту считать поводом для
+# отдельного сообщения. Сутки выбраны потому, что именно столько агент
+# деривативов молчал на четырёх токенах из пяти незамеченным (замер 8.5).
+SILENCE_HOURS_ALERT = 24
+
+
+def section_agent_silence() -> list[str]:
+    """Доля insufficient_data по агенту и инструменту за 24 часа (§6 ТЗ 8.6).
+
+    Зачем отдельная секция. ``insufficient_data`` — ШТАТНЫЙ исход: агент не
+    бросает исключения и в ``agent_failures`` не попадает, и это сознательное
+    решение Этапа 7.2 (отличать «данных нет» от «агент сломался»). Но из-за
+    этого молчание агента не видел никто: замер 8.5 показал агент деривативов,
+    молчавший на четырёх токенах из пяти полтора суток при нуле записей в
+    журнале сбоев. Здесь молчание становится видимым, а логика агентов не
+    меняется — это надзор, а не поведение.
+
+    Отдельной строкой отмечается инструмент, по которому агент не сказал ничего
+    содержательного дольше ``SILENCE_HOURS_ALERT`` часов подряд.
+    """
+    lines = ["<b>🔇 Молчание агентов за 24 часа</b>"]
+    out = _psql(
+        "SELECT a.agent, i.base, "
+        "count(*) FILTER (WHERE a.signal='insufficient_data'), "
+        "count(*), "
+        "round(extract(epoch FROM now() - coalesce(max(a.ts) FILTER "
+        "(WHERE a.signal<>'insufficient_data'), min(a.ts))) / 3600.0) "
+        "FROM agent_outputs a JOIN instruments i ON i.id = a.instrument_id "
+        "WHERE a.ts > now() - interval '24 hours' "
+        "GROUP BY a.agent, i.base ORDER BY a.agent, i.base;"
+    )
+    if not out:
+        lines.append("🟢 Выводов за сутки нет — сравнивать нечего.")
+        return lines
+
+    noisy: list[str] = []
+    alerts: list[str] = []
+    for row in out.splitlines():
+        parts = row.split("|")
+        if len(parts) < 5:
+            continue
+        agent, token, silent_raw, total_raw, hours_raw = parts[:5]
+        try:
+            silent, total = int(silent_raw), int(total_raw)
+            hours = float(hours_raw or 0)
+        except ValueError:
+            continue
+        if total == 0:
+            continue
+        share = silent / total
+        if share >= SILENCE_SHARE_WARN:
+            noisy.append(
+                f"🟡 {_esc(agent)} / {_esc(token)}: молчит "
+                f"{share * 100:.0f}% выводов ({silent} из {total})"
+            )
+        if silent == total and hours >= SILENCE_HOURS_ALERT:
+            alerts.append(
+                f"🔴 {_esc(agent)} / {_esc(token)}: ни одного содержательного "
+                f"вывода {hours:.0f} ч подряд"
+            )
+
+    if not noisy and not alerts:
+        lines.append("🟢 Все агенты говорят по всем инструментам.")
+        return lines
+    lines.extend(alerts)
+    lines.extend(noisy)
+    return lines
+
+
 def section_db_and_errors() -> list[str]:
     lines = ["<b>🗄 БД и ошибки</b>"]
     size = _psql("SELECT pg_size_pretty(pg_database_size(current_database()));")
@@ -389,6 +463,7 @@ def build_message() -> str:
         "\n".join(section_data_24h()),
         "\n".join(section_signals_24h()),
         "\n".join(section_agent_failures()),
+        "\n".join(section_agent_silence()),
         "\n".join(section_db_and_errors()),
     ]
     return "\n\n".join(blocks)
