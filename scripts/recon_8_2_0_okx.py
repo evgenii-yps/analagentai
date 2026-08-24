@@ -20,7 +20,8 @@ SYMBOLS (§1 ТЗ 8.1). Формат аргумента — ``СПОТ:КОНТ�
 
     sudo -u agent bash -c 'cd /opt/agent-trade && docker compose --profile backtest \
         run --rm backtest python scripts/recon_8_2_0_okx.py \
-        --pairs BTC-USDT:BTC-USDT-SWAP,ETH-USDT:ETH-USDT-SWAP,SOL-USDT:SOL-USDT-SWAP,XRP-USDT:XRP-USDT-SWAP,DOGE-USDT:DOGE-USDT-SWAP'
+        --pairs BTC-USDT:BTC-USDT-SWAP,ETH-USDT:ETH-USDT-SWAP,\
+SOL-USDT:SOL-USDT-SWAP,XRP-USDT:XRP-USDT-SWAP,DOGE-USDT:DOGE-USDT-SWAP'
 """
 
 from __future__ import annotations
