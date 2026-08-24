@@ -498,7 +498,7 @@ setup_operations() {
     log "Автозапуск включён (systemctl enable agent-trade)."
 
     # Регламентные задачи (§8–§11) — cron под пользователем agent.
-    log "Прописываю cron-задачи (бэкап §8, хранение §9, сводка §10, вотчдог §11)."
+    log "Прописываю cron-задачи (бэкап §8, хранение §9, сводка §10, вотчдог §11, цели 8.2 §7)."
     cat > /etc/cron.d/agent-trade <<EOF
 # Agent Trade — регламентные задачи (Этап 6.5). Выполняются под пользователем ${APP_USER}.
 SHELL=/bin/bash
@@ -517,6 +517,11 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # Этап 7.3 Калибровочная кривая — ежедневно 05:30 UTC, ДО суточной сводки в 06:00,
 # чтобы сводка показывала актуальное состояние кривой (внутри контейнера, D-3)
 30 5 * * * ${APP_USER} cd ${APP_DIR} && /usr/bin/docker compose --profile tools run --rm --no-deps calibration >> ${APP_DIR}/logs/calibration.log 2>&1
+# Этап 8.2 §7 Цели по вероятности — ежедневно 03:40 UTC (внутри контейнера, D-3).
+# Пересчёт сам догружает свежий край свечей и сам выполняет предпроверку §1;
+# инструмент, её не прошедший, получает пустую цель с причиной data_gap, а не
+# выдуманное число.
+40 3 * * * ${APP_USER} cd ${APP_DIR} && /usr/bin/docker compose --profile tools run --rm --no-deps risk >> ${APP_DIR}/logs/risk.log 2>&1
 EOF
     chmod 644 /etc/cron.d/agent-trade
     log "Cron-задачи установлены (/etc/cron.d/agent-trade)."

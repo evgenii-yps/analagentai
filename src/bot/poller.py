@@ -232,7 +232,7 @@ class BotPoller:
         if cmd == "last":
             return await self._cmd_last(args, now, chat_id)
         if cmd == "signal":
-            return await self._cmd_signal(args, now)
+            return await self._cmd_signal(args, now, chat_id)
         if cmd == "agents":
             return await self._cmd_agents(now)
         if cmd == "stats":
@@ -394,12 +394,14 @@ class BotPoller:
         )
         return handlers.render_last(signals, notified_only, now)
 
-    async def _cmd_signal(self, args: list[str], now: datetime) -> str:
+    async def _cmd_signal(self, args: list[str], now: datetime, chat_id: int) -> str:
+        """/signal <id>: карточка сигнала с целью на ВЫБРАННОМ горизонте (§8 ТЗ 8.2)."""
         signal_id = handlers.parse_signal_id(args)
         if signal_id is None:
             return "Укажите номер сигнала: например, /signal 1847"
         card = await self.queries.signal_card(signal_id)
-        return handlers.render_signal_card(card, now)
+        user = await self._chat_settings(chat_id)
+        return handlers.render_signal_card(card, now, user.horizon_h)
 
     async def _cmd_agents(self, now: datetime) -> str:
         rows = await self.queries.latest_agents(list(AGENT_ORDER))

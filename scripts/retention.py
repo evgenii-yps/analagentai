@@ -71,6 +71,12 @@ PROTECTED_TABLES: frozenset[str] = frozenset(
         "calibration_curves",
         "signal_exports",
         "logic_version_windows",
+        # Этап 8.2 §3: цели по вероятности и их заморозка. Объём мал (5
+        # инструментов x 4 горизонта x 2 направления = 40 строк в сутки), а
+        # ценность вся в истории: удалив signal_targets, нельзя ответить на
+        # вопрос «какую цель система назвала в момент сигнала и сбылась ли она».
+        "risk_targets",
+        "signal_targets",
     }
 )
 

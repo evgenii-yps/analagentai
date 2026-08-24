@@ -275,6 +275,26 @@ class BotQueries:
         card["eval_1h"] = by_horizon.get("1h")
         card["eval_4h"] = by_horizon.get("4h")
 
+        # Замороженные цели сигнала (Этап 8.2 §6). Читается именно то, что было
+        # сказано человеку В МОМЕНТ СИГНАЛА, а не сегодняшняя цель из
+        # risk_targets: карточка обязана показывать сказанное, а не текущее.
+        # Отсутствие таблицы — не повод ронять карточку: она существует с
+        # миграции 014, а /signal работает и на томе, где её ещё не применили.
+        try:
+            targets = await self._pool.fetch(
+                """
+                SELECT horizon_h, direction, target_pct, target_price, hit_rate,
+                       covers_fees, no_target_reason
+                FROM signal_targets WHERE signal_id = $1;
+                """,
+                signal_id,
+            )
+            card["targets_by_horizon"] = {
+                int(t["horizon_h"]): dict(t) for t in targets
+            }
+        except Exception:  # noqa: BLE001 — карточка важнее блока цели
+            card["targets_by_horizon"] = {}
+
         # Цена на момент сигнала — close ближайшей 1m-свечи на/до ts.
         card["price_at_signal"] = await self._pool.fetchval(
             """

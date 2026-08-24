@@ -36,6 +36,10 @@ async def run() -> None:
     # Этап 7.3: калиброванная вероятность (Блок B) и учёт инерции входов (Блок C).
     await db.ensure_calibration_schema()
     await db.ensure_signals_inertia()
+    # Этап 8.2 §6: таблицы целей. Гарантируем их и здесь — миграция 014 могла
+    # быть не применена на уже работающем томе, а падать из-за отсутствия
+    # УКРАШЕНИЯ решение не должно: сигнал важнее цели.
+    await db.ensure_risk_targets_schema()
 
     tasks: list[asyncio.Task[None]] = []
     try:

@@ -136,11 +136,15 @@ curl -fsSL https://raw.githubusercontent.com/evgenii-yps/analagentai/claude/depl
 │   ├── agent-trade.service # systemd-юнит автозапуска стека
 │   ├── apps_script.gs      # код приёмника Google Таблицы (выгрузка 6.6)
 │   ├── agent-trade-export.cron        # шаблон cron-записи выгрузки
+│   ├── agent-trade-risk.cron          # шаблон cron-записи пересчёта целей (8.2)
+│   ├── verify_8_2.sh                  # проверка развёртывания Этапа 8.2
 │   └── logrotate-agent-trade-export   # ротация лога выгрузки
 ├── scripts/                # вспомогательные скрипты эксплуатации (хост, stdlib)
 │   ├── geo_check.py        # блокирующий гео-тест OKX (REST + WebSocket, stdlib)
 │   ├── backup_db.sh        # ежедневный бэкап БД с ротацией
 │   ├── retention.py        # политика хранения (очистка старых сырых данных)
+│   ├── precheck_8_2.sql    # предпроверка глубины и целостности свечей (Этап 8.2 §1)
+│   ├── backfill_8_2.py     # разовая догрузка 95 суток часовых свечей спота (8.2 §2)
 │   └── watchdog.py         # вотчдог: перезапуск упавших сервисов + алерт
 ├── src/
 │   ├── main.py             # точка входа — сервис-коллектор
@@ -150,6 +154,7 @@ curl -fsSL https://raw.githubusercontent.com/evgenii-yps/analagentai/claude/depl
 │   ├── evaluator_main.py   # точка входа — оценщик результатов
 │   ├── export_main.py      # точка входа — выгрузка сигналов (docker compose run)
 │   ├── bot_main.py         # точка входа — телеграм-бот только на чтение (Этап 6.7)
+│   ├── risk_main.py        # точка входа — пересчёт целей по вероятности (Этап 8.2)
 │   ├── healthcheck.py      # CLI-проверка PG и Redis
 │   ├── core/
 │   │   ├── config.py       # Settings (pydantic-settings)
@@ -163,6 +168,10 @@ curl -fsSL https://raw.githubusercontent.com/evgenii-yps/analagentai/claude/depl
 │   ├── notify/             # NotifyAgent + should_notify + Telegram
 │   ├── bot/                # телеграм-бот на чтение: poller/handlers/queries/runner
 │   ├── evaluator/          # compute_evaluation + класс Evaluator
+│   ├── risk/               # цели по вероятности (Этап 8.2)
+│   │   ├── targets.py      # MFE по касанию, 40-й процентиль, покрытие издержек
+│   │   ├── quality.py      # предпроверка ряда свечей (пороги §1)
+│   │   └── runner.py       # суточный пересчёт risk_targets
 │   ├── export/             # выгрузка сигналов (Этап 6.6)
 │   │   ├── transform.py    # чистые функции: строки листов, окно 4ч, свойства Notion
 │   │   ├── queries.py      # SQL выборки/агрегатов/учёта выгрузок

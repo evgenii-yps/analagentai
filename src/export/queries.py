@@ -55,6 +55,90 @@ _WINDOW_EXPR = (
 )
 
 
+# --- Версия логики в выборке (Этап 8.2 §9) ----------------------------------
+#
+# ЗАМЕР 24.08.2026: лист «Независимые окна» содержал строки версий 1, 2 и 3
+# вперемешку, потому что в условии отбора не было ни слова про logic_version.
+# Смешанный лист непригоден как источник: сравнивать исходы разных версий
+# логики нельзя по построению — у них разный состав агентов, разные пороги и
+# разный набор горизонтов. Ждать на нём «накопления статистики» бессмысленно.
+#
+# Версия НЕ зашивается числом в код: она берётся из ``logic_version_windows``,
+# где её фиксирует Decision Agent при первом старте на новой версии.
+
+LOGIC_VERSION_ALL = "all"
+LOGIC_VERSION_CURRENT = "current"
+
+# Версия 0 означает «версия неизвестна» (миграция 012) и не является настоящей
+# версией. Такие строки не попадают в выборку НИ ПРИ КАКОМ значении параметра
+# (§9.5): смешать их с чем угодно — значит объявить неизвестное известным.
+UNKNOWN_LOGIC_VERSION = 0
+
+
+class ExportVersionError(ValueError):
+    """Неверное значение EXPORT_LOGIC_VERSION: выгрузка не начинается вовсе."""
+
+
+async def resolve_logic_version(
+    conn: asyncpg.Connection,
+    raw: str,
+) -> int | None:
+    """Значение EXPORT_LOGIC_VERSION → номер версии или ``None`` для «all».
+
+    ``current`` — ПОСЛЕДНЯЯ ОТКРЫТАЯ версия из ``logic_version_windows``, то
+    есть та, на которой система работает сейчас. Число — именно эта версия.
+    ``all`` — фильтра по версии нет, и лист обязан начинаться прямой оговоркой
+    о смешивании (§9.3).
+
+    Пустая ``logic_version_windows`` при ``current`` — это остановка, а не
+    молчаливый переход к «all»: без границы версии выборка была бы смешанной
+    ровно в том виде, ради устранения которого параметр и заводился.
+    """
+    value = (raw or "").strip().lower()
+    if not value:
+        value = LOGIC_VERSION_CURRENT
+    if value == LOGIC_VERSION_ALL:
+        return None
+    if value == LOGIC_VERSION_CURRENT:
+        version = await conn.fetchval(
+            "SELECT logic_version FROM logic_version_windows "
+            "WHERE logic_version > 0 ORDER BY started_at DESC, logic_version DESC "
+            "LIMIT 1;"
+        )
+        if version is None:
+            raise ExportVersionError(
+                "EXPORT_LOGIC_VERSION=current, но таблица logic_version_windows "
+                "пуста: границу версии фиксирует Decision Agent при старте. "
+                "Пока её нет, выборка была бы смешанной по версиям — а именно "
+                "это §9 ТЗ 8.2 и запрещает"
+            )
+        return int(version)
+    try:
+        version = int(value)
+    except ValueError as exc:
+        raise ExportVersionError(
+            f"EXPORT_LOGIC_VERSION={raw!r}: допустимы «current», целое число "
+            f"или «all»"
+        ) from exc
+    if version <= 0:
+        raise ExportVersionError(
+            "EXPORT_LOGIC_VERSION: ноль зарезервирован под признак «версия "
+            "неизвестна» и настоящей версией быть не может"
+        )
+    return version
+
+
+def logic_version_condition(version: int | None, placeholder: str) -> str:
+    """Условие отбора по версии логики для WHERE.
+
+    Версия 0 отсекается ВСЕГДА, даже при ``all``: «версия неизвестна» — это не
+    версия, и в выборку такие строки не попадают ни при каком значении (§9.5).
+    """
+    if version is None:
+        return f"s.logic_version <> {UNKNOWN_LOGIC_VERSION}"
+    return f"s.logic_version = {placeholder}"
+
+
 async def apply_migrations(conn: asyncpg.Connection) -> None:
     """Идемпотентно применяет схему §4 (таблица учёта + колонка notified_at)."""
     await conn.execute(
@@ -141,6 +225,7 @@ async def fetch_independent_windows(conn: asyncpg.Connection) -> list[dict[str, 
 async def fetch_independent_by_token_horizon(
     conn: asyncpg.Connection,
     horizons_h: list[int],
+    logic_version: int | None = None,
 ) -> list[dict[str, Any]]:
     """Независимые наблюдения ПО ТОКЕНУ И ПО ГОРИЗОНТУ (§7 ТЗ 8.1).
 
@@ -155,6 +240,13 @@ async def fetch_independent_by_token_horizon(
     """
     if not horizons_h:
         return []
+    # Фильтр по версии логики (§9.1 ТЗ 8.2). Без него лист смешивал версии, и
+    # прореживание «одно наблюдение на окно» выбирало ПЕРВЫЙ сигнал окна —
+    # то есть систематически более старую версию.
+    args: list[Any] = [[int(h) for h in horizons_h]]
+    if logic_version is not None:
+        args.append(int(logic_version))
+    condition = logic_version_condition(logic_version, f"${len(args)}")
     query = f"""
         SELECT DISTINCT ON (e.horizon_h, i.id, win)
                {_SIGNAL_COLUMNS},
@@ -172,15 +264,17 @@ async def fetch_independent_by_token_horizon(
         JOIN signal_evaluations e ON e.signal_id = s.id
         WHERE s.decision <> 'wait'
           AND e.horizon_h = ANY($1::int[])
+          AND {condition}
         ORDER BY e.horizon_h, i.id, win, s.ts ASC;
     """
-    rows = await conn.fetch(query, [int(h) for h in horizons_h])
+    rows = await conn.fetch(query, *args)
     return [dict(r) for r in rows]
 
 
 async def fetch_outcome_correlation(
     conn: asyncpg.Connection,
     horizons_h: list[int],
+    logic_version: int | None = None,
 ) -> list[dict[str, Any]]:
     """Корреляция исходов между токенами по каждому горизонту (§7 ТЗ 8.1).
 
@@ -191,12 +285,20 @@ async def fetch_outcome_correlation(
     """
     if not horizons_h:
         return []
-    query = """
+    # §9.1 и §9.4 ТЗ 8.2. До этой правки корреляция исходов считалась ПОПЕРЁК
+    # версий логики, и увидеть это по листу было невозможно: колонки версии в
+    # нём не было вовсе. Теперь версия и отбирается, и печатается.
+    args: list[Any] = [[int(h) for h in horizons_h]]
+    if logic_version is not None:
+        args.append(int(logic_version))
+    condition = logic_version_condition(logic_version, f"${len(args)}")
+    query = f"""
         WITH indep AS (
             SELECT DISTINCT ON (e.horizon_h, s.instrument_id, win)
                    e.horizon_h,
                    s.instrument_id,
                    i.base AS token,
+                   s.logic_version,
                    to_timestamp(
                        floor(extract(epoch FROM s.ts) / (e.horizon_h * 3600))
                        * (e.horizon_h * 3600)
@@ -207,6 +309,7 @@ async def fetch_outcome_correlation(
             JOIN signal_evaluations e ON e.signal_id = s.id
             WHERE s.decision <> 'wait'
               AND e.horizon_h = ANY($1::int[])
+              AND {condition}
             ORDER BY e.horizon_h, s.instrument_id, win, s.ts ASC
         )
         SELECT a.horizon_h,
@@ -214,14 +317,23 @@ async def fetch_outcome_correlation(
                b.token AS token_b,
                count(*) AS n,
                corr(CASE WHEN a.success THEN 1.0 ELSE 0.0 END,
-                    CASE WHEN b.success THEN 1.0 ELSE 0.0 END) AS r
+                    CASE WHEN b.success THEN 1.0 ELSE 0.0 END) AS r,
+               -- Версия печатается ОДНОЙ на пару: при фильтре она одна по
+               -- построению, при «all» разные версии дают строку с пометкой
+               -- «смешано» — молча усреднять их по колонке нельзя.
+               CASE WHEN count(DISTINCT a.logic_version) = 1
+                         AND count(DISTINCT b.logic_version) = 1
+                         AND min(a.logic_version) = min(b.logic_version)
+                    THEN min(a.logic_version)::text
+                    ELSE 'смешано'
+               END AS logic_version
         FROM indep a
         JOIN indep b
           ON b.horizon_h = a.horizon_h AND b.win = a.win AND a.token < b.token
         GROUP BY a.horizon_h, a.token, b.token
         ORDER BY a.horizon_h, a.token, b.token;
     """
-    rows = await conn.fetch(query, [int(h) for h in horizons_h])
+    rows = await conn.fetch(query, *args)
     return [dict(r) for r in rows]
 
 
