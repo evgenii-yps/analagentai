@@ -348,8 +348,16 @@ docker compose exec postgres psql -U agenttrade -d agenttrade -c \
 2. Поднимите всё окружение:
 
    ```bash
-   docker compose up --build
+   docker compose up --build --remove-orphans
    ```
+
+   > **Зачем `--remove-orphans`.** Контейнер, оставшийся от services, которого в
+   > текущем `docker-compose.yml` уже нет, docker compose не удаляет сам — он
+   > лишь предупреждает о нём при КАЖДОЙ команде («Found orphan containers»).
+   > Так на сервере до Этапа 8.7 висел остановленный `bt_load` от закрытого
+   > Этапа 7.4. Флаг убирает такие контейнеры сразу. Сервисы из невключённых
+   > профилей (`tools`, `backtest`) осиротевшими НЕ считаются: они запускаются
+   > через `run --rm` и постоянных контейнеров не оставляют.
 
    Контейнер `postgres` при первом старте автоматически применит `db/init.sql`
    и создаст 9 таблиц с индексами. Сервисы `collector`, `agents`, `decision`,
@@ -420,3 +428,25 @@ pytest
 docker compose down          # остановить контейнеры
 docker compose down -v       # остановить и удалить тома (pg_data, redis_data)
 ```
+
+## Осиротевшие контейнеры
+
+Контейнер, чей сервис исчез из `docker-compose.yml`, продолжает существовать и
+даёт предупреждение «Found orphan containers» при каждой команде compose. Сам
+он не удаляется — это делается явно:
+
+```bash
+# Посмотреть, что вообще осталось (включая остановленные)
+docker compose ps -a
+docker ps -a --filter "name=bt_"
+
+# Удалить осиротевшие вместе с обычным подъёмом стека
+docker compose up -d --remove-orphans
+
+# Либо удалить конкретный контейнер поимённо
+docker rm bt_load
+```
+
+Контейнер `bt_load` остался от закрытого Этапа 7.4 (`docs/STAGE_7_4_REPORT.md`)
+и удалён Этапом 8.7 §6. Данных он не хранил: история реплея лежит в схеме
+`backtest` базы, а не в контейнере, — удаление ничего не теряет.

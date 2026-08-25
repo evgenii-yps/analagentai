@@ -1,15 +1,62 @@
 -- ЭТАП 7.1, РАСЧЁТ 6 (раздел 10 ТЗ): почему система замолчала.
--- Только чтение. Выполняется по КАЖДОЙ версии логики отдельно; версии сведены
--- в колонки одной таблицы (по одной на версию), но нигде не смешиваются в одном показателе.
+-- Только чтение. Выполняется по КАЖДОЙ версии логики отдельно; версии нигде не
+-- смешиваются в одном показателе.
 --
 -- Из версии 3 везде исключены записи с degraded = true (кроме блока 6.8, где
 -- они и подсчитываются). Балл (|score|) и согласованность восстанавливаются
 -- пересчётом из signals.agents_payload по формуле кода (см. 03_formula.sql).
 -- Этот расчёт НИЧЕГО не предлагает: он только измеряет.
+--
+-- ПРАВКА ЭТАПА 8.7 (§4). До неё сводные блоки 6.1-6.4 и 6.6 раскладывали версии
+-- по ЖЁСТКО ПЕРЕЧИСЛЕННЫМ колонкам v1…v4. Версия 5 (Этап 8.1) в них не
+-- показывалась вовсе: запрос не падал и не предупреждал — он молчал, и читатель
+-- видел полную на вид таблицу без самой свежей версии. Любая следующая версия
+-- исчезла бы так же.
+--
+-- Теперь версия — это СТРОКА, а не колонка: набор версий берётся из самой
+-- выборки, поэтому в выдачу попадает каждая версия, которая в данных есть.
+-- Колонками остались показатели: их перечень задан методикой и не растёт сам
+-- по себе. Метрики и правила отбора не изменились — изменилась только форма
+-- вывода, поэтому числа предыдущих прогонов сопоставимы построчно.
+--
+-- ВЕРСИЯ 0 — это НЕ версия, а признак «версия неизвестна» (Этап 8.1,
+-- миграция 012). Она исключена из ВСЕХ блоков всегда: смешивать неизвестное с
+-- измеренным нельзя. Сколько записей при этом отброшено — печатает блок 6.-1
+-- ЧИСЛОМ, отдельной строкой, чтобы исключение было видно, а не подразумевалось.
 
 \pset pager off
 SET default_transaction_read_only = on;
 SET statement_timeout = '600s';
+
+\echo
+\echo '--- 6.-1 Исключено как «версия неизвестна» (logic_version = 0) ---'
+\echo '(эти записи не участвуют НИ В ОДНОМ блоке ниже; ноль в столбце — исключать было нечего)'
+WITH ver_windows AS (
+    SELECT logic_version, min(ts) AS started_at FROM signals GROUP BY logic_version
+), ao AS (
+    SELECT coalesce((SELECT v.logic_version FROM ver_windows v
+                      WHERE v.started_at <= a.ts
+                      ORDER BY v.started_at DESC LIMIT 1), 0) AS ver
+    FROM agent_outputs a
+)
+SELECT 'signals (решения)'                    AS source,
+       (SELECT count(*) FROM signals)                              AS rows_total,
+       (SELECT count(*) FROM signals WHERE logic_version = 0)      AS rows_excluded_ver0
+UNION ALL
+SELECT 'agent_outputs (выводы агентов)',
+       (SELECT count(*) FROM ao),
+       (SELECT count(*) FROM ao WHERE ver = 0);
+
+\echo
+\echo '--- 6.-2 Какие версии присутствуют в выборке (набор берётся из данных) ---'
+SELECT logic_version,
+       count(*)  AS decisions_total,
+       min(ts)   AS ts_from,
+       max(ts)   AS ts_to
+FROM signals
+WHERE logic_version <> 0
+GROUP BY logic_version
+ORDER BY logic_version;
 
 \echo
 \echo '--- 6.0 Объём данных по версиям (после исключения degraded из версии 3) ---'
@@ -20,57 +67,54 @@ SELECT logic_version,
        max(ts)                                     AS ts_to,
        round((extract(epoch FROM (max(ts) - min(ts))) / 86400.0)::numeric, 3) AS days_span
 FROM signals
-WHERE NOT (logic_version >= 3 AND degraded)
+WHERE logic_version <> 0
+  AND NOT (logic_version >= 3 AND degraded)
 GROUP BY logic_version
 ORDER BY logic_version;
 
 \echo
 \echo '--- 6.1 Распределение probability по версиям (ВСЕ решения, включая wait) ---'
+\echo '(одна строка на версию: набор версий динамический, ни одна не теряется)'
 WITH base AS (
     SELECT logic_version AS ver, probability
     FROM signals
-    WHERE NOT (logic_version >= 3 AND degraded) AND probability IS NOT NULL
-), stats AS (
-    SELECT 1 AS ord, 'медиана (p50)' AS metric, ver, percentile_cont(0.50) WITHIN GROUP (ORDER BY probability) AS val FROM base GROUP BY ver
-    UNION ALL SELECT 2, 'p75',      ver, percentile_cont(0.75) WITHIN GROUP (ORDER BY probability) FROM base GROUP BY ver
-    UNION ALL SELECT 3, 'p90',      ver, percentile_cont(0.90) WITHIN GROUP (ORDER BY probability) FROM base GROUP BY ver
-    UNION ALL SELECT 4, 'p95',      ver, percentile_cont(0.95) WITHIN GROUP (ORDER BY probability) FROM base GROUP BY ver
-    UNION ALL SELECT 5, 'p99',      ver, percentile_cont(0.99) WITHIN GROUP (ORDER BY probability) FROM base GROUP BY ver
-    UNION ALL SELECT 6, 'максимум', ver, max(probability)                                          FROM base GROUP BY ver
-    UNION ALL SELECT 7, 'N решений', ver, count(*)::double precision                                FROM base GROUP BY ver
+    WHERE logic_version <> 0
+      AND NOT (logic_version >= 3 AND degraded)
+      AND probability IS NOT NULL
 )
-SELECT metric,
-       round(max(val) FILTER (WHERE ver = 1)::numeric, 4) AS v1,
-       round(max(val) FILTER (WHERE ver = 2)::numeric, 4) AS v2,
-       round(max(val) FILTER (WHERE ver = 3)::numeric, 4) AS v3,
-       round(max(val) FILTER (WHERE ver = 4)::numeric, 4) AS v4
-FROM stats
-GROUP BY ord, metric
-ORDER BY ord;
+SELECT ver AS logic_version,
+       count(*)                                                                     AS n_decisions,
+       round(percentile_cont(0.50) WITHIN GROUP (ORDER BY probability)::numeric, 4) AS p50,
+       round(percentile_cont(0.75) WITHIN GROUP (ORDER BY probability)::numeric, 4) AS p75,
+       round(percentile_cont(0.90) WITHIN GROUP (ORDER BY probability)::numeric, 4) AS p90,
+       round(percentile_cont(0.95) WITHIN GROUP (ORDER BY probability)::numeric, 4) AS p95,
+       round(percentile_cont(0.99) WITHIN GROUP (ORDER BY probability)::numeric, 4) AS p99,
+       round(max(probability)::numeric, 4)                                          AS max_value
+FROM base
+GROUP BY ver
+ORDER BY ver;
 
 \echo
 \echo '--- 6.2 Распределение probability по версиям (ТОЛЬКО направленные решения buy/sell) ---'
 WITH base AS (
     SELECT logic_version AS ver, probability
     FROM signals
-    WHERE NOT (logic_version >= 3 AND degraded) AND probability IS NOT NULL AND decision <> 'wait'
-), stats AS (
-    SELECT 1 AS ord, 'медиана (p50)' AS metric, ver, percentile_cont(0.50) WITHIN GROUP (ORDER BY probability) AS val FROM base GROUP BY ver
-    UNION ALL SELECT 2, 'p75',      ver, percentile_cont(0.75) WITHIN GROUP (ORDER BY probability) FROM base GROUP BY ver
-    UNION ALL SELECT 3, 'p90',      ver, percentile_cont(0.90) WITHIN GROUP (ORDER BY probability) FROM base GROUP BY ver
-    UNION ALL SELECT 4, 'p95',      ver, percentile_cont(0.95) WITHIN GROUP (ORDER BY probability) FROM base GROUP BY ver
-    UNION ALL SELECT 5, 'p99',      ver, percentile_cont(0.99) WITHIN GROUP (ORDER BY probability) FROM base GROUP BY ver
-    UNION ALL SELECT 6, 'максимум', ver, max(probability)                                          FROM base GROUP BY ver
-    UNION ALL SELECT 7, 'N решений', ver, count(*)::double precision                                FROM base GROUP BY ver
+    WHERE logic_version <> 0
+      AND NOT (logic_version >= 3 AND degraded)
+      AND probability IS NOT NULL
+      AND decision <> 'wait'
 )
-SELECT metric,
-       round(max(val) FILTER (WHERE ver = 1)::numeric, 4) AS v1,
-       round(max(val) FILTER (WHERE ver = 2)::numeric, 4) AS v2,
-       round(max(val) FILTER (WHERE ver = 3)::numeric, 4) AS v3,
-       round(max(val) FILTER (WHERE ver = 4)::numeric, 4) AS v4
-FROM stats
-GROUP BY ord, metric
-ORDER BY ord;
+SELECT ver AS logic_version,
+       count(*)                                                                     AS n_decisions,
+       round(percentile_cont(0.50) WITHIN GROUP (ORDER BY probability)::numeric, 4) AS p50,
+       round(percentile_cont(0.75) WITHIN GROUP (ORDER BY probability)::numeric, 4) AS p75,
+       round(percentile_cont(0.90) WITHIN GROUP (ORDER BY probability)::numeric, 4) AS p90,
+       round(percentile_cont(0.95) WITHIN GROUP (ORDER BY probability)::numeric, 4) AS p95,
+       round(percentile_cont(0.99) WITHIN GROUP (ORDER BY probability)::numeric, 4) AS p99,
+       round(max(probability)::numeric, 4)                                          AS max_value
+FROM base
+GROUP BY ver
+ORDER BY ver;
 
 \echo
 \echo '--- 6.3 Распределение |балла| по версиям (пересчёт из agents_payload; направленные решения) ---'
@@ -86,28 +130,26 @@ WITH base AS (
                  CASE WHEN jsonb_typeof(s.agents_payload) = 'array'
                       THEN s.agents_payload ELSE '[]'::jsonb END) el
     ) c
-    WHERE NOT (s.logic_version >= 3 AND s.degraded) AND s.decision <> 'wait'
-), f AS (SELECT ver, abs_score FROM base WHERE abs_score IS NOT NULL
-), stats AS (
-    SELECT 1 AS ord, 'медиана (p50)' AS metric, ver, percentile_cont(0.50) WITHIN GROUP (ORDER BY abs_score) AS val FROM f GROUP BY ver
-    UNION ALL SELECT 2, 'p75',      ver, percentile_cont(0.75) WITHIN GROUP (ORDER BY abs_score) FROM f GROUP BY ver
-    UNION ALL SELECT 3, 'p90',      ver, percentile_cont(0.90) WITHIN GROUP (ORDER BY abs_score) FROM f GROUP BY ver
-    UNION ALL SELECT 4, 'p95',      ver, percentile_cont(0.95) WITHIN GROUP (ORDER BY abs_score) FROM f GROUP BY ver
-    UNION ALL SELECT 5, 'максимум', ver, max(abs_score)                                          FROM f GROUP BY ver
-    UNION ALL SELECT 6, 'N решений', ver, count(*)::double precision                              FROM f GROUP BY ver
+    WHERE s.logic_version <> 0
+      AND NOT (s.logic_version >= 3 AND s.degraded)
+      AND s.decision <> 'wait'
+), f AS (
+    SELECT ver, abs_score FROM base WHERE abs_score IS NOT NULL
 )
-SELECT metric,
-       round(max(val) FILTER (WHERE ver = 1)::numeric, 4) AS v1,
-       round(max(val) FILTER (WHERE ver = 2)::numeric, 4) AS v2,
-       round(max(val) FILTER (WHERE ver = 3)::numeric, 4) AS v3,
-       round(max(val) FILTER (WHERE ver = 4)::numeric, 4) AS v4
-FROM stats
-GROUP BY ord, metric
-ORDER BY ord;
+SELECT ver AS logic_version,
+       count(*)                                                                  AS n_decisions,
+       round(percentile_cont(0.50) WITHIN GROUP (ORDER BY abs_score)::numeric, 4) AS p50,
+       round(percentile_cont(0.75) WITHIN GROUP (ORDER BY abs_score)::numeric, 4) AS p75,
+       round(percentile_cont(0.90) WITHIN GROUP (ORDER BY abs_score)::numeric, 4) AS p90,
+       round(percentile_cont(0.95) WITHIN GROUP (ORDER BY abs_score)::numeric, 4) AS p95,
+       round(max(abs_score)::numeric, 4)                                          AS max_value
+FROM f
+GROUP BY ver
+ORDER BY ver;
 
 \echo
 \echo '--- 6.4 Распределение согласованности по версиям: доля каждого дискретного значения, % ---'
-\echo '(согласованность пересчитана так, как её считал КОД соответствующей версии: v1/v2 — знаменатель = число свежих агентов, v3 — знаменатель = 3)'
+\echo '(согласованность пересчитана так, как её считал КОД соответствующей версии: v1/v2 — знаменатель = число свежих агентов, v3+ — знаменатель = 3)'
 WITH base AS (
     SELECT s.logic_version AS ver,
            CASE WHEN s.logic_version >= 3
@@ -123,24 +165,17 @@ WITH base AS (
                  CASE WHEN jsonb_typeof(s.agents_payload) = 'array'
                       THEN s.agents_payload ELSE '[]'::jsonb END) el
     ) c
-    WHERE NOT (s.logic_version >= 3 AND s.degraded) AND s.decision <> 'wait'
-), tot AS (SELECT ver, count(*) AS n FROM base GROUP BY ver)
-SELECT COALESCE(b.agreement::text, 'нет данных') AS agreement_value,
-       count(*) FILTER (WHERE b.ver = 1) AS v1_n,
-       round(100.0 * count(*) FILTER (WHERE b.ver = 1)
-             / NULLIF((SELECT n FROM tot WHERE ver = 1), 0), 2) AS v1_pct,
-       count(*) FILTER (WHERE b.ver = 2) AS v2_n,
-       round(100.0 * count(*) FILTER (WHERE b.ver = 2)
-             / NULLIF((SELECT n FROM tot WHERE ver = 2), 0), 2) AS v2_pct,
-       count(*) FILTER (WHERE b.ver = 3) AS v3_n,
-       round(100.0 * count(*) FILTER (WHERE b.ver = 3)
-             / NULLIF((SELECT n FROM tot WHERE ver = 3), 0), 2) AS v3_pct,
-       count(*) FILTER (WHERE b.ver = 4) AS v4_n,
-       round(100.0 * count(*) FILTER (WHERE b.ver = 4)
-             / NULLIF((SELECT n FROM tot WHERE ver = 4), 0), 2) AS v4_pct
-FROM base b
-GROUP BY 1
-ORDER BY 1;
+    WHERE s.logic_version <> 0
+      AND NOT (s.logic_version >= 3 AND s.degraded)
+      AND s.decision <> 'wait'
+)
+SELECT ver AS logic_version,
+       COALESCE(agreement::text, 'нет данных') AS agreement_value,
+       count(*)                                AS decisions_n,
+       round(100.0 * count(*) / NULLIF(sum(count(*)) OVER (PARTITION BY ver), 0), 2) AS pct_of_version
+FROM base
+GROUP BY ver, agreement
+ORDER BY ver, agreement_value;
 
 \echo
 \echo '--- 6.5 Решения с probability >= 0.7: абсолютное число и доля (X из N) ---'
@@ -153,33 +188,22 @@ SELECT logic_version,
        round(100.0 * count(*) FILTER (WHERE decision <> 'wait' AND probability >= 0.7)
              / NULLIF(count(*) FILTER (WHERE decision <> 'wait'), 0), 3) AS directional_ge_07_pct
 FROM signals
-WHERE NOT (logic_version >= 3 AND degraded)
+WHERE logic_version <> 0
+  AND NOT (logic_version >= 3 AND degraded)
 GROUP BY logic_version
 ORDER BY logic_version;
 
 \echo
 \echo '--- 6.6 Разбивка решений buy / sell / wait по версиям (X из N) ---'
-WITH tot AS (
-    SELECT logic_version AS ver, count(*) AS n
-    FROM signals WHERE NOT (logic_version >= 3 AND degraded) GROUP BY logic_version
-)
-SELECT s.decision,
-       count(*) FILTER (WHERE s.logic_version = 1) AS v1_n,
-       round(100.0 * count(*) FILTER (WHERE s.logic_version = 1)
-             / NULLIF((SELECT n FROM tot WHERE ver = 1), 0), 2) AS v1_pct,
-       count(*) FILTER (WHERE s.logic_version = 2) AS v2_n,
-       round(100.0 * count(*) FILTER (WHERE s.logic_version = 2)
-             / NULLIF((SELECT n FROM tot WHERE ver = 2), 0), 2) AS v2_pct,
-       count(*) FILTER (WHERE s.logic_version = 3) AS v3_n,
-       round(100.0 * count(*) FILTER (WHERE s.logic_version = 3)
-             / NULLIF((SELECT n FROM tot WHERE ver = 3), 0), 2) AS v3_pct,
-       count(*) FILTER (WHERE s.logic_version = 4) AS v4_n,
-       round(100.0 * count(*) FILTER (WHERE s.logic_version = 4)
-             / NULLIF((SELECT n FROM tot WHERE ver = 4), 0), 2) AS v4_pct
-FROM signals s
-WHERE NOT (s.logic_version >= 3 AND s.degraded)
-GROUP BY s.decision
-ORDER BY s.decision;
+SELECT logic_version,
+       decision,
+       count(*)                                                                          AS decisions_n,
+       round(100.0 * count(*) / NULLIF(sum(count(*)) OVER (PARTITION BY logic_version), 0), 2) AS pct_of_version
+FROM signals
+WHERE logic_version <> 0
+  AND NOT (logic_version >= 3 AND degraded)
+GROUP BY logic_version, decision
+ORDER BY logic_version, decision;
 
 \echo
 \echo '--- 6.7 ВЕРСИЯ 3: сколько кандидатов дал бы каждый порог probability (только измерение) ---'
@@ -219,7 +243,7 @@ SELECT count(*)                                        AS directional_n,
 FROM v1;
 
 \echo
-\echo '--- 6.8 Версия 3: число и доля решений с degraded = true ---'
+\echo '--- 6.8 Число и доля решений с degraded = true (по всем версиям выборки) ---'
 SELECT logic_version,
        count(*)                                 AS decisions_total,
        count(*) FILTER (WHERE degraded)         AS degraded_x,
@@ -227,12 +251,13 @@ SELECT logic_version,
        min(ts) FILTER (WHERE degraded)          AS first_degraded_ts,
        max(ts) FILTER (WHERE degraded)          AS last_degraded_ts
 FROM signals
+WHERE logic_version <> 0
 GROUP BY logic_version
 ORDER BY logic_version;
 
 \echo
 \echo '--- 6.9 Проверка альтернативного объяснения: изменилась ли доля neutral у каждого агента между версиями ---'
-\echo '(источник — agent_outputs; границы версий взяты из signals)'
+\echo '(источник — agent_outputs; границы версий взяты из signals; выводы с неизвестной версией исключены — их число см. в блоке 6.-1)'
 WITH ver_windows AS (
     -- Границы версий берутся из самих данных: в agent_outputs колонки версии
     -- нет. Перечисление версий 1-4 убрано: оно помечало ЧЕТВЁРКОЙ выводы любой
@@ -257,6 +282,7 @@ SELECT agent,
        count(*) FILTER (WHERE signal = 'bearish')              AS bearish_x,
        count(*) FILTER (WHERE signal = 'insufficient_data')    AS insufficient_x
 FROM ao
+WHERE ver <> 0
 GROUP BY agent, ver
 ORDER BY agent, ver;
 
@@ -274,7 +300,8 @@ FROM signals s
 CROSS JOIN LATERAL jsonb_array_elements(
          CASE WHEN jsonb_typeof(s.agents_payload) = 'array'
               THEN s.agents_payload ELSE '[]'::jsonb END) el
-WHERE NOT (s.logic_version >= 3 AND s.degraded)
+WHERE s.logic_version <> 0
+  AND NOT (s.logic_version >= 3 AND s.degraded)
 GROUP BY s.logic_version, el->>'agent'
 ORDER BY el->>'agent', s.logic_version;
 
@@ -288,5 +315,6 @@ SELECT date_trunc('day', ts)::date         AS day_utc,
        count(*) FILTER (WHERE decision <> 'wait' AND probability >= 0.7) AS candidates_ge_07,
        round(max(probability)::numeric, 4) AS max_probability
 FROM signals
+WHERE logic_version <> 0
 GROUP BY 1, 2
 ORDER BY 1, 2;

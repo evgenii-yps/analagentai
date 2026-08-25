@@ -11,6 +11,9 @@
   уведомлений отправлено; сколько сигналов закрыто оценщиком;
 * размер БД, свободное место на диске, свободная память;
 * число записей уровня ERROR в логах за сутки;
+* по каждому контрактному инструменту — число точек funding в окне
+  ``FUTURES_LOOKBACK_HOURS``, действующий порог ``FUTURES_MIN_POINTS`` и запас
+  между ними; инструменты с запасом меньше трёх точек отмечаются (§7 ТЗ 8.7);
 * если поток данных за сутки не пополнялся — строка помечается красным (🔴):
   это главный признак «тихой» поломки.
 
@@ -438,6 +441,118 @@ def section_agent_silence() -> list[str]:
     return lines
 
 
+# Запас точек funding: сколько их ещё можно потерять, прежде чем агент
+# деривативов замолчит. Меньше трёх — инструмент отмечается (§7 ТЗ 8.7).
+FUNDING_RESERVE_ALERT = 3
+
+
+def _env_int(key: str) -> int | None:
+    """Целое из .env/окружения. None — «параметр не задан».
+
+    Умолчание НЕ подставляется намеренно (та же дисциплина, что в §3 ТЗ 8.7):
+    строка запаса, посчитанная от зашитого числа вместо действующего, врала бы
+    молча — а именно этот дефект этап и устраняет. Нет параметра — так и
+    написано.
+    """
+    raw = os.environ.get(key, ENV.get(key, ""))
+    head = (raw or "").split("#", 1)[0].strip()
+    if not head:
+        return None
+    try:
+        return int(head)
+    except ValueError:
+        return None
+
+
+def section_funding_reserve() -> list[str]:
+    """Запас точек funding по каждому инструменту (§7 ТЗ 8.7).
+
+    ЧИСТО ОТЧЁТНАЯ секция: ни порогов, ни поведения агентов она не меняет.
+    До неё нехватку точек находили только руками — раздел молчания (Этап 8.6)
+    показывал ФАКТ молчания, но не то, насколько близко к нему остальные.
+
+    Точки считаются ТАК ЖЕ, как их видит агент: ``db.get_funding_window``
+    прореживает окно до ОДНОЙ точки на час (``DISTINCT ON`` по часу), и с этим
+    числом сравнивается ``FUTURES_MIN_POINTS``. Считать сырые строки было бы
+    неверно: коллектор пишет чаще раза в час, и запас вышел бы завышенным.
+
+    Инструменты — контрактные (``type='swap'``): именно их получает
+    ``FuturesAgent`` (src/agents/runner.py). У спота funding нет.
+    """
+    lines = ["<b>⛽ Запас точек funding</b>"]
+    lookback = _env_int("FUTURES_LOOKBACK_HOURS")
+    min_points = _env_int("FUTURES_MIN_POINTS")
+
+    if lookback is None:
+        lines.append(
+            "⚪ FUTURES_LOOKBACK_HOURS: параметр не задан — "
+            "окно неизвестно, запас не считается."
+        )
+        return lines
+    if min_points is None:
+        lines.append(
+            "⚪ FUTURES_MIN_POINTS: параметр не задан — "
+            "порог неизвестен, запас не считается."
+        )
+        lines.append(f"Окно: {lookback} ч.")
+        return lines
+
+    lines.append(
+        f"Окно {lookback} ч, порог {min_points} точек "
+        f"(точка = один час с данными, как их считает агент)."
+    )
+    out = _psql(
+        "SELECT i.base, "
+        "count(DISTINCT date_trunc('hour', f.ts)) "
+        "FROM instruments i "
+        "LEFT JOIN funding f ON f.instrument_id = i.id "
+        f"AND f.ts >= now() - make_interval(hours => {lookback}) "
+        "WHERE i.type = 'swap' AND i.active "
+        "GROUP BY i.base ORDER BY i.base;"
+    )
+    if not out:
+        # Пустой ответ значит одно из двух, и различить их отсюда нечем: либо
+        # контрактных инструментов нет, либо запрос не выполнился. Писать
+        # «всё хорошо» нельзя ни в том, ни в другом случае.
+        lines.append(
+            "⚪ Ответа от базы нет: либо контрактных инструментов нет, "
+            "либо запрос не выполнился. Строка запаса не построена."
+        )
+        return lines
+
+    tight = 0
+    for row in out.splitlines():
+        parts = row.split("|")
+        if len(parts) < 2:
+            continue
+        token, points_raw = parts[0], parts[1]
+        try:
+            points = int(points_raw)
+        except ValueError:
+            continue
+        reserve = points - min_points
+        if reserve < 0:
+            mark = "🔴"
+            tail = f"агент уже молчит (не хватает {-reserve})"
+            tight += 1
+        elif reserve < FUNDING_RESERVE_ALERT:
+            mark = "🟡"
+            tail = "до молчания меньше трёх точек"
+            tight += 1
+        else:
+            mark = "🟢"
+            tail = ""
+        line = (
+            f"{mark} {_esc(token)}: точек {points}, порог {min_points}, "
+            f"запас {reserve:+d}"
+        )
+        lines.append(f"{line} — {tail}" if tail else line)
+
+    if tight == 0:
+        lines.append(f"🟢 Запас не меньше {FUNDING_RESERVE_ALERT} точек у всех инструментов.")
+    return lines
+
+
 def section_db_and_errors() -> list[str]:
     lines = ["<b>🗄 БД и ошибки</b>"]
     size = _psql("SELECT pg_size_pretty(pg_database_size(current_database()));")
@@ -464,6 +579,7 @@ def build_message() -> str:
         "\n".join(section_signals_24h()),
         "\n".join(section_agent_failures()),
         "\n".join(section_agent_silence()),
+        "\n".join(section_funding_reserve()),
         "\n".join(section_db_and_errors()),
     ]
     return "\n\n".join(blocks)

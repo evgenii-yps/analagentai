@@ -11,7 +11,8 @@
 #   3. таблица calibration_curves и уникальность активной кривой;
 #   4. сигналы с logic_version = 4 появляются;
 #   5. все три агента пишут выводы;
-#   6. у Futures есть bearish ЛИБО объяснение по фактическому funding;
+#   6. у Futures есть bearish ЛИБО объяснение по фактическому funding
+#      (окно берётся из .env: FUTURES_LOOKBACK_HOURS, а не зашито в скрипт);
 #   7. inputs_hash заполняется, повторы считаются;
 #   8. cron калибровки установлен;
 #   9. замороженные параметры .env не изменились.
@@ -32,6 +33,19 @@ psql_q() {
 psql_rows() {
   docker compose exec -T postgres psql -U "$PG_USER" -d "$PG_DB" -tA -F '|' -c "$1" 2>/dev/null
 }
+# Значение ключа из .env стека. Умолчание НЕ подставляется намеренно (Этап 8.7
+# §3): скрипт, печатающий зашитое число вместо рабочего, врёт молча. Пустой
+# вывод здесь означает ровно одно — «параметр не задан».
+env_value() {
+  grep -E "^$1=" "${APP_DIR}/.env" 2>/dev/null | tail -1 | cut -d= -f2- \
+    | sed 's/#.*//' | xargs || true
+}
+
+# Окно распределения funding и порог точек — ФАКТИЧЕСКИЕ, из .env.
+# До Этапа 8.7 в скрипте было зашито 168 ч, тогда как на сервере стоит 336:
+# проверка печатала не тот параметр, который действует.
+FUNDING_LOOKBACK="$(env_value FUTURES_LOOKBACK_HOURS)"
+FUNDING_MIN_POINTS="$(env_value FUTURES_MIN_POINTS)"
 
 echo "=== 1. Контейнеры (ожидается 8 healthy/running) ==="
 ps_json="$(docker compose ps --format json 2>/dev/null)"
@@ -103,19 +117,32 @@ if [[ "${n_bear:-0}" -ge 1 ]]; then
 else
   # Отсутствие bearish само по себе НЕ дефект: оно должно объясняться данными.
   echo "  ⚠ bearish за 30 мин: 0 из ${n_fut:-0}. Это не обязательно дефект — проверяем данные."
-  pct="$(psql_q "SELECT round((count(*) FILTER (WHERE rate <= (SELECT percentile_cont(0.2) WITHIN GROUP (ORDER BY rate) FROM funding WHERE ts > now() - interval '168 hours'))::numeric * 100 / NULLIF(count(*),0), 1) FROM funding WHERE ts > now() - interval '1 hour';")"
-  last="$(psql_rows "SELECT round(rate::numeric, 8), to_char(ts,'YYYY-MM-DD HH24:MI') FROM funding ORDER BY ts DESC LIMIT 1;")"
-  win="$(psql_rows "SELECT count(*), round(min(rate)::numeric,8), round(percentile_cont(0.2) WITHIN GROUP (ORDER BY rate)::numeric,8), round(percentile_cont(0.8) WITHIN GROUP (ORDER BY rate)::numeric,8), round(max(rate)::numeric,8) FROM funding WHERE ts > now() - interval '168 hours';")"
-  echo "     текущий funding (значение|время): ${last:-нет данных}"
-  echo "     окно 168 ч (N|min|p20|p80|max):   ${win:-нет данных}"
-  echo "     доля времени в нижних 20% за час: ${pct:-нет данных}%"
-  echo "     Вывод: bearish появится, когда текущий funding опустится в нижние 20% своего"
-  echo "     недельного распределения. Если текущее значение выше p20 — рыночные условия"
-  echo "     его сейчас не порождают, и это ожидаемое поведение, а не асимметрия."
-  n_points="$(psql_q "SELECT count(*) FROM funding WHERE ts > now() - interval '168 hours';")"
-  if [[ "${n_points:-0}" -lt "${FUTURES_MIN_POINTS:-20}" ]]; then
-    echo "  🔴 точек funding в окне: ${n_points:-0} < ${FUTURES_MIN_POINTS:-20} — агент отдаёт insufficient_data"
-    fail=1
+  if [[ -z "$FUNDING_LOOKBACK" ]]; then
+    echo "     окно funding (FUTURES_LOOKBACK_HOURS): параметр не задан"
+    echo "     Распределение по окну не считается: без окна считать нечего. Это НЕ"
+    echo "     «всё хорошо» — это непрочитанный параметр. Задайте его в .env."
+    last="$(psql_rows "SELECT round(rate::numeric, 8), to_char(ts,'YYYY-MM-DD HH24:MI') FROM funding ORDER BY ts DESC LIMIT 1;")"
+    echo "     текущий funding (значение|время): ${last:-нет данных}"
+  else
+    echo "     окно funding (FUTURES_LOOKBACK_HOURS): ${FUNDING_LOOKBACK} ч"
+    pct="$(psql_q "SELECT round((count(*) FILTER (WHERE rate <= (SELECT percentile_cont(0.2) WITHIN GROUP (ORDER BY rate) FROM funding WHERE ts > now() - make_interval(hours => ${FUNDING_LOOKBACK})))::numeric * 100 / NULLIF(count(*),0), 1) FROM funding WHERE ts > now() - interval '1 hour';")"
+    last="$(psql_rows "SELECT round(rate::numeric, 8), to_char(ts,'YYYY-MM-DD HH24:MI') FROM funding ORDER BY ts DESC LIMIT 1;")"
+    win="$(psql_rows "SELECT count(*), round(min(rate)::numeric,8), round(percentile_cont(0.2) WITHIN GROUP (ORDER BY rate)::numeric,8), round(percentile_cont(0.8) WITHIN GROUP (ORDER BY rate)::numeric,8), round(max(rate)::numeric,8) FROM funding WHERE ts > now() - make_interval(hours => ${FUNDING_LOOKBACK});")"
+    echo "     текущий funding (значение|время):        ${last:-нет данных}"
+    echo "     окно ${FUNDING_LOOKBACK} ч (N|min|p20|p80|max): ${win:-нет данных}"
+    echo "     доля времени в нижних 20% за час:        ${pct:-нет данных}%"
+    echo "     Вывод: bearish появится, когда текущий funding опустится в нижние 20% своего"
+    echo "     распределения за это окно. Если текущее значение выше p20 — рыночные условия"
+    echo "     его сейчас не порождают, и это ожидаемое поведение, а не асимметрия."
+    n_points="$(psql_q "SELECT count(*) FROM funding WHERE ts > now() - make_interval(hours => ${FUNDING_LOOKBACK});")"
+    if [[ -z "$FUNDING_MIN_POINTS" ]]; then
+      echo "  ⚪ FUTURES_MIN_POINTS: параметр не задан — сравнить ${n_points:-0} точек не с чем"
+    elif [[ "${n_points:-0}" -lt "$FUNDING_MIN_POINTS" ]]; then
+      echo "  🔴 точек funding в окне ${FUNDING_LOOKBACK} ч: ${n_points:-0} < ${FUNDING_MIN_POINTS} — агент отдаёт insufficient_data"
+      fail=1
+    else
+      echo "  🟢 точек funding в окне ${FUNDING_LOOKBACK} ч: ${n_points:-0} >= ${FUNDING_MIN_POINTS} (запас $(( ${n_points:-0} - FUNDING_MIN_POINTS )))"
+    fi
   fi
 fi
 echo "  ℹ распределение выводов Futures за сутки:"
