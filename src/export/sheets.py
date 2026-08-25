@@ -4,6 +4,16 @@
 редиректом 302 на ``script.googleusercontent.com`` — редирект обязательно
 следовать (httpx делает это по умолчанию). Успех — только HTTP 200 и
 ``{"ok": true}`` в теле.
+
+ЭТАП 8.4.1. Перед отправкой пачка приводится к ОДНОЙ ширине — самой широкой
+строке набора с учётом заголовка (:func:`normalize_batch`). Приёмник считает
+ширину диапазона сам, но живёт на стороне Google и обновляется вручную,
+отдельно от образа: пока развёрнута старая версия, она берёт ширину из ПЕРВОЙ
+строки пачки. На листе «Независимые окна» первой идёт оговорка из одного
+элемента, и запись пятнадцати колонок обрывалась ошибкой «In den Daten sind es
+15, im Bereich jedoch 1». Выравнивание здесь снимает отказ независимо от того,
+обновлён приёмник или ещё нет, и не зависит от числа колонок: ширина считается
+по набору, а не задаётся константой.
 """
 
 from __future__ import annotations
@@ -30,6 +40,36 @@ class SheetsResult:
     ok: bool
     inserted: int = 0
     error: str | None = None
+    # Версия развёрнутого приёмника из его ответа (Этап 8.4.1). None означает
+    # «приёмник версию не сообщил» — то есть развёрнута версия до 8.4.1.
+    receiver_version: str | None = None
+
+
+def normalize_batch(
+    rows: list[list[Any]],
+    header: list[str] | None = None,
+) -> tuple[list[list[Any]], list[Any] | None]:
+    """Приводит строки пачки к одной ширине — самой широкой в наборе.
+
+    Ширина считается ПО НАБОРУ (заголовок участвует наравне со строками), а не
+    берётся у первой строки и не задаётся константой: набор строк разной длины
+    — штатный случай, и следующее изменение состава колонок не должно ломать
+    запись. Короткие строки дополняются пустыми ячейками; пустая ячейка в
+    таблице выглядит пустой, тогда как ноль выглядел бы значением.
+
+    Порядок строк не меняется: оговорка листа «Независимые окна» остаётся
+    первой строкой.
+    """
+    width = len(header) if header else 0
+    for row in rows:
+        width = max(width, len(row))
+    if width == 0:
+        return [list(row) for row in rows], header
+    padded = [list(row) + [""] * (width - len(row)) for row in rows]
+    padded_header = (
+        None if header is None else list(header) + [""] * (width - len(header))
+    )
+    return padded, padded_header
 
 
 def _verify() -> str | bool:
@@ -51,6 +91,8 @@ async def post_rows(
     Возвращает :class:`SheetsResult`. Исключений не бросает — сеть/HTTP/парсинг
     ошибки сворачиваются в ``ok=False`` с текстом причины.
     """
+    # Выравнивание ширины ДО отправки (Этап 8.4.1) — см. модульный докстринг.
+    rows, header = normalize_batch(rows, header)
     payload: dict[str, Any] = {
         "secret": secret,
         "sheet": sheet,
@@ -87,7 +129,21 @@ async def post_rows(
             continue
 
         if body.get("ok") is True:
-            return SheetsResult(ok=True, inserted=int(body.get("inserted", 0)))
+            version = body.get("version")
+            # Версию печатаем всегда: по ней владелец видит в журнале, что
+            # развёрнутая на стороне Google версия приёмника действительно
+            # обновилась. Её отсутствие — признак версии до 8.4.1.
+            _log.info(
+                "Sheets: пачка принята",
+                sheet=sheet,
+                rows=len(rows),
+                receiver_version=version or "до 8.4.1 (версию не сообщает)",
+            )
+            return SheetsResult(
+                ok=True,
+                inserted=int(body.get("inserted", 0)),
+                receiver_version=None if version is None else str(version),
+            )
         last_error = f"ok=false: {body.get('error', 'без описания')}"
         _log.warning("Sheets: ответ ok=false", attempt=attempt + 1, error=last_error)
 

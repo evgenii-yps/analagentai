@@ -20,6 +20,19 @@ httpx закреплён в requirements.
 Загрузка идемпотентна: повторный запуск не перекачивает уже загруженное
 (``ON CONFLICT DO NOTHING`` плюс старт пагинации от самой ранней имеющейся
 точки). Незакрытые свечи (``confirm = 0``) не сохраняются вообще (§4.4).
+
+РАЗНЫЕ РЫНКИ У РАЗНЫХ РЯДОВ. Свечи запрашиваются по СПОТУ, funding — по
+БЕССРОЧНОМУ КОНТРАКТУ. У спота истории funding не существует: запрос
+``/api/v5/public/funding-rate-history?instId=BTC-USDT`` возвращает HTTP 400,
+код 51000 «Parameter instId error» (наблюдалось 22.08.2026). Идентификатор
+контракта берётся из конфигурации и НИКОГДА не достраивается из имени спота.
+
+ХОД РАБОТЫ ВИДЕН В ЛОГЕ (дефект D-10). Загрузка миллионов свечей страницами по
+сто занимает часы, и до этой правки о её ходе можно было судить только счётчиком
+строк в БД. Теперь каждая страница продвигает счётчики, а раз в
+``PROGRESS_EVERY_PAGES`` страниц печатается строка: сколько страниц пройдено,
+сколько строк записано, до какой даты дошла пагинация и сколько осталось до
+границы периода.
 """
 
 from __future__ import annotations
@@ -59,6 +72,11 @@ RATE_LIMIT_CODE = "50011"
 
 # Сколько раз повторять запрос при ошибке темпа, с удвоением паузы.
 _MAX_RETRIES = 6
+
+# Как часто печатать строку прогресса (в страницах). Значение выбрано так, чтобы
+# при паузе в сотни миллисекунд строка появлялась примерно раз в несколько
+# секунд: реже — работа выглядит зависшей, чаще — лог невозможно читать.
+PROGRESS_EVERY_PAGES = 10
 
 
 class LoaderError(RuntimeError):
@@ -257,6 +275,36 @@ async def _insert_funding(rows: list[tuple[Any, ...]]) -> int:
     return len(rows)
 
 
+def _progress_line(
+    kind: str,
+    inst_id: str,
+    pages: int,
+    inserted: int,
+    reached: datetime | None,
+    since: datetime,
+    until: datetime,
+) -> dict[str, Any]:
+    """Поля строки прогресса: где пагинация сейчас и сколько периода пройдено.
+
+    Доля считается по ВРЕМЕНИ, а не по числу строк: сколько строк отдаст биржа,
+    заранее неизвестно, а границы периода известны точно.
+    """
+    total_sec = (until - since).total_seconds() or 1.0
+    done_pct = (
+        0.0 if reached is None
+        else max(0.0, min(100.0, 100.0 * (until - reached).total_seconds() / total_sec))
+    )
+    return {
+        "series": kind,
+        "inst_id": inst_id,
+        "pages": pages,
+        "rows_written": inserted,
+        "reached": None if reached is None else reached.isoformat(),
+        "boundary": since.isoformat(),
+        "period_done_pct": round(done_pct, 1),
+    }
+
+
 async def backfill_candles(
     inst_id: str,
     bar: str,
@@ -266,11 +314,22 @@ async def backfill_candles(
     client: OkxHistory | None = None,
     page_limit: int = 100,
 ) -> int:
-    """Догружает свечи [since, until] и возвращает число записанных строк.
+    """Догружает свечи [since, until] СПОТА и возвращает число записанных строк.
 
-    Идемпотентность: точка старта пагинации берётся от самой ранней уже
-    загруженной свечи, поэтому повторный запуск докачивает только недостающее
-    и не запрашивает историю заново.
+    ДВА ПРОХОДА, а не один. Пагинация OKX идёт только НАЗАД по времени, поэтому
+    докачка недостающего требует двух заходов:
+
+      * «свежий» — от ``until`` назад до самой поздней уже загруженной свечи;
+      * «старый» — от самой ранней загруженной свечи назад до ``since``.
+
+    Раньше проход был один — от самой ранней загруженной точки назад, — и
+    поэтому уже загруженный ряд НИКОГДА не пополнялся свежими свечами. Для
+    сверки §13.2 это критично: её моменты лежат в живом окне, позже
+    BT_PERIOD_TO, и без свежего прохода агент в реплее считался бы на
+    устаревших свечах.
+
+    Идемпотентность сохраняется: границы проходов берутся из БД, а вставка идёт
+    с ``ON CONFLICT DO NOTHING``. Уже загруженное не перекачивается.
     """
     own_client = client is None
     http_client = None
@@ -279,33 +338,73 @@ async def backfill_candles(
         client = OkxHistory(http_client, pause_ms=200)
 
     inserted = 0
-    try:
-        earliest = await db.fetchval(
-            "SELECT min(open_time) FROM backtest.candles WHERE inst_id=$1 AND bar=$2;",
-            inst_id, bar,
-        )
-        cursor_ms = _ms(earliest) if earliest is not None else _ms(until)
-        _log.info("Загрузка свечей", inst_id=inst_id, bar=bar,
-                  since=since.isoformat(), until=until.isoformat(),
-                  resume_from=None if earliest is None else earliest.isoformat())
+    pages = 0
+    reached: datetime | None = None
 
+    async def walk(cursor_ms: int, stop_at: datetime, phase: str) -> None:
+        """Один проход назад по времени: от ``cursor_ms`` до ``stop_at``."""
+        nonlocal inserted, pages, reached
         while True:
             page = await client.candles_page(inst_id, bar, cursor_ms, page_limit)
+            pages += 1
             if not page:
-                break
+                _log.info("Загрузка свечей: пустая страница — история кончилась",
+                          inst_id=inst_id, phase=phase, pages=pages)
+                return
             rows = parse_candles(page, inst_id, bar)
             fresh = [r for r in rows if since <= r[2] <= until]
             inserted += await _insert_candles(fresh)
             oldest_ms = min(int(item[0]) for item in page)
+            reached = _dt(oldest_ms)
+            if pages % PROGRESS_EVERY_PAGES == 0:
+                _log.info(
+                    "Загрузка свечей: идёт", phase=phase,
+                    **_progress_line("свечи", inst_id, pages, inserted,
+                                     reached, since, until),
+                )
             if oldest_ms >= cursor_ms:   # пагинация не движется — обрываем
-                break
+                _log.warning("Загрузка свечей: пагинация не движется, останов",
+                             inst_id=inst_id, phase=phase, cursor=reached.isoformat())
+                return
             cursor_ms = oldest_ms
-            if _dt(oldest_ms) <= since:
-                break
+            if reached <= stop_at:
+                return
+
+    try:
+        border = await db.fetchrow(
+            "SELECT min(open_time) AS lo, max(open_time) AS hi, count(*) AS n "
+            "FROM backtest.candles WHERE inst_id=$1 AND bar=$2;",
+            inst_id, bar,
+        )
+        earliest = border["lo"] if border else None
+        newest = border["hi"] if border else None
+        _log.info(
+            "Загрузка свечей: начало", inst_id=inst_id, bar=bar,
+            since=since.isoformat(), until=until.isoformat(),
+            already_in_db=int((border["n"] if border else 0) or 0),
+            in_db_from=None if earliest is None else earliest.isoformat(),
+            in_db_to=None if newest is None else newest.isoformat(),
+        )
+
+        if newest is None:
+            await walk(_ms(until), since, "весь период")
+        else:
+            if newest < until:
+                # Свежий хвост: от конца периода назад до уже загруженного.
+                await walk(_ms(until), newest, "свежие свечи")
+            if earliest > since:
+                # Недостающее начало: от самой ранней загруженной точки назад.
+                await walk(_ms(earliest), since, "старые свечи")
+            if newest >= until and earliest <= since:
+                _log.info("Загрузка свечей: период уже покрыт, запросов не будет",
+                          inst_id=inst_id, bar=bar)
     finally:
         if own_client and http_client is not None:
             await http_client.aclose()
-    _log.info("Свечи загружены", inst_id=inst_id, bar=bar, rows=inserted)
+    _log.info(
+        "Загрузка свечей: готово",
+        **_progress_line("свечи", inst_id, pages, inserted, reached, since, until),
+    )
     return inserted
 
 
@@ -317,7 +416,15 @@ async def backfill_funding(
     client: OkxHistory | None = None,
     page_limit: int = 100,
 ) -> int:
-    """Догружает историю funding [since, until] и возвращает число строк."""
+    """Догружает историю funding [since, until] КОНТРАКТА и возвращает число строк.
+
+    ``inst_id`` здесь — идентификатор бессрочного контракта. Передать сюда спот
+    нельзя: биржа ответит 51000 «Parameter instId error». Вызывающий код
+    (``backtest.run``) берёт значение из пары конфигурации, а при
+    ``BT_AGENTS=market`` не вызывает эту функцию вовсе.
+
+    Проходов, как и у свечей, два: свежий хвост и недостающее начало.
+    """
     own_client = client is None
     http_client = None
     if own_client:
@@ -325,26 +432,68 @@ async def backfill_funding(
         client = OkxHistory(http_client, pause_ms=200)
 
     inserted = 0
-    try:
-        earliest = await db.fetchval(
-            "SELECT min(funding_time) FROM backtest.funding WHERE inst_id=$1;", inst_id
-        )
-        cursor_ms = _ms(earliest) if earliest is not None else _ms(until)
+    pages = 0
+    reached: datetime | None = None
+
+    async def walk(cursor_ms: int, stop_at: datetime, phase: str) -> None:
+        nonlocal inserted, pages, reached
         while True:
             page = await client.funding_page(inst_id, cursor_ms, page_limit)
+            pages += 1
             if not page:
-                break
+                _log.info("Загрузка funding: пустая страница — история кончилась",
+                          inst_id=inst_id, phase=phase, pages=pages)
+                return
             rows = parse_funding(page, inst_id)
             fresh = [r for r in rows if since <= r[1] <= until]
             inserted += await _insert_funding(fresh)
             oldest_ms = min(int(item["fundingTime"]) for item in page)
+            reached = _dt(oldest_ms)
+            if pages % PROGRESS_EVERY_PAGES == 0:
+                _log.info(
+                    "Загрузка funding: идёт", phase=phase,
+                    **_progress_line("funding", inst_id, pages, inserted,
+                                     reached, since, until),
+                )
             if oldest_ms >= cursor_ms:
-                break
+                _log.warning("Загрузка funding: пагинация не движется, останов",
+                             inst_id=inst_id, phase=phase, cursor=reached.isoformat())
+                return
             cursor_ms = oldest_ms
-            if _dt(oldest_ms) <= since:
-                break
+            if reached <= stop_at:
+                return
+
+    try:
+        border = await db.fetchrow(
+            "SELECT min(funding_time) AS lo, max(funding_time) AS hi, count(*) AS n "
+            "FROM backtest.funding WHERE inst_id=$1;",
+            inst_id,
+        )
+        earliest = border["lo"] if border else None
+        newest = border["hi"] if border else None
+        _log.info(
+            "Загрузка funding: начало", inst_id=inst_id,
+            since=since.isoformat(), until=until.isoformat(),
+            already_in_db=int((border["n"] if border else 0) or 0),
+            in_db_from=None if earliest is None else earliest.isoformat(),
+            in_db_to=None if newest is None else newest.isoformat(),
+        )
+
+        if newest is None:
+            await walk(_ms(until), since, "весь период")
+        else:
+            if newest < until:
+                await walk(_ms(until), newest, "свежие ставки")
+            if earliest > since:
+                await walk(_ms(earliest), since, "старые ставки")
+            if newest >= until and earliest <= since:
+                _log.info("Загрузка funding: период уже покрыт, запросов не будет",
+                          inst_id=inst_id)
     finally:
         if own_client and http_client is not None:
             await http_client.aclose()
-    _log.info("Funding загружен", inst_id=inst_id, rows=inserted)
+    _log.info(
+        "Загрузка funding: готово",
+        **_progress_line("funding", inst_id, pages, inserted, reached, since, until),
+    )
     return inserted

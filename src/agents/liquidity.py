@@ -138,9 +138,12 @@ def analyze_orderbook(
 class LiquidityAgent(BaseAgent):
     """Агент анализа стакана заявок."""
 
-    def __init__(self, instrument_id: int, interval: float) -> None:
+    def __init__(
+        self, instrument_id: int, interval: float, name_suffix: str = ""
+    ) -> None:
         super().__init__(
-            name="liquidity", interval=interval, instrument_id=instrument_id
+            name="liquidity", interval=interval, instrument_id=instrument_id,
+            name_suffix=name_suffix,
         )
 
     async def analyze(self, instrument_id: int) -> AgentOutput:

@@ -27,6 +27,10 @@ LOG_FILE="/var/log/agent-trade-install.log"
 EXPECTED_SERVICES=(postgres redis collector agents decision notify evaluator bot)
 
 OVERALL_FAIL=0
+# Повторные объявления в .env и файлах cron — отдельный код возврата (§5.3
+# ТЗ 8.7): установка могла пройти целиком, но конфигурация с двумя
+# объявлениями одного ключа считается неисправной и должна быть замечена.
+DUPLICATE_FAIL=0
 CLONE_URL="$REPO_URL"   # для приватного репо будет заменён на URL с токеном
 BACKUP_VERIFY_RESULT="не выполнялась"
 
@@ -46,6 +50,117 @@ trap 'rc=$?; [[ $rc -ne 0 ]] && log "ОШИБКА: команда заверши
 
 # Скрывает токен внутри URL вида https://user:token@host в потоке вывода.
 redact() { sed -E 's#(https://)[^@/ ]+@#\1***@#g'; }
+
+# ===========================================================================
+# ИДЕМПОТЕНТНАЯ ЗАПИСЬ КОНФИГУРАЦИИ (Этап 8.7 §5)
+# ===========================================================================
+# За проект дублирование случилось ЧЕТЫРЕЖДЫ: блок 7.3 в .env, пара
+# EVAL_HORIZONS, комментарий о калибровочной кривой в /etc/cron.d/agent-trade.
+# Класс дефекта один — развёртывание ДОПИСЫВАЕТ строку, не проверив, есть ли
+# она уже. Поэтому лечение тоже одно: любое объявление ключа идёт через
+# env_upsert (заменить, а не добавить второе), а любой файл конфигурации
+# проходит normalize_declarations (снять уже накопленные повторы).
+#
+# ПРАВИЛО ВЫБОРА ПРИ ПОВТОРЕ. Для строк вида КЛЮЧ=значение остаётся ПОСЛЕДНЕЕ
+# объявление, потому что именно оно действует: и docker compose env_file, и
+# cron читают файл сверху вниз, и последнее присваивание перекрывает прежние.
+# Снятие повторов поэтому НЕ МЕНЯЕТ действующую конфигурацию — оно лишь
+# убирает мёртвые строки. Для одинаковых строк без ключа (комментарии, задачи
+# cron) остаётся ПЕРВАЯ: комментарий должен остаться перед своей задачей.
+
+# Ключ строки «КЛЮЧ=значение»; для прочих строк — пусто.
+declarations_dedupe() {  # $1 = файл; нормализованное содержимое — в stdout
+    awk '
+      function keyof(line,   k) {
+          if (line !~ /^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=/) return ""
+          k = line; sub(/=.*$/, "", k); gsub(/[[:space:]]/, "", k); return k
+      }
+      NR == FNR {
+          k = keyof($0)
+          if (k != "")                  last_key[k]  = FNR
+          else if ($0 ~ /[^[:space:]]/) { if (!($0 in first_line)) first_line[$0] = FNR }
+          next
+      }
+      {
+          k = keyof($0)
+          if (k != "")                  { if (FNR == last_key[k])   print; next }
+          if ($0 !~ /[^[:space:]]/)     { print; next }
+          if (FNR == first_line[$0])    print
+      }
+    ' "$1" "$1"
+}
+
+# Перечисляет повторы в файле: «ключ — объявлено N раз». Пусто = повторов нет.
+declarations_duplicates() {  # $1 = файл
+    [[ -f "$1" ]] || return 0
+    awk -v f="$1" '
+      /[^[:space:]]/ {
+          if ($0 ~ /^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=/) {
+              k = $0; sub(/=.*$/, "", k); gsub(/[[:space:]]/, "", k)
+              label = "ключ " k
+          } else if ($0 ~ /^[[:space:]]*#/) {
+              # Строка печатается ЦЕЛИКОМ: обрезка по байтам рвала бы кириллицу
+              # посередине символа, и находка стала бы нечитаемой.
+              label = "комментарий: " $0
+          } else {
+              label = "строка: " $0
+          }
+          n[label]++
+      }
+      END { for (l in n) if (n[l] > 1) printf "%s | %s | повторов: %d\n", f, l, n[l] }
+    ' "$1"
+}
+
+# Снимает повторы в файле НА МЕСТЕ. Права и владелец сохраняются: содержимое
+# перезаписывается в существующий inode, файл не пересоздаётся (важно для .env
+# с правами 600).
+normalize_declarations() {  # $1 = файл
+    local file="$1" tmp
+    [[ -f "$file" ]] || return 0
+    tmp="$(mktemp)"
+    declarations_dedupe "$file" > "$tmp"
+    if ! cmp -s "$tmp" "$file"; then
+        cat "$tmp" > "$file"
+        log "Сняты повторные объявления в $file."
+    fi
+    rm -f "$tmp"
+}
+
+# Устанавливает КЛЮЧ=значение идемпотентно: существующее объявление заменяется
+# (последнее по файлу — то, что действует), отсутствующее дописывается.
+# Единственный разрешённый способ добавить ключ в .env из установщика.
+env_upsert() {  # $1 = файл, $2 = ключ, $3 = значение
+    local file="$1" key="$2" value="$3" tmp
+    [[ -f "$file" ]] || { : > "$file"; chmod 600 "$file"; }
+    if grep -qE "^[[:space:]]*${key}=" "$file"; then
+        # Новое значение встаёт НА МЕСТО последнего объявления (именно оно
+        # действовало), прежние объявления того же ключа убираются. Ключ не
+        # переезжает в конец файла: структура блоков сохраняется, а повторный
+        # запуск установщика не переставляет строки местами.
+        tmp="$(mktemp)"
+        awk -v k="$key" -v v="$value" '
+            NR == FNR { if ($0 ~ "^[[:space:]]*" k "=") last = FNR; next }
+            $0 ~ "^[[:space:]]*" k "=" { if (FNR == last) print k "=" v; next }
+            { print }
+        ' "$file" "$file" > "$tmp"
+        cat "$tmp" > "$file"
+        rm -f "$tmp"
+    else
+        printf '%s=%s\n' "$key" "$value" >> "$file"
+    fi
+}
+
+# Устанавливает файл cron из stdin. Содержимое задаётся ЦЕЛИКОМ и перезаписывает
+# прежнее — дописывания здесь нет по построению; normalize_declarations снимает
+# повторы, которые могли остаться от прежних ручных доустановок.
+cron_install() {  # $1 = путь к файлу cron, содержимое — в stdin
+    local file="$1" tmp
+    tmp="$(mktemp)"
+    cat > "$tmp"
+    install -m 644 "$tmp" "$file"
+    rm -f "$tmp"
+    normalize_declarations "$file"
+}
 
 # ---------------------------------------------------------------------------
 # Ввод от пользователя — строго из /dev/tty (скрипт запущен через curl | bash,
@@ -362,8 +477,13 @@ deploy_stack() {
     mkdir -p "$APP_DIR/logs" "$APP_DIR/backups"
     chown "$APP_USER:$APP_USER" "$APP_DIR/logs" "$APP_DIR/backups"
 
-    log "Собираю и запускаю контейнеры: docker compose up -d --build (может занять пару минут)…"
-    docker compose up -d --build
+    # --remove-orphans: контейнер, чей сервис исчез из docker-compose.yml, сам не
+    # удаляется — он лишь предупреждает при каждой команде («Found orphan
+    # containers»); так на сервере висел bt_load от закрытого Этапа 7.4.
+    # Сервисы невключённых профилей (tools, backtest) осиротевшими не считаются:
+    # они запускаются через `run --rm` и постоянных контейнеров не оставляют.
+    log "Собираю и запускаю контейнеры: docker compose up -d --build --remove-orphans (может занять пару минут)…"
+    docker compose up -d --build --remove-orphans
 
     log "Жду готовности PostgreSQL…"
     wait_postgres || die "PostgreSQL не поднялся за отведённое время. Смотрите: docker compose logs postgres"
@@ -433,6 +553,10 @@ NOTIFY_INTERVAL=30
 NOTIFY_MIN_PROBABILITY=0.7
 NOTIFY_MIN_AGENTS=3
 NOTIFY_COOLDOWN_SEC=1800
+# Защита от потока уведомлений (§2 ТЗ 8.3). Значения предварительные:
+# заданы вслепую и уточняются по измеренному потоку. 0 — выключено.
+NOTIFY_HOLD_MIN=${NOTIFY_HOLD_MIN:-60}
+NOTIFY_MAX_PER_HOUR=${NOTIFY_MAX_PER_HOUR:-6}
 NOTIFY_TIMEZONE=Europe/Moscow
 # --- Калибровка вероятности (Этап 7.3, Блок B) ---
 CALIBRATION_MIN_SAMPLES=${CALIBRATION_MIN_SAMPLES:-60}
@@ -462,9 +586,28 @@ BOT_POLL_TIMEOUT=${BOT_POLL_TIMEOUT:-30}
 BOT_ALLOWED_CHAT_IDS=${BOT_ALLOWED_CHAT_IDS:-}
 BOT_MAX_ROWS=${BOT_MAX_ROWS:-20}
 BOT_RATE_LIMIT_SEC=${BOT_RATE_LIMIT_SEC:-3}
+# --- Цели по вероятности (Этап 8.2), правка Этапа 8.7 ---
+# Круговые издержки СПОТА: комиссия тейкера OKX Lv1 0.10 % × 2 сделки = 0.20 %,
+# проскальзывание 0.01 % × 2 = 0.02 %. Отсюда 0.22. От этого числа считается
+# порог покрытия издержек covers_fees = 3 × 0.22 = 0.66 % (src/risk/targets.py).
+#
+# ПОЧЕМУ КЛЮЧ ДОБАВЛЕН. Комментарий в src/core/config.py:205 заявлял, что
+# значение вынесено в .env и числом в коде не зашито, — а установщик его туда
+# никогда не писал: замер на сервере 25.08.2026 показал, что ключа в .env нет и
+# фактически действует умолчание кода. Заявление и факт разошлись. Значение
+# здесь РАВНО умолчанию (0.22), поэтому поведение системы не меняется —
+# меняется только то, что настройка стала видимой там, где её обещали.
+#
+# С BT_FEE_ROUNDTRIP_PCT (backtest/.env.backtest) ключ НЕ СВЯЗАН: тот читает
+# только пакет backtest/ и на решение и текст сигнала не влияет.
+RISK_COST_ROUNDTRIP_PCT=${RISK_COST_ROUNDTRIP_PCT:-0.22}
 POSTGRES_RO_PASSWORD=${POSTGRES_RO_PASSWORD}
 EOF
     chmod 600 "$APP_DIR/.env"
+    # Файл сформирован целиком, повторов в нём быть не может. Проверка стоит
+    # здесь на случай, если кто-то допишет блок в write_env мимо env_upsert:
+    # тогда дубль будет снят сразу, а не всплывёт через месяц в проверке.
+    normalize_declarations "$APP_DIR/.env"
 }
 
 wait_postgres() {
@@ -494,8 +637,13 @@ setup_operations() {
     log "Автозапуск включён (systemctl enable agent-trade)."
 
     # Регламентные задачи (§8–§11) — cron под пользователем agent.
-    log "Прописываю cron-задачи (бэкап §8, хранение §9, сводка §10, вотчдог §11)."
-    cat > /etc/cron.d/agent-trade <<EOF
+    #
+    # Содержимое задаётся ЦЕЛИКОМ и ставится через cron_install: файл
+    # перезаписывается, а не дополняется, и сразу проходит снятие повторов
+    # (Этап 8.7 §5). Именно ручное дописывание строки калибровки поверх
+    # установленной установщиком дало дубль комментария на сервере.
+    log "Прописываю cron-задачи (бэкап §8, хранение §9, сводка §10, вотчдог §11, цели 8.2 §7)."
+    cron_install /etc/cron.d/agent-trade <<EOF
 # Agent Trade — регламентные задачи (Этап 6.5). Выполняются под пользователем ${APP_USER}.
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -513,9 +661,21 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # Этап 7.3 Калибровочная кривая — ежедневно 05:30 UTC, ДО суточной сводки в 06:00,
 # чтобы сводка показывала актуальное состояние кривой (внутри контейнера, D-3)
 30 5 * * * ${APP_USER} cd ${APP_DIR} && /usr/bin/docker compose --profile tools run --rm --no-deps calibration >> ${APP_DIR}/logs/calibration.log 2>&1
+# Этап 8.2 §7 Цели по вероятности — ежедневно 03:40 UTC (внутри контейнера, D-3).
+# Пересчёт сам догружает свежий край свечей и сам выполняет предпроверку §1;
+# инструмент, её не прошедший, получает пустую цель с причиной data_gap, а не
+# выдуманное число.
+40 3 * * * ${APP_USER} cd ${APP_DIR} && /usr/bin/docker compose --profile tools run --rm --no-deps risk >> ${APP_DIR}/logs/risk.log 2>&1
 EOF
-    chmod 644 /etc/cron.d/agent-trade
     log "Cron-задачи установлены (/etc/cron.d/agent-trade)."
+
+    # Соседние файлы cron ставились вручную на уже работающих серверах
+    # (agent-trade-export, agent-trade-risk) — их установщик не перезаписывает,
+    # но повторы в них снимает: дефект один и тот же, и лечится он одинаково.
+    local cronfile
+    for cronfile in /etc/cron.d/agent-trade-export /etc/cron.d/agent-trade-risk; do
+        normalize_declarations "$cronfile"
+    done
 
     # Ротация лога выгрузки (ТЗ 6.6.1 §8.5), 14 дней.
     if [[ -f "$APP_DIR/deploy/logrotate-agent-trade-export" ]]; then
@@ -607,6 +767,49 @@ add_check() {  # $1 = текст, $2 = код (0 — ок)
     fi
 }
 
+# Завершающая самопроверка §5.3 ТЗ 8.7: ни .env, ни файлы cron не содержат
+# повторных объявлений одного ключа (и одинаковых строк-задач/комментариев).
+# При обнаружении печатает СПИСОК находок и поднимает DUPLICATE_FAIL — скрипт
+# завершится с ненулевым кодом. «Ничего не найдено» печатается явно, чтобы
+# отсутствие вывода нельзя было принять за невыполненную проверку.
+check_no_duplicate_declarations() {
+    step "Самопроверка: повторные объявления в .env и cron (§5.3 ТЗ 8.7)"
+    local f found=0 files=()
+    files=("$APP_DIR/.env")
+    for f in /etc/cron.d/agent-trade /etc/cron.d/agent-trade-export /etc/cron.d/agent-trade-risk; do
+        [[ -f "$f" ]] && files+=("$f")
+    done
+
+    local report=""
+    for f in "${files[@]}"; do
+        if [[ ! -f "$f" ]]; then
+            log "  ПРОПУЩЕНО — файла нет: $f"
+            continue
+        fi
+        local dup
+        dup="$(declarations_duplicates "$f")"
+        if [[ -n "$dup" ]]; then
+            report+="${dup}"$'\n'
+            found=1
+        else
+            log "  OK  — повторов нет: $f"
+        fi
+    done
+
+    if [[ "$found" -eq 1 ]]; then
+        log "  FAIL — найдены повторные объявления:"
+        printf '%s' "$report" | while IFS= read -r line; do
+            [[ -n "$line" ]] && log "        $line"
+        done
+        log "  Устраните повторы (нужное объявление — ПОСЛЕДНЕЕ по файлу) и"
+        log "  запустите установщик повторно: он идемпотентен."
+        DUPLICATE_FAIL=1
+        OVERALL_FAIL=1
+    else
+        log "Повторных объявлений не найдено ни в одном проверенном файле."
+    fi
+}
+
 self_check_and_report() {
     step "8/8 Итоговая самопроверка и отчёт"
     cd "$APP_DIR"
@@ -646,6 +849,9 @@ self_check_and_report() {
     [[ "$tz_actual" == "UTC" || "$tz_actual" == "Etc/UTC" ]]; add_check "Таймзона = UTC (текущая: ${tz_actual:-неизвестно})" "$?"
     [[ -f /etc/cron.d/agent-trade ]]; add_check "Регламентные задачи (cron) установлены" "$?"
     [[ -f "$APP_DIR/.env" && "$(stat -c '%a' "$APP_DIR/.env")" == "600" ]]; add_check ".env существует и имеет права 600" "$?"
+    # Результат посчитан выше в check_no_duplicate_declarations — здесь он
+    # только попадает в отчёт, повторного разбора файлов не происходит.
+    [[ "$DUPLICATE_FAIL" -eq 0 ]]; add_check "Повторных объявлений в .env и cron нет (§5.3 ТЗ 8.7)" "$?"
 
     set -e
     trap 'rc=$?; [[ $rc -ne 0 ]] && log "ОШИБКА: команда завершилась с кодом $rc (строка $LINENO)."; ' ERR
@@ -749,8 +955,15 @@ main() {
     deploy_stack
     setup_operations
     first_backup_and_verify
+    check_no_duplicate_declarations
     self_check_and_report
     final_banner
+    # Повтор объявления — не косметика: два разных значения одного ключа делают
+    # действующую конфигурацию неочевидной. Код возврата обязан это показать.
+    if [[ "$DUPLICATE_FAIL" -ne 0 ]]; then
+        log "КОД ВОЗВРАТА 3: в конфигурации остались повторные объявления (см. выше)."
+        exit 3
+    fi
 }
 
 main "$@"

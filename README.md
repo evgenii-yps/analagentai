@@ -18,8 +18,10 @@
   ТОЛЬКО сильные сигналы (`decision ≠ wait`, `probability ≥ NOTIFY_MIN_PROBABILITY`,
   без повторов и спама).
 - **Этап 6 (анализ результатов):** сервис-оценщик дооценивает сигналы фактом движения
-  цены на горизонтах 1ч/4ч (pnl%, просадка, success) и пишет в `signal_evaluations`;
-  по главному горизонту (4ч) заполняет сводку в `signals` и закрывает сигнал.
+  цены на горизонтах 1ч/4ч/12ч/24ч (pnl%, просадка, success) и пишет в
+  `signal_evaluations`; по главному горизонту (4ч) заполняет сводку в `signals`
+  и закрывает сигнал. Сигнал при этом ОДИН: горизонт влияет только на оценку
+  исхода (Этап 8.1 §5).
 - **Этап 6.6 (выгрузка сигналов):** суточная пакетная выгрузка закрытых сигналов
   наружу — полный поток в Google Таблицу (лист «Сигналы» + служебные «Сводка по дням»
   и «Независимые окна»), витрина сильных сигналов (с фактически отправленным
@@ -134,11 +136,15 @@ curl -fsSL https://raw.githubusercontent.com/evgenii-yps/analagentai/claude/depl
 │   ├── agent-trade.service # systemd-юнит автозапуска стека
 │   ├── apps_script.gs      # код приёмника Google Таблицы (выгрузка 6.6)
 │   ├── agent-trade-export.cron        # шаблон cron-записи выгрузки
+│   ├── agent-trade-risk.cron          # шаблон cron-записи пересчёта целей (8.2)
+│   ├── verify_8_2.sh                  # проверка развёртывания Этапа 8.2
 │   └── logrotate-agent-trade-export   # ротация лога выгрузки
 ├── scripts/                # вспомогательные скрипты эксплуатации (хост, stdlib)
 │   ├── geo_check.py        # блокирующий гео-тест OKX (REST + WebSocket, stdlib)
 │   ├── backup_db.sh        # ежедневный бэкап БД с ротацией
 │   ├── retention.py        # политика хранения (очистка старых сырых данных)
+│   ├── precheck_8_2.sql    # предпроверка глубины и целостности свечей (Этап 8.2 §1)
+│   ├── backfill_8_2.py     # разовая догрузка 95 суток часовых свечей спота (8.2 §2)
 │   └── watchdog.py         # вотчдог: перезапуск упавших сервисов + алерт
 ├── src/
 │   ├── main.py             # точка входа — сервис-коллектор
@@ -148,6 +154,7 @@ curl -fsSL https://raw.githubusercontent.com/evgenii-yps/analagentai/claude/depl
 │   ├── evaluator_main.py   # точка входа — оценщик результатов
 │   ├── export_main.py      # точка входа — выгрузка сигналов (docker compose run)
 │   ├── bot_main.py         # точка входа — телеграм-бот только на чтение (Этап 6.7)
+│   ├── risk_main.py        # точка входа — пересчёт целей по вероятности (Этап 8.2)
 │   ├── healthcheck.py      # CLI-проверка PG и Redis
 │   ├── core/
 │   │   ├── config.py       # Settings (pydantic-settings)
@@ -161,6 +168,10 @@ curl -fsSL https://raw.githubusercontent.com/evgenii-yps/analagentai/claude/depl
 │   ├── notify/             # NotifyAgent + should_notify + Telegram
 │   ├── bot/                # телеграм-бот на чтение: poller/handlers/queries/runner
 │   ├── evaluator/          # compute_evaluation + класс Evaluator
+│   ├── risk/               # цели по вероятности (Этап 8.2)
+│   │   ├── targets.py      # MFE по касанию, 40-й процентиль, покрытие издержек
+│   │   ├── quality.py      # предпроверка ряда свечей (пороги §1)
+│   │   └── runner.py       # суточный пересчёт risk_targets
 │   ├── export/             # выгрузка сигналов (Этап 6.6)
 │   │   ├── transform.py    # чистые функции: строки листов, окно 4ч, свойства Notion
 │   │   ├── queries.py      # SQL выборки/агрегатов/учёта выгрузок
@@ -181,6 +192,18 @@ curl -fsSL https://raw.githubusercontent.com/evgenii-yps/analagentai/claude/depl
 Каждый коллектор работает в своём цикле и не падает при ошибках сети/API
 (ошибка логируется как warning, цикл продолжается). После каждой успешной итерации
 пишется heartbeat в Redis: `collector:heartbeat:{name}` (TTL 300 сек).
+
+Состав инструментов задаётся `SYMBOLS` — пары «спот:контракт» через запятую
+(Этап 8.1 §1), например
+`SYMBOLS=BTC/USDT:BTC/USDT:USDT,ETH/USDT:ETH/USDT:USDT`. Разделитель пары —
+первое двоеточие: имя контракта само содержит двоеточие. Свечи, стакан и сделки
+собираются по СПОТУ, funding и открытый интерес — по КОНТРАКТУ; имя контракта из
+имени спота не достраивается. Пустой `SYMBOLS` = одна пара из
+`SYMBOL`/`SWAP_SYMBOL`.
+
+Расширять состав следует ПОЭТАПНО (§2 ТЗ 8.1): сначала два токена, два часа
+работы и `bash scripts/measure_load.sh`, и только при ненарушенных порогах —
+остальные. Проверка развёртывания: `bash deploy/verify_8_1.sh`.
 
 Настройки сбора (с дефолтами) — см. `.env.example`: `EXCHANGE`, `SYMBOL`,
 `SWAP_SYMBOL`, `TIMEFRAMES`, `OHLCV_INTERVAL`, `ORDERBOOK_INTERVAL`,
@@ -278,7 +301,7 @@ NOTIFY_TIMEZONE=Europe/Moscow
 ## Анализ результатов (Этап 6)
 
 Отдельный сервис `evaluator` (команда `python -m src.evaluator_main`) дооценивает каждый
-направленный сигнал фактом: пошла ли цена в предсказанную сторону. Для горизонтов 1ч и 4ч
+направленный сигнал фактом: пошла ли цена в предсказанную сторону. Для горизонтов 1ч, 4ч, 12ч и 24ч
 по 1m-свечам считаются `pnl_pct` (движение в сторону сигнала; для `sell` со знаком минус,
 положительный = верно), `drawdown_pct` (макс. ход против сигнала, всегда ≥ 0) и
 `success` (`pnl_pct > 0`). Результаты пишутся в `signal_evaluations`
@@ -290,7 +313,8 @@ NOTIFY_TIMEZONE=Europe/Moscow
 статистика: доля `success` и средний `pnl_pct` по `decision × horizon`.
 Heartbeat — `evaluator:heartbeat`.
 
-Настройки (с дефолтами): `EVAL_INTERVAL` (300), `EVAL_HORIZONS` (1h,4h),
+Настройки (с дефолтами): `EVAL_INTERVAL` (300), `EVAL_HORIZONS` (1,4,12,24 —
+в часах; прежний формат «1h,4h» тоже читается),
 `EVAL_PRIMARY_HORIZON` (4h), `STATS_LOG_INTERVAL` (3600).
 
 Проверка результатов:
@@ -324,8 +348,16 @@ docker compose exec postgres psql -U agenttrade -d agenttrade -c \
 2. Поднимите всё окружение:
 
    ```bash
-   docker compose up --build
+   docker compose up --build --remove-orphans
    ```
+
+   > **Зачем `--remove-orphans`.** Контейнер, оставшийся от services, которого в
+   > текущем `docker-compose.yml` уже нет, docker compose не удаляет сам — он
+   > лишь предупреждает о нём при КАЖДОЙ команде («Found orphan containers»).
+   > Так на сервере до Этапа 8.7 висел остановленный `bt_load` от закрытого
+   > Этапа 7.4. Флаг убирает такие контейнеры сразу. Сервисы из невключённых
+   > профилей (`tools`, `backtest`) осиротевшими НЕ считаются: они запускаются
+   > через `run --rm` и постоянных контейнеров не оставляют.
 
    Контейнер `postgres` при первом старте автоматически применит `db/init.sql`
    и создаст 9 таблиц с индексами. Сервисы `collector`, `agents`, `decision`,
@@ -396,3 +428,25 @@ pytest
 docker compose down          # остановить контейнеры
 docker compose down -v       # остановить и удалить тома (pg_data, redis_data)
 ```
+
+## Осиротевшие контейнеры
+
+Контейнер, чей сервис исчез из `docker-compose.yml`, продолжает существовать и
+даёт предупреждение «Found orphan containers» при каждой команде compose. Сам
+он не удаляется — это делается явно:
+
+```bash
+# Посмотреть, что вообще осталось (включая остановленные)
+docker compose ps -a
+docker ps -a --filter "name=bt_"
+
+# Удалить осиротевшие вместе с обычным подъёмом стека
+docker compose up -d --remove-orphans
+
+# Либо удалить конкретный контейнер поимённо
+docker rm bt_load
+```
+
+Контейнер `bt_load` остался от закрытого Этапа 7.4 (`docs/STAGE_7_4_REPORT.md`)
+и удалён Этапом 8.7 §6. Данных он не хранил: история реплея лежит в схеме
+`backtest` базы, а не в контейнере, — удаление ничего не теряет.

@@ -20,8 +20,9 @@ class TradesCollector(BaseCollector):
         instrument_id: int,
         symbol: str,
         interval: float,
+        name_suffix: str = "",
     ) -> None:
-        super().__init__(name="trades", interval=interval)
+        super().__init__(name="trades", interval=interval, name_suffix=name_suffix)
         self.exchange = exchange
         self.instrument_id = instrument_id
         self.symbol = symbol

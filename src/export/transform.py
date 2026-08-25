@@ -197,6 +197,126 @@ def _payload_json(agents_payload: Any) -> str:
     return json.dumps(agents_payload, ensure_ascii=False)
 
 
+# --- Лист «Независимые окна» (Этап 8.1 §7) ---------------------------------
+
+# Оговорка выводится ПЕРВОЙ строкой листа и обязана быть в нём всегда (§7 ТЗ 8.1):
+# без неё число наблюдений читается как пятикратно выросшая мощность, чем оно
+# не является.
+INDEPENDENT_DISCLAIMER: list[Any] = [
+    "ВНИМАНИЕ: пять токенов НЕ дают пятикратного роста статистической мощности. "
+    "Криптовалюты сильно коррелированы: одно и то же движение рынка попадает в "
+    "наблюдения по всем токенам сразу. Фактическая корреляция исходов между "
+    "токенами приведена в колонке «корреляция с другими токенами» и на листе "
+    "«Корреляция токенов»; эффективное число независимых наблюдений МЕНЬШЕ "
+    "формального."
+]
+
+INDEPENDENT_HEADER: list[str] = [
+    "горизонт_ч",
+    "токен",
+    "окно_utc",
+    "signal_id",
+    "ts_utc",
+    "decision",
+    "индекс согласия",
+    "price_at_signal",
+    "price_at_close",
+    "pnl_pct",
+    "drawdown_pct",
+    "success",
+    "logic_version",
+    "degraded",
+    "корреляция с другими токенами",
+]
+
+CORRELATION_HEADER: list[str] = [
+    "горизонт_ч", "токен_a", "токен_b", "N совпавших окон", "корреляция исходов r",
+    # §9.4 ТЗ 8.2. Колонки версии здесь не было вовсе, и корреляция исходов
+    # считалась ПОПЕРЁК версий логики так, что увидеть это по листу было
+    # невозможно. Значение «смешано» означает ровно то, что написано.
+    "logic_version",
+]
+
+# Оговорка первой строкой листа при EXPORT_LOGIC_VERSION=all (§9.3 ТЗ 8.2).
+# Прямая, а не сноской внизу: читатель обязан узнать о смешивании раньше, чем
+# увидит первое число.
+MIXED_VERSIONS_DISCLAIMER: list[Any] = [
+    "ВНИМАНИЕ: лист собран при EXPORT_LOGIC_VERSION=all и СМЕШИВАЕТ РАЗНЫЕ "
+    "ВЕРСИИ ЛОГИКИ. Сигналы разных версий несравнимы между собой: у них разный "
+    "состав агентов, разные пороги и разный набор горизонтов. Сравнивать доли "
+    "попаданий и корреляции по такому листу нельзя; версия каждой строки — в "
+    "колонке logic_version."
+]
+
+
+def build_independent_row(
+    signal: dict[str, Any],
+    correlation: float | None = None,
+) -> list[Any]:
+    """Строка листа «Независимые окна»: одно наблюдение (токен × горизонт).
+
+    ``correlation`` — средняя корреляция исходов этого токена с остальными на
+    том же горизонте. Значение считается ежесуточно вместе с выгрузкой и
+    выводится рядом с наблюдением, чтобы «много строк» не читалось как «много
+    независимой информации».
+    """
+    ts: datetime = signal["ts"]
+    probability = signal.get("probability")
+    return [
+        signal.get("horizon_h"),
+        signal.get("token") or "",
+        iso_utc(signal.get("win")),
+        signal["id"],
+        iso_utc(ts),
+        signal.get("decision") or "",
+        "" if probability is None else round(float(probability), 4),
+        _num(signal.get("h_price_at_signal")),
+        _num(signal.get("h_price_at_close")),
+        _num(signal.get("h_pnl_pct")),
+        _num(signal.get("h_drawdown_pct")),
+        success_cell(signal.get("h_success")),
+        signal.get("logic_version"),
+        "да" if signal.get("degraded") else "нет",
+        "" if correlation is None else round(float(correlation), 3),
+    ]
+
+
+def build_correlation_row(row: dict[str, Any]) -> list[Any]:
+    """Строка листа «Корреляция токенов» (с версией логики, §9.4 ТЗ 8.2)."""
+    r = row.get("r")
+    return [
+        row.get("horizon_h"),
+        row.get("token_a") or "",
+        row.get("token_b") or "",
+        int(row.get("n") or 0),
+        "" if r is None else round(float(r), 3),
+        row.get("logic_version") if row.get("logic_version") is not None else "",
+    ]
+
+
+def mean_correlation_by_token(
+    rows: list[dict[str, Any]]
+) -> dict[tuple[int, str], float]:
+    """Средняя корреляция исходов каждого токена с остальными: (горизонт, токен) → r.
+
+    Пары считаются один раз (a < b), поэтому каждая строка учитывается для обоих
+    токенов пары. Пустые значения (нет совпавших окон) пропускаются, а не
+    заменяются нулём: «корреляции не измерено» и «корреляция равна нулю» —
+    разные утверждения.
+    """
+    sums: dict[tuple[int, str], list[float]] = {}
+    for row in rows:
+        r = row.get("r")
+        if r is None:
+            continue
+        horizon = int(row.get("horizon_h") or 0)
+        for token in (row.get("token_a"), row.get("token_b")):
+            if not token:
+                continue
+            sums.setdefault((horizon, str(token)), []).append(float(r))
+    return {key: sum(values) / len(values) for key, values in sums.items()}
+
+
 def build_signal_row(signal: dict[str, Any]) -> list[Any]:
     """Собирает одну строку листа «Сигналы» (27 колонок) из записи БД.
 

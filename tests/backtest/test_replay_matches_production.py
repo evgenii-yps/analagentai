@@ -20,7 +20,7 @@ import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from helpers import INST, T0, make_config, requires_db, seed_candles, seed_funding
+from helpers import PAIR, T0, make_config, requires_db, seed_candles, seed_funding
 
 from backtest import parity
 from backtest.parity import AgentParity, ParityResult
@@ -116,7 +116,7 @@ async def test_replayed_agent_values_are_deterministic(bt_db, pool) -> None:
 
     cfg = make_config()
     ts = T0 + timedelta(hours=24 * 30)
-    snapshot = await build_snapshot(INST, ts, cfg)
+    snapshot = await build_snapshot(PAIR, ts, cfg)
 
     first = parity._replay_agent_values(snapshot)
     second = parity._replay_agent_values(snapshot)
@@ -139,7 +139,7 @@ async def test_replay_uses_production_functions(bt_db, pool, monkeypatch) -> Non
 
     cfg = make_config()
     ts = T0 + timedelta(hours=24 * 30)
-    snapshot = await build_snapshot(INST, ts, cfg)
+    snapshot = await build_snapshot(PAIR, ts, cfg)
     original = replay_mod.agent_outputs_at(snapshot, ("market",))[0]
 
     def fake_analyze(df, min_candles):

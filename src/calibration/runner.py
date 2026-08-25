@@ -17,6 +17,7 @@ import structlog
 from src.calibration.curve import Observation, build_bins, curve_summary, to_independent
 from src.core.config import settings
 from src.core.db import db
+from src.core.instruments import horizon_label, parse_horizon_hours
 from src.core.redis_client import close_redis, get_redis
 
 # Ключ кэша активной кривой в Redis (его же читает Decision Agent).
@@ -32,7 +33,9 @@ async def build_once() -> int | None:
     """
     log = structlog.get_logger().bind(component="calibration")
     logic_version = settings.LOGIC_VERSION
-    horizon = settings.CALIBRATION_HORIZON
+    # Горизонт калибровки в часах (Этап 8.1 §5): в .env он может стоять и как
+    # «4h», и как «4» — это один и тот же горизонт.
+    horizon = parse_horizon_hours(settings.CALIBRATION_HORIZON)
 
     rows = await db.get_independent_outcomes(logic_version, horizon)
     # Прореживание уже сделано запросом; повторное применение чистой функции —
@@ -50,7 +53,7 @@ async def build_once() -> int | None:
         log.info(
             "Кривая не строится: независимых наблюдений меньше минимума",
             logic_version=logic_version,
-            horizon=horizon,
+            horizon=horizon_label(horizon),
             observations=len(observations),
             required=settings.CALIBRATION_MIN_SAMPLES,
         )
@@ -64,7 +67,8 @@ async def build_once() -> int | None:
     window_from = observations[0].ts
     window_to = observations[-1].ts
     notes = (
-        f"Независимые 4-часовые окна, горизонт {horizon}, "
+        f"Независимые окна длиной в горизонт, по одному на токен; "
+        f"горизонт {horizon_label(horizon)}, "
         f"сглаживание k={settings.CALIBRATION_PRIOR_WEIGHT}, "
         f"монотонность не навязывалась."
     )

@@ -97,8 +97,47 @@ else
 fi
 
 echo "=== 5. Конфигурация прогона ==="
-if [[ -f backtest/.env.backtest ]]; then
+if [[ -d backtest/.env.backtest ]]; then
+  # Дефект D-9: docker создаёт КАТАЛОГ на месте файла, указанного в volumes,
+  # если файла на хосте не было. Дальше конфигурация «не читается» без причины.
+  block "backtest/.env.backtest — это КАТАЛОГ (его создал docker, когда файла не было)."
+  info "удалите каталог, создайте файл из backtest/.env.backtest.example"
+  info "и пересоберите образ: docker compose --profile backtest build --no-cache backtest"
+elif [[ -f backtest/.env.backtest ]]; then
   ok "backtest/.env.backtest на месте"
+
+  # Рынки разведены: свечи берутся со спота, funding — с контракта. Пара
+  # задаётся явно, достраивание имени контракта запрещено.
+  agents_value="$(grep -E '^BT_AGENTS=' backtest/.env.backtest | tail -1 | cut -d= -f2- | awk '{print $1}')"
+  if [[ -z "$agents_value" ]]; then
+    block "BT_AGENTS пуст: допустимо «market» или «market,futures»"
+  elif [[ "$agents_value" == "market" || "$agents_value" == "market,futures" ]]; then
+    ok "BT_AGENTS=$agents_value"
+  else
+    block "BT_AGENTS=$agents_value: допустимо только «market» или «market,futures»"
+  fi
+
+  inst_value="$(grep -E '^BT_INSTRUMENTS=' backtest/.env.backtest | tail -1 | cut -d= -f2- | awk '{print $1}')"
+  if [[ -z "$inst_value" ]]; then
+    block "BT_INSTRUMENTS пуст"
+  else
+    pairs_ok=true
+    IFS=',' read -ra items <<< "$inst_value"
+    for item in "${items[@]}"; do
+      if [[ "$item" != *:* ]]; then
+        if [[ "$agents_value" == *futures* ]]; then
+          block "BT_INSTRUMENTS: «$item» без контракта, а BT_AGENTS включает futures."
+          info "формат СПОТ:КОНТРАКТ, например BTC-USDT:BTC-USDT-SWAP;"
+          info "у спота истории funding нет — биржа отвечает 51000 Parameter instId error"
+          pairs_ok=false
+        else
+          warn "BT_INSTRUMENTS: «$item» без контракта (при BT_AGENTS=market это допустимо)"
+        fi
+      fi
+    done
+    [[ "$pairs_ok" == "true" ]] && ok "BT_INSTRUMENTS=$inst_value"
+  fi
+
   for key in BT_PERIOD_FROM BT_REQUEST_PAUSE_MS; do
     value="$(grep -E "^${key}=" backtest/.env.backtest | tail -1 | cut -d= -f2- | awk '{print $1}')"
     if [[ -n "$value" ]]; then

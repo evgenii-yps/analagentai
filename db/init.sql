@@ -42,6 +42,49 @@ CREATE TABLE IF NOT EXISTS trades (
 );
 CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades (instrument_id, ts DESC);
 
+-- Поминутные итоги ленты сделок (Этап 8.1, решение по §4.3). Сырьё в trades
+-- живёт трое суток, итоги минуты — НАВСЕГДА: при пяти токенах сырая лента не
+-- помещается на диск, а её содержательная часть помещается легко.
+CREATE TABLE IF NOT EXISTS trade_flow_1m (
+    instrument_id INTEGER       NOT NULL REFERENCES instruments(id),
+    ts            TIMESTAMPTZ   NOT NULL,   -- начало ЗАВЕРШЁННОЙ минуты
+    trades_n      INTEGER       NOT NULL,
+    buy_volume    NUMERIC(30,8) NOT NULL,
+    sell_volume   NUMERIC(30,8) NOT NULL,
+    buy_n         INTEGER       NOT NULL,
+    sell_n        INTEGER       NOT NULL,
+    vwap          NUMERIC(20,8) NOT NULL,
+    PRIMARY KEY (instrument_id, ts)
+);
+CREATE INDEX IF NOT EXISTS ix_trade_flow_1m_ts ON trade_flow_1m (ts);
+
+-- Суточные итоги выводов агентов (Этап 8.1). Сырой журнал agent_outputs живёт
+-- 90 суток (версия логики меняется почти каждый этап, и старые выводы
+-- аналитически непригодны), итоги суток — НАВСЕГДА. logic_version в ключе:
+-- сутки на границе версий дают две строки, а не одну смешанную.
+CREATE TABLE IF NOT EXISTS agent_outputs_daily (
+    day            DATE          NOT NULL,
+    agent          TEXT          NOT NULL,
+    instrument_id  INTEGER       NOT NULL REFERENCES instruments(id),
+    logic_version  SMALLINT      NOT NULL,
+    n_total        INTEGER       NOT NULL,
+    n_bullish      INTEGER       NOT NULL,
+    n_bearish      INTEGER       NOT NULL,
+    n_neutral      INTEGER       NOT NULL,
+    conf_avg       NUMERIC(10,6) NOT NULL,
+    conf_p50       NUMERIC(10,6) NOT NULL,
+    conf_p90       NUMERIC(10,6) NOT NULL,
+    repeat_rate    NUMERIC(5,4)  NOT NULL,
+    PRIMARY KEY (day, agent, instrument_id, logic_version)
+);
+CREATE INDEX IF NOT EXISTS ix_agent_outputs_daily_agent
+    ON agent_outputs_daily (agent, day);
+COMMENT ON COLUMN agent_outputs_daily.logic_version IS
+    '0 — версия логики НЕИЗВЕСТНА (вывод сделан раньше самой ранней записанной '
+    'границы версий). Ближайшая известная версия не подставляется: это была бы '
+    'ложная запись в таблице, которая не удаляется никогда. Реальные версии '
+    'строго положительны (ограничение на logic_version_windows).';
+
 -- Ставки финансирования (funding rate) для деривативов.
 CREATE TABLE IF NOT EXISTS funding (
     instrument_id INT NOT NULL REFERENCES instruments(id),
@@ -144,17 +187,54 @@ CREATE TABLE IF NOT EXISTS signal_exports (
 CREATE INDEX IF NOT EXISTS idx_signal_exports_target ON signal_exports (target, signal_id);
 
 -- Оценка результатов сигналов фактом движения цены (Этап 6).
+-- Оценка результата сигнала. Этап 8.1 §5: горизонтов четыре (1, 4, 12, 24 ч),
+-- каждый считается независимо, а сигнал остаётся ОДИН. Ключ записи —
+-- (сигнал, горизонт в часах). Текстовая колонка horizon сохранена и несёт
+-- подпись того же значения ('4h'): её читают выгрузка, бот и суточная сводка.
 CREATE TABLE IF NOT EXISTS signal_evaluations (
-    id              BIGSERIAL PRIMARY KEY,
     signal_id       BIGINT NOT NULL REFERENCES signals(id),
-    horizon         TEXT NOT NULL,                 -- 1h | 4h
+    horizon         TEXT NOT NULL,                 -- 1h | 4h | 12h | 24h
+    horizon_h       SMALLINT NOT NULL,             -- тот же горизонт в часах
     price_at_signal DOUBLE PRECISION NOT NULL,
     price_at_close  DOUBLE PRECISION NOT NULL,
     pnl_pct         DOUBLE PRECISION NOT NULL,
     drawdown_pct    DOUBLE PRECISION NOT NULL,
     success         BOOLEAN NOT NULL,
     evaluated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (signal_id, horizon)
+    PRIMARY KEY (signal_id, horizon_h)
+);
+CREATE INDEX IF NOT EXISTS ix_eval_horizon
+    ON signal_evaluations (horizon_h, evaluated_at);
+
+-- Границы версий логики (Этап 8.1 §6). Данные версий не смешиваются в анализе,
+-- поэтому момент перехода хранится машиночитаемо, с точностью до минуты.
+-- Настройки уведомлений по чату Telegram (Этап 8.3 §1). Отсутствие строки —
+-- не ошибка: действуют значения по умолчанию из кода. instruments хранит
+-- идентификаторы инструментов, а не названия: имя пары может смениться.
+CREATE TABLE IF NOT EXISTS user_settings (
+    chat_id     BIGINT       PRIMARY KEY,
+    instruments INTEGER[]    NOT NULL
+        CHECK (array_length(instruments, 1) >= 1),
+    horizon_h   SMALLINT     NOT NULL DEFAULT 4 CHECK (horizon_h > 0),
+    min_score   NUMERIC(4,3) NOT NULL DEFAULT 0.700,
+    -- Часы UTC; NULL в обоих означает «тишина выключена». Диапазон может
+    -- пересекать полночь (22 → 6), поэтому порядок часов не ограничивается.
+    quiet_from  SMALLINT,
+    quiet_to    SMALLINT,
+    updated_at  TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    CONSTRAINT user_settings_quiet_hours_valid CHECK (
+        (quiet_from IS NULL AND quiet_to IS NULL)
+        OR (quiet_from BETWEEN 0 AND 23 AND quiet_to BETWEEN 0 AND 23)
+    )
+);
+
+CREATE TABLE IF NOT EXISTS logic_version_windows (
+    -- Строго положительна: ноль зарезервирован под признак «версия
+    -- неизвестна» в agent_outputs_daily (миграция 012). Без этого запрета
+    -- признак «неизвестно» нельзя было бы отличить от реальной версии.
+    logic_version SMALLINT    PRIMARY KEY CHECK (logic_version > 0),
+    started_at    TIMESTAMPTZ NOT NULL,
+    note          TEXT
 );
 
 -- Учёт сбоев итераций агентов (Этап 7.0). Раньше сбой терялся молча — теперь
@@ -181,3 +261,7 @@ CREATE TABLE IF NOT EXISTS agent_outputs (
     rationale     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_agent_outputs ON agent_outputs (agent, instrument_id, ts DESC);
+-- Отбор ТОЛЬКО по времени: поиск незакрытых суток в свёртке и удаление
+-- журнала старше RETENTION_AGENT_OUTPUTS_DAYS. Индекс выше такой отбор
+-- не покрывает — ведущая колонка в нём agent.
+CREATE INDEX IF NOT EXISTS ix_agent_outputs_ts ON agent_outputs (ts);

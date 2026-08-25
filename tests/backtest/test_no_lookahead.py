@@ -18,7 +18,7 @@ import random
 from datetime import timedelta
 
 import pytest
-from helpers import INST, T0, make_config, requires_db, seed_candles, seed_funding
+from helpers import PAIR, SPOT, SWAP, T0, make_config, requires_db, seed_candles, seed_funding
 
 from backtest import clock, replay
 
@@ -41,7 +41,7 @@ async def test_snapshot_contains_nothing_from_the_future(seeded) -> None:
         for _ in range(100)
     ]
     for ts in moments:
-        snapshot = await clock.build_snapshot(INST, ts, cfg)
+        snapshot = await clock.build_snapshot(PAIR, ts, cfg)
         if not snapshot.candles.empty:
             assert snapshot.candles["close_time"].max() <= ts
         if not snapshot.funding.empty:
@@ -52,7 +52,7 @@ async def test_candle_closing_exactly_at_t_is_included(seeded) -> None:
     """Свеча, закрывающаяся ровно в T, входит в снимок; следующая — нет."""
     cfg = make_config()
     ts = T0 + timedelta(hours=24 * 25)
-    snapshot = await clock.build_snapshot(INST, ts, cfg)
+    snapshot = await clock.build_snapshot(PAIR, ts, cfg)
     close_times = list(snapshot.candles["close_time"])
     assert ts in close_times
     assert all(t <= ts for t in close_times)
@@ -67,19 +67,19 @@ async def test_deleting_future_rows_does_not_change_replay(seeded, pool) -> None
     cfg = make_config()
     ts = T0 + timedelta(hours=24 * 30)
 
-    before = await clock.build_snapshot(INST, ts, cfg)
+    before = await clock.build_snapshot(PAIR, ts, cfg)
     outputs_before = replay.agent_outputs_at(before, ("market", "futures"))
 
     deleted_candles = await pool.execute(
-        "DELETE FROM backtest.candles WHERE inst_id=$1 AND close_time > $2;", INST, ts
+        "DELETE FROM backtest.candles WHERE inst_id=$1 AND close_time > $2;", SPOT, ts
     )
     deleted_funding = await pool.execute(
-        "DELETE FROM backtest.funding WHERE inst_id=$1 AND funding_time > $2;", INST, ts
+        "DELETE FROM backtest.funding WHERE inst_id=$1 AND funding_time > $2;", SWAP, ts
     )
     assert deleted_candles.startswith("DELETE")
     assert deleted_funding.startswith("DELETE")
 
-    after = await clock.build_snapshot(INST, ts, cfg)
+    after = await clock.build_snapshot(PAIR, ts, cfg)
     outputs_after = replay.agent_outputs_at(after, ("market", "futures"))
 
     for left, right in zip(outputs_before, outputs_after, strict=True):
@@ -112,16 +112,16 @@ async def test_deleting_future_does_not_change_decision(seeded, pool) -> None:
         )
 
     decision_before, conviction_before, _p, _r = decide(
-        await clock.build_snapshot(INST, ts, cfg)
+        await clock.build_snapshot(PAIR, ts, cfg)
     )
     await pool.execute(
-        "DELETE FROM backtest.candles WHERE inst_id=$1 AND close_time > $2;", INST, ts
+        "DELETE FROM backtest.candles WHERE inst_id=$1 AND close_time > $2;", SPOT, ts
     )
     await pool.execute(
-        "DELETE FROM backtest.funding WHERE inst_id=$1 AND funding_time > $2;", INST, ts
+        "DELETE FROM backtest.funding WHERE inst_id=$1 AND funding_time > $2;", SWAP, ts
     )
     decision_after, conviction_after, _p2, _r2 = decide(
-        await clock.build_snapshot(INST, ts, cfg)
+        await clock.build_snapshot(PAIR, ts, cfg)
     )
 
     assert decision_before == decision_after

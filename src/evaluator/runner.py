@@ -17,24 +17,44 @@ async def run() -> None:
     """Поднимает инфраструктуру, запускает оценщик и ждёт сигнала остановки."""
     log = structlog.get_logger()
     log.info(
-        "Запуск оценщика Agent Trade (Этап 6)",
+        "Запуск оценщика Agent Trade (Этап 6, горизонты — Этап 8.1)",
         interval=settings.EVAL_INTERVAL,
-        horizons=settings.eval_horizons_list,
-        primary=settings.EVAL_PRIMARY_HORIZON,
+        horizons_h=settings.eval_horizons_hours,
+        primary_h=settings.eval_primary_horizon_h,
     )
 
     await db.connect()
     get_redis()
-    # Идемпотентно гарантируем наличие таблицы оценок (на старом томе).
+    # Идемпотентно гарантируем схему оценок с колонкой horizon_h (Этап 8.1 §5).
     await db.ensure_evaluator_schema()
+    await db.ensure_logic_version_schema()
 
     tasks: list[asyncio.Task[None]] = []
     try:
+        # Граница версии логики (§6): сигналы, выданные ДО перехода на текущую
+        # версию, новых горизонтов не получают — досчёт задним числом запрещён
+        # (§12 ТЗ 8.1).
+        #
+        # Границу фиксирует тот сервис, который стартовал первым (запись
+        # идемпотентна, первый писатель побеждает). Порядок старта контейнеров
+        # не задан, и если бы оценщик просто ЧИТАЛ границу, при старте раньше
+        # Decision Agent он получил бы «границы нет» — то есть работал бы вовсе
+        # без отсечения и досчитал бы горизонты 12ч и 24ч старым сигналам
+        # версии 4. Это ровно то, что §12 запрещает, поэтому граница здесь
+        # именно ЗАПИСЫВАЕТСЯ, а не читается.
+        evaluate_from = await db.record_logic_version_start(settings.LOGIC_VERSION)
+        log.info(
+            "Граница дооценки",
+            logic_version=settings.LOGIC_VERSION,
+            evaluate_from=None if evaluate_from is None
+            else evaluate_from.isoformat(timespec="minutes"),
+        )
         evaluator = Evaluator(
             interval=settings.EVAL_INTERVAL,
-            horizons=settings.eval_horizons_list,
-            primary_horizon=settings.EVAL_PRIMARY_HORIZON,
+            horizons=settings.eval_horizons_hours,
+            primary_horizon=settings.eval_primary_horizon_h,
             stats_log_interval=settings.STATS_LOG_INTERVAL,
+            evaluate_from=evaluate_from,
         )
         tasks = [asyncio.create_task(evaluator.run(), name="evaluator")]
 

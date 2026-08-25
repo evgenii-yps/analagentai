@@ -27,6 +27,7 @@ from src.calibration.curve import probability_for_index
 from src.core.config import settings
 from src.core.db import db
 from src.core.redis_client import get_redis
+from src.risk.targets import REASON_NO_RISK_TARGET, target_price
 
 # Агенты, выводы которых агрегируются.
 AGENTS = ("market", "liquidity", "futures")
@@ -198,9 +199,13 @@ class DecisionAgent:
         threshold: float,
         min_agents: int,
         freshness_sec: float,
+        token: str = "",
     ) -> None:
         # instrument_id — основной инструмент, под которым пишется сигнал.
         self.instrument_id = instrument_id
+        # Токен пары (Этап 8.1): различает пять одновременно работающих
+        # экземпляров в логах и в heartbeat-ключе.
+        self.token = token
         # У каждого агента может быть свой инструмент (spot/swap).
         self.agent_instruments = agent_instruments
         self.interval = interval
@@ -208,7 +213,9 @@ class DecisionAgent:
         self.threshold = threshold
         self.min_agents = min_agents
         self.freshness_sec = freshness_sec
-        self._log = structlog.get_logger().bind(agent="decision")
+        self._log = structlog.get_logger().bind(
+            agent="decision", token=token or None
+        )
 
     async def decide_once(self) -> None:
         """Читает последние выводы агентов, агрегирует и сохраняет решение."""
@@ -239,28 +246,149 @@ class DecisionAgent:
         # Нет кривой — NULL, и никакая «вероятность» никому не показывается.
         calibrated, calibration_id = await self._calibrate(conviction)
 
-        await db.save_signal(
-            self.instrument_id,
-            decision,
-            conviction,
-            payload,
-            rationale,
-            logic_version=LOGIC_VERSION,
-            degraded=degraded,
-            calibrated_probability=calibrated,
-            calibration_id=calibration_id,
-            inputs_hash=inputs_hash,
-            is_repeat=is_repeat,
-        )
+        # Цели по вероятности (Этап 8.2 §6). Считаются ДО транзакции, пишутся
+        # В НЕЙ ЖЕ. Сбой расчёта не мешает выдаче сигнала: сигнал важнее
+        # украшения — это правило §6 ТЗ, а не соображение удобства.
+        targets = await self._frozen_targets(decision)
+
+        try:
+            signal_id = await db.save_signal(
+                self.instrument_id,
+                decision,
+                conviction,
+                payload,
+                rationale,
+                logic_version=LOGIC_VERSION,
+                degraded=degraded,
+                calibrated_probability=calibrated,
+                calibration_id=calibration_id,
+                inputs_hash=inputs_hash,
+                is_repeat=is_repeat,
+                targets=targets,
+            )
+        except Exception as exc:  # noqa: BLE001 — сигнал важнее целей
+            if not targets:
+                raise
+            # Транзакцию сорвала ЗАПИСЬ ЦЕЛЕЙ (например, таблицы нет на этом
+            # томе). Повторяем без целей: без сигнала система слепа, без цели —
+            # только менее удобна.
+            await self._record_targets_failure("db_write", exc)
+            signal_id = await db.save_signal(
+                self.instrument_id,
+                decision,
+                conviction,
+                payload,
+                rationale,
+                logic_version=LOGIC_VERSION,
+                degraded=degraded,
+                calibrated_probability=calibrated,
+                calibration_id=calibration_id,
+                inputs_hash=inputs_hash,
+                is_repeat=is_repeat,
+                targets=None,
+            )
         self._log.info(
             "Решение сохранено",
+            signal_id=signal_id,
             decision=decision,
             conviction=conviction,
             calibrated_probability=calibrated,
             agents=len(payload),
             degraded=degraded,
             is_repeat=is_repeat,
+            targets=0 if not targets else len(targets),
         )
+
+    async def _frozen_targets(self, decision: str) -> list[dict[str, Any]] | None:
+        """Цели по всем горизонтам оценки на момент сигнала (§6 ТЗ 8.2).
+
+        Решение ``wait`` целей не получает: цель — это ход в сторону сделки,
+        а сделки здесь нет (§6.1).
+
+        Отсутствие строки ``risk_targets`` или пустая цель в ней НЕ означают
+        «промолчать»: строка всё равно пишется с ``target_pct = NULL`` и
+        причиной. Отсутствие цели фиксируется, а не замалчивается (§6.5).
+
+        Любое исключение внутри перехватывается: сигнал уходит без цели, а факт
+        сбоя попадает в ``agent_failures`` с ``agent = 'risk_targets'``.
+        """
+        if decision == DECISION_WAIT:
+            return None
+        try:
+            price = await db.get_price_at(self.instrument_id, datetime.now(UTC))
+            if price is None:
+                # Цена решения неизвестна — цена цели была бы выдумана.
+                self._log.warning(
+                    "risk_targets_no_price=1", instrument_id=self.instrument_id
+                )
+                return None
+            rows: list[dict[str, Any]] = []
+            for horizon_h in settings.eval_horizons_hours:
+                risk_row = await db.get_latest_risk_target(
+                    self.instrument_id, horizon_h, decision
+                )
+                rows.append(self._freeze_one(horizon_h, decision, float(price), risk_row))
+            return rows
+        except Exception as exc:  # noqa: BLE001 — сигнал важнее целей
+            self._log.warning("risk_targets_freeze_failed=1", error=str(exc))
+            await self._record_targets_failure("compute", exc)
+            return None
+
+    @staticmethod
+    def _freeze_one(
+        horizon_h: int,
+        decision: str,
+        price: float,
+        risk_row: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Одна строка signal_targets. Чистая: всё состояние — в аргументах."""
+        base: dict[str, Any] = {
+            "horizon_h": horizon_h,
+            "direction": decision,
+            "price_at_signal": price,
+            "target_pct": None,
+            "target_price": None,
+            "hit_rate": None,
+            "covers_fees": False,
+            "no_target_reason": REASON_NO_RISK_TARGET,
+            "risk_target_computed_at": None,
+            "targets_version": None,
+        }
+        if risk_row is None:
+            return base
+        base["risk_target_computed_at"] = risk_row.get("computed_at")
+        base["targets_version"] = risk_row.get("targets_version")
+        pct = risk_row.get("target_pct")
+        if pct is None:
+            # Причину берём из risk_targets как есть: она уже названа там
+            # закрытым перечнем, и переписывать её своими словами нельзя.
+            base["no_target_reason"] = risk_row.get("no_target_reason") or \
+                REASON_NO_RISK_TARGET
+            return base
+        pct_value = float(pct)
+        hit_rate = risk_row.get("hit_rate")
+        base.update({
+            "target_pct": pct_value,
+            "target_price": target_price(price, pct_value, decision),
+            "hit_rate": None if hit_rate is None else float(hit_rate),
+            "covers_fees": bool(risk_row.get("covers_fees", False)),
+            "no_target_reason": None,
+        })
+        return base
+
+    async def _record_targets_failure(self, error_type: str, exc: Exception) -> None:
+        """Сбой расчёта целей — строкой в agent_failures (§6 ТЗ 8.2).
+
+        Сама эта запись тоже может не пройти (та же недоступная база), и тогда
+        она молча пропускается: ронять сигнал из-за учёта сбоя было бы ровно
+        той ошибкой, от которой учёт и заводился.
+        """
+        try:
+            await db.record_agent_failure(
+                "risk_targets", error_type, type(exc).__name__, str(exc)
+            )
+        except Exception:  # noqa: BLE001 — учёт сбоя не важнее сигнала
+            self._log.warning("risk_targets_failure_not_recorded=1")
 
     async def _calibrate(self, conviction: float) -> tuple[float | None, int | None]:
         """Вероятность по активной кривой → (значение, id кривой) или (None, None).
@@ -325,6 +453,16 @@ class DecisionAgent:
             await asyncio.sleep(self.interval)
 
     async def _heartbeat(self) -> None:
-        """Пишет в Redis отметку времени последнего успешного решения."""
+        """Отметка времени последнего успешного решения — двумя ключами.
+
+        Общий ключ ``decision:heartbeat`` читают вотчдог, бот и суточная сводка;
+        его обновляет любой токен. Ключ с токеном добавлен Этапом 8.1, чтобы
+        было видно, какой именно экземпляр отстал.
+        """
         now_iso = datetime.now(UTC).isoformat()
-        await get_redis().set("decision:heartbeat", now_iso, ex=_HEARTBEAT_TTL)
+        redis = get_redis()
+        await redis.set("decision:heartbeat", now_iso, ex=_HEARTBEAT_TTL)
+        if self.token:
+            await redis.set(
+                f"decision:heartbeat:{self.token}", now_iso, ex=_HEARTBEAT_TTL
+            )

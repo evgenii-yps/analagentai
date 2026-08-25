@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+from typing import Any
 
 import asyncpg
 import structlog
@@ -34,11 +35,18 @@ from src.core.config import mask_secret, settings
 from src.core.logging import setup_logging
 from src.export import notion, queries, sheets
 from src.export.transform import (
+    CORRELATION_HEADER,
+    INDEPENDENT_DISCLAIMER,
+    INDEPENDENT_HEADER,
+    MIXED_VERSIONS_DISCLAIMER,
     SIGNALS_HEADER,
     SUMMARY_HEADER,
+    build_correlation_row,
+    build_independent_row,
     build_notion_properties,
     build_signal_row,
     build_summary_row,
+    mean_correlation_by_token,
 )
 from src.notify.telegram import send_message
 
@@ -49,6 +57,9 @@ _NOTION_PAUSE = 0.35
 _SHEET_SIGNALS = "Сигналы"
 _SHEET_SUMMARY = "Сводка по дням"
 _SHEET_WINDOWS = "Независимые окна"
+# Этап 8.1 §7: корреляция исходов между токенами — отдельным листом, чтобы её
+# нельзя было не заметить.
+_SHEET_CORRELATION = "Корреляция токенов"
 
 
 class ExportError(Exception):
@@ -108,18 +119,68 @@ async def _export_sheets(
     if not res.ok:
         raise ExportError(f"лист «Сводка по дням»: {res.error}")
 
-    windows = await queries.fetch_independent_windows(conn)
-    window_rows = [build_signal_row(sig) for sig in windows]
+    # Независимые окна: по одному наблюдению на ТОКЕН и ГОРИЗОНТ (§7 ТЗ 8.1),
+    # ОДНОЙ версии логики (§9 ТЗ 8.2). Версия разрешается один раз на прогон:
+    # оба листа обязаны быть собраны по одной и той же выборке, иначе
+    # корреляция описывала бы не те наблюдения, что попали в лист окон.
+    horizons = settings.eval_horizons_hours
+    logic_version = await queries.resolve_logic_version(
+        conn, settings.EXPORT_LOGIC_VERSION
+    )
+    log.info(
+        "Версия логики в выгрузке",
+        export_logic_version=settings.EXPORT_LOGIC_VERSION,
+        resolved=logic_version if logic_version is not None else "all",
+    )
+    windows = await queries.fetch_independent_by_token_horizon(
+        conn, horizons, logic_version
+    )
+    correlation = await queries.fetch_outcome_correlation(
+        conn, horizons, logic_version
+    )
+    mean_corr = mean_correlation_by_token(correlation)
+    window_rows = [
+        build_independent_row(
+            sig,
+            mean_corr.get((int(sig.get("horizon_h") or 0), str(sig.get("token") or ""))),
+        )
+        for sig in windows
+    ]
+    # Оговорка §7 — ПЕРВОЙ строкой листа, до данных: она обязательна и не
+    # зависит от того, посмотрит ли читатель отдельный лист корреляции.
+    # При EXPORT_LOGIC_VERSION=all перед ней идёт оговорка о смешивании версий
+    # (§9.3 ТЗ 8.2): о том, что лист несравним внутри себя, читатель обязан
+    # узнать раньше всего остального.
+    prefix: list[list[Any]] = [INDEPENDENT_DISCLAIMER]
+    if logic_version is None:
+        prefix.insert(0, MIXED_VERSIONS_DISCLAIMER)
     res = await sheets.post_rows(
-        url, secret, _SHEET_WINDOWS, "replace", window_rows, header=SIGNALS_HEADER
+        url, secret, _SHEET_WINDOWS, "replace",
+        [*prefix, *window_rows], header=INDEPENDENT_HEADER,
     )
     if not res.ok:
         raise ExportError(f"лист «Независимые окна»: {res.error}")
+
+    correlation_rows = [build_correlation_row(row) for row in correlation]
+    correlation_payload: list[list[Any]] = (
+        [MIXED_VERSIONS_DISCLAIMER, *correlation_rows]
+        if logic_version is None
+        else correlation_rows
+    )
+    res = await sheets.post_rows(
+        url, secret, _SHEET_CORRELATION, "replace", correlation_payload,
+        header=CORRELATION_HEADER,
+    )
+    if not res.ok:
+        raise ExportError(f"лист «Корреляция токенов»: {res.error}")
 
     log.info(
         "Служебные листы пересобраны",
         summary_days=len(summary_rows),
         windows=len(window_rows),
+        horizons_h=horizons,
+        correlation_pairs=len(correlation_rows),
+        logic_version=logic_version if logic_version is not None else "all",
     )
     return total
 

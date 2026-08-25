@@ -22,6 +22,7 @@ from src.notify.agent import (
     compute_agreement,
     normalize_payload,
 )
+from src.notify.wording import target_block
 
 # Часовой пояс отображения (заказчик в МСК). Сервер и БД живут в UTC.
 _MSK = ZoneInfo("Europe/Moscow")
@@ -34,7 +35,10 @@ DECISION_RU = {"buy": "покупать", "sell": "продавать", "wait": 
 DECISION_EMOJI = {"buy": "🟢", "sell": "🔴", "wait": "⚪"}
 
 # Известные команды (для маршрутизации и подсказки в /help).
-KNOWN_COMMANDS = ("start", "help", "status", "last", "signal", "agents", "stats", "summary")
+KNOWN_COMMANDS = (
+    "start", "help", "status", "last", "signal", "agents", "stats", "summary",
+    "settings",
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -186,6 +190,7 @@ def render_help() -> str:
         "решение; сильные сигналы приходят вам в Telegram.\n"
         "<b>Система не торгует сама. Все решения принимаете вы.</b>\n\n"
         "<b>Команды (только чтение):</b>\n"
+        "/settings — какие токены, горизонт, порог силы и часы тишины\n"
         "/status — жива ли система прямо сейчас\n"
         "/last [N] — последние отправленные сигналы (N по умолчанию 5)\n"
         "/last all [N] — последние сигналы, включая неотправленные\n"
@@ -206,11 +211,16 @@ def render_status(
     hb_rows: list[tuple[str, str | None, int]],
     db_facts: dict[str, Any],
     now: datetime,
+    per_token: list[tuple[str, datetime | None]] | None = None,
 ) -> str:
     """/status: свежесть heartbeat-ключей, свежесть данных, счётчики сигналов.
 
     ``hb_rows`` — список ``(ключ, значение_или_None, интервал_цикла_сек)``.
     Порог «устарел» — 5× интервала (как в scripts/watchdog.py).
+
+    ``per_token`` — свежесть данных ПО КАЖДОМУ токену (§4 ТЗ 8.3). Одна общая
+    строка на пять токенов бесполезна: сбор мог встать по одному из них, а по
+    остальным идти — общий показатель остался бы зелёным.
     """
     lines = ["<b>📟 Состояние системы</b>", "", "<b>Сервисы (heartbeat):</b>"]
     problems: list[str] = []
@@ -226,6 +236,19 @@ def render_status(
             problems.append(key)
         else:
             lines.append(f"🟢 {esc(key)}: {age} сек назад")
+
+    if per_token:
+        lines.append("")
+        lines.append("<b>Свежесть данных по токенам:</b>")
+        for symbol, last_ts in per_token:
+            age = age_seconds(now, last_ts)
+            token = esc(symbol.split("/", 1)[0])
+            if age is None:
+                lines.append(f"🔴 {token}: свечей нет")
+            elif age > _TOKEN_STALE_SEC:
+                lines.append(f"🔴 {token}: {age // 60} мин назад")
+            else:
+                lines.append(f"🟢 {token}: {age // 60} мин назад")
 
     lines.append("")
     lines.append("<b>Свежесть данных:</b>")
@@ -281,8 +304,17 @@ def render_last(signals: list[dict[str, Any]], notified_only: bool, now: datetim
     return "\n".join(lines)
 
 
-def render_signal_card(card: dict[str, Any] | None, now: datetime) -> str:
-    """/signal <id>: полная карточка одного сигнала."""
+def render_signal_card(
+    card: dict[str, Any] | None,
+    now: datetime,
+    horizon_h: int | None = None,
+) -> str:
+    """/signal <id>: полная карточка одного сигнала.
+
+    ``horizon_h`` — горизонт, выбранный человеком в /settings. Цель показывается
+    ТОЛЬКО для него (§8 ТЗ 8.2): показ всех четырёх целей сразу превратил бы
+    карточку в набор чисел, из которых человек выбирал бы удобное.
+    """
     if card is None:
         return "Сигнал с таким id не найден. Проверьте номер и повторите."
 
@@ -294,8 +326,14 @@ def render_signal_card(card: dict[str, Any] | None, now: datetime) -> str:
         else "—"
     )
 
+    # Этап 8.1: инструмент называется в заголовке — токенов пять, и без имени
+    # карточка не отличает сигнал по XRP от сигнала по BTC.
+    symbol = card.get("symbol")
+    header = f"{emoji} <b>Сигнал #{card['id']}</b>"
+    if symbol:
+        header = f"{emoji} <b>Сигнал #{card['id']} · {symbol}</b>"
     lines = [
-        f"{emoji} <b>Сигнал #{card['id']}</b>",
+        header,
         f"Время: {fmt_msk(card['ts'])}",
         f"Решение: {decision}, индекс согласия {conviction}%",
     ]
@@ -321,6 +359,15 @@ def render_signal_card(card: dict[str, Any] | None, now: datetime) -> str:
     if price is not None:
         lines.append(f"Цена на момент сигнала: {round(float(price)):,}".replace(",", " "))
 
+    # Цель и доля её достижения — ВСЕГДА вместе, одним блоком (§8, §12 ТЗ 8.2).
+    # Решение 'wait' целей не имеет: цель — это ход в сторону сделки, а сделки нет.
+    if card.get("decision") in ("buy", "sell") and horizon_h is not None:
+        targets = card.get("targets_by_horizon") or {}
+        block = target_block(targets.get(int(horizon_h)))
+        lines.append("")
+        lines.append(f"<b>Цель на {horizon_h} ч:</b>")
+        lines.extend(block)
+
     payload = normalize_payload(card.get("agents_payload"))
     present = {e.get("agent") for e in payload}
     lines.append("")
@@ -341,8 +388,15 @@ def render_signal_card(card: dict[str, Any] | None, now: datetime) -> str:
 
     lines.append("")
     lines.append("<b>Результаты:</b>")
-    lines.append("1 час: " + _render_horizon(card.get("eval_1h")))
-    lines.append("4 часа: " + _render_horizon(card.get("eval_4h")))
+    # Этап 8.1: четыре горизонта. Подписи берутся из фактических данных, а не
+    # зашиты: если состав горизонтов изменится, карточка не начнёт врать.
+    evals = card.get("evals_by_horizon") or {}
+    if evals:
+        for hours in sorted(evals):
+            lines.append(f"{hours} ч: " + _render_horizon(evals[hours]))
+    else:
+        lines.append("1 час: " + _render_horizon(card.get("eval_1h")))
+        lines.append("4 часа: " + _render_horizon(card.get("eval_4h")))
 
     lines.append("")
     lines.append(f"Уведомление: {_notify_status(card)}")
@@ -401,73 +455,100 @@ def render_agents(
     return "\n".join(lines)
 
 
+# §4 ТЗ 8.3: ниже этого числа наблюдений цифра не считается надёжной и
+# сопровождается оговоркой. Константа, а не число в тексте: границу видно и
+# менять её приходится осознанно.
+SMALL_SAMPLE_N = 60
+
+# Возраст свежей минутной свечи, после которого токен помечается красным.
+# Порог тот же, что в §3 ТЗ 8.1 для остановки: два интервала таймфрейма
+# берутся с запасом — 20 минут, чтобы редкая пауза биржи не давала
+# ложной тревоги.
+_TOKEN_STALE_SEC = 1200
+
+
 def render_stats(
-    block1: dict[str, Any],
-    block2: dict[str, Any],
-    block5: dict[str, Any],
-    period: str,
+    blocks: list[tuple[str, dict[str, Any], dict[str, Any]]],
+    horizon_h: int,
     now: datetime,
     logic_version: int | None = None,
-    mixed_versions: bool = False,
+    version_started_at: datetime | None = None,
+    filter_counts: dict[str, Any] | None = None,
 ) -> str:
-    """/stats: пять блоков — честная выборка, все подряд, пояснение, предупреждение,
-    фильтрация уведомлений. Бот НЕ выдаёт суждений «хорошо/плохо» — только цифры.
+    """/stats: попадания по ВЫБРАННОМУ горизонту за каждый период (§4 ТЗ 8.3).
 
-    Статистика считается по ОДНОЙ версии логики (§D.4). ``logic_version`` — версия,
-    по которой посчитано; ``mixed_versions`` — в периоде встречались обе версии.
+    ``blocks`` — список ``(подпись периода, честная выборка, все подряд)``.
+    Бот не выдаёт суждений «хорошо/плохо» — только цифры и, где нужно,
+    оговорку о размере выборки.
+
+    ВЕРСИИ ЛОГИКИ НЕ СМЕШИВАЮТСЯ (§7 ТЗ): показывается только текущая, и рядом
+    сказано, с какой даты она действует. Без даты «мало наблюдений» невозможно
+    истолковать: это может значить и «система молчит», и «версия работает
+    вторые сутки».
     """
-    label = STATS_PERIODS.get(period, period)
-    version_note = f" (версия логики {logic_version})" if logic_version is not None else ""
-    lines = [f"<b>📊 Статистика {label}{version_note}</b>", ""]
-    if mixed_versions:
-        lines.append(
-            "⚠️ В периоде смешаны две версии логики, статистика недостоверна. "
-            "Ниже — только по последней версии."
+    lines = [f"<b>📊 Статистика · горизонт {horizon_h} ч</b>"]
+    if logic_version is not None:
+        since = (
+            f", действует с {version_started_at.strftime('%d.%m.%Y %H:%M')} UTC"
+            if version_started_at is not None
+            else ""
         )
+        lines.append(f"Версия логики {logic_version}{since}. Прежние версии не учтены.")
+    lines.append("")
+
+    for label, independent, whole in blocks:
+        lines.append(f"<b>{label}</b>")
+        lines.append("Честная выборка (независимые 4-часовые окна):")
+        lines.extend(_stats_body(independent))
+        lines.append("Все сигналы подряд:")
+        lines.extend(_stats_body(whole))
         lines.append("")
 
-    lines.append("<b>Блок 1 — честная выборка (независимые 4-часовые окна)</b>")
-    lines.extend(_stats_body(block1))
-
-    lines.append("")
-    lines.append("<b>Блок 2 — все сигналы подряд</b>")
-    lines.extend(_stats_body(block2))
-
-    lines.append("")
-    lines.append("<b>Блок 3 — почему две цифры</b>")
+    lines.append("<b>Почему две цифры</b>")
     lines.append(
-        "Решение принимается раз в минуту, а результат проверяется через 4 часа. "
-        "Поэтому сотни соседних сигналов описывают один и тот же кусок рынка. "
-        "Ориентируйтесь на блок 1: только он показывает реальный размер опыта."
+        "Решение принимается раз в минуту, а результат проверяется через "
+        f"{horizon_h} ч. Поэтому сотни соседних сигналов описывают один и тот же "
+        "кусок рынка. Ориентируйтесь на честную выборку: только она показывает "
+        "реальный размер опыта."
     )
 
-    lines.append("")
-    lines.append("<b>Блок 4 — размер выборки</b>")
-    if int(block1.get("n", 0)) < 30:
-        lines.append("⚠️ Данных пока мало, выводы делать рано.")
-    else:
-        lines.append("Наблюдений в блоке 1 ≥ 30.")
-
-    lines.append("")
-    lines.append("<b>Блок 5 — фильтрация уведомлений</b>")
-    lines.append(f"Реально отправлено: {block5.get('sent', 0)}")
-    lines.append(f"Поглощено анти-спамом: {block5.get('absorbed', 0)}")
+    if filter_counts:
+        lines.append("")
+        lines.append("<b>Фильтрация уведомлений</b>")
+        lines.append(f"Реально отправлено: {filter_counts.get('sent', 0)}")
+        lines.append(f"Поглощено анти-спамом: {filter_counts.get('absorbed', 0)}")
     return "\n".join(lines)
 
 
 def _stats_body(block: dict[str, Any]) -> list[str]:
-    """Тело блока статистики (размер, раскладка, доли, средние)."""
+    """Тело блока статистики: число наблюдений стоит РЯДОМ с каждым процентом."""
     n = int(block.get("n", 0))
     if n == 0:
-        return ["Закрытых сигналов пока нет."]
-    return [
-        f"Размер выборки: {n}",
-        f"Раскладка: buy {block.get('buy', 0)}, sell {block.get('sell', 0)}, "
-        f"wait {block.get('wait', 0)}",
-        f"Угадано по 4ч: buy {_rate(block.get('sr_buy'))}, sell {_rate(block.get('sr_sell'))}",
-        f"Средняя прибыль: {_pct(block.get('avg_pnl'))}, "
-        f"средняя просадка: {_pct(block.get('avg_dd'))}",
+        return ["· закрытых сигналов пока нет"]
+    body = [
+        f"· наблюдений: {n} (buy {block.get('buy', 0)}, sell {block.get('sell', 0)}, "
+        f"wait {block.get('wait', 0)})",
+        f"· угадано: buy {_rate_with_n(block.get('sr_buy'), block.get('n_buy'))}, "
+        f"sell {_rate_with_n(block.get('sr_sell'), block.get('n_sell'))}",
+        f"· средняя прибыль {_pct(block.get('avg_pnl'))}, "
+        f"средняя просадка {_pct(block.get('avg_dd'))}",
     ]
+    if n < SMALL_SAMPLE_N:
+        body.append("⚠️ наблюдений мало, цифра ненадёжна")
+    return body
+
+
+def _rate_with_n(value: Any, n: Any) -> str:
+    """Доля с числом наблюдений: ``62% из 84``. §4 ТЗ требует их рядом.
+
+    Процент без знаменателя одинаково выглядит и при трёх наблюдениях, и при
+    трёхстах, а значит одинаково читается — хотя весит совершенно по-разному.
+    """
+    if value is None:
+        return "—"
+    percent = round(float(value) * 100)
+    count = int(n) if n is not None else None
+    return f"{percent}% из {count}" if count is not None else f"{percent}%"
 
 
 def _rate(value: Any) -> str:

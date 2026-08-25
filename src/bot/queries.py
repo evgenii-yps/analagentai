@@ -1,8 +1,9 @@
 """SELECT-запросы бота и идемпотентное создание роли только на чтение.
 
-Сервис бота подключается к БД ролью ``agenttrade_ro`` (права SELECT), поэтому все
-запросы здесь — исключительно чтение. Даже при ошибке в коде бот не сможет
-испортить данные (ТЗ §3.5, §8).
+Сервис бота подключается к БД ролью ``agenttrade_ro``. Права — SELECT на всё
+и запись ТОЛЬКО в ``user_settings`` (§1 ТЗ 8.3: меню настроек обязано их
+сохранять). Наблюдения, выводы агентов и решения бот по-прежнему испортить не
+может ничем — даже при ошибке в коде (ТЗ §3.5, §8).
 
 Границу 4-часового окна считаем ТЕМ ЖЕ выражением, что и выгрузка 6.6
 (src.export.queries) и §7.1 ТЗ 6.6 — чтобы «честная выборка» совпадала.
@@ -14,6 +15,8 @@ from typing import Any
 
 import asyncpg
 import structlog
+
+from src.core.user_settings import USER_SETTINGS_DDL
 
 _log = structlog.get_logger().bind(component="bot-queries")
 
@@ -82,7 +85,22 @@ async def ensure_readonly_role(
         "ALTER DEFAULT PRIVILEGES IN SCHEMA public "
         "GRANT SELECT ON TABLES TO agenttrade_ro;"
     )
-    _log.info("Права SELECT для agenttrade_ro выданы")
+    # Таблица настроек создаётся ЗДЕСЬ же, до выдачи прав на неё. Порядок
+    # старта сервисов не задан: бот может подняться раньше уведомлений, и тогда
+    # GRANT на несуществующую таблицу срывал бы подготовку роли — бот повторял
+    # бы попытку бесконечно и не отвечал бы вообще. DDL общий (один источник).
+    await conn.execute(USER_SETTINGS_DDL)
+
+    # ЕДИНСТВЕННОЕ исключение из «только чтение»: настройки самого пользователя
+    # (§1 ТЗ 8.3). Бот обязан их сохранять, иначе меню было бы декорацией.
+    # Право выдано ТОЧЕЧНО на одну таблицу: испортить данные наблюдений или
+    # решений бот по-прежнему не может ничем.
+    await conn.execute(
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON user_settings TO agenttrade_ro;"
+    )
+    _log.info(
+        "Права выданы: SELECT на всё, запись — только в user_settings (§1 ТЗ 8.3)"
+    )
 
 
 class BotQueries:
@@ -92,6 +110,58 @@ class BotQueries:
         self._pool = pool
 
     # --- /status ---
+
+    async def spot_instruments(self) -> list[tuple[int, str]]:
+        """Спотовые инструменты для меню настроек, по возрастанию идентификатора.
+
+        Именно спот: сигналы выдаются по нему (Decision Agent пишет
+        ``instrument_id`` спота), и настройки человека сравниваются с ним же.
+        Контракты в меню не показываются — человек выбирает ТОКЕН, а не рынок.
+        """
+        rows = await self._pool.fetch(
+            "SELECT id, symbol FROM instruments "
+            " WHERE symbol NOT LIKE '%:%' ORDER BY id;"
+        )
+        return [(int(r["id"]), str(r["symbol"])) for r in rows]
+
+    async def user_settings(self, chat_id: int) -> dict[str, Any] | None:
+        """Настройки чата или ``None``, если человек их ни разу не открывал."""
+        row = await self._pool.fetchrow(
+            "SELECT chat_id, instruments, horizon_h, min_score, quiet_from, quiet_to "
+            "  FROM user_settings WHERE chat_id = $1;",
+            int(chat_id),
+        )
+        return dict(row) if row else None
+
+    async def save_user_settings(
+        self,
+        chat_id: int,
+        instruments: list[int],
+        horizon_h: int,
+        min_score: float,
+        quiet_from: int | None,
+        quiet_to: int | None,
+    ) -> None:
+        """Сохраняет настройки чата целиком (единственная запись бота в БД)."""
+        await self._pool.execute(
+            """
+            INSERT INTO user_settings
+                (chat_id, instruments, horizon_h, min_score, quiet_from, quiet_to,
+                 updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, now())
+            ON CONFLICT (chat_id) DO UPDATE SET
+                instruments = EXCLUDED.instruments,
+                horizon_h   = EXCLUDED.horizon_h,
+                min_score   = EXCLUDED.min_score,
+                quiet_from  = EXCLUDED.quiet_from,
+                quiet_to    = EXCLUDED.quiet_to,
+                updated_at  = now();
+            """,
+            int(chat_id), [int(i) for i in instruments], int(horizon_h),
+            float(min_score),
+            None if quiet_from is None else int(quiet_from),
+            None if quiet_to is None else int(quiet_to),
+        )
 
     async def status_facts(self) -> dict[str, Any]:
         """Свежесть данных и счётчики сигналов для /status."""
@@ -109,22 +179,58 @@ class BotQueries:
 
     # --- /last ---
 
-    async def last_signals(self, notified_only: bool, limit: int) -> list[dict[str, Any]]:
-        """Последние сигналы. notified_only → только реально отправленные (§5)."""
+    async def last_signals(
+        self,
+        notified_only: bool,
+        limit: int,
+        instruments: list[int] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Последние сигналы. notified_only → только реально отправленные (§5).
+
+        ``instruments`` — отбор по выбранным пользователем токенам (§4 ТЗ 8.3);
+        ``None`` означает «все», а не «ни одного»: у человека, не открывавшего
+        настройки, выбраны все токены.
+        """
         rows = await self._pool.fetch(
             """
             SELECT id, ts, decision, probability, status,
                    pnl_pct, drawdown_pct, success,
-                   calibrated_probability, is_repeat
+                   calibrated_probability, is_repeat, instrument_id
             FROM signals
             WHERE (NOT $1 OR notified_at IS NOT NULL)
+              AND ($3::int[] IS NULL OR instrument_id = ANY($3))
             ORDER BY ts DESC
             LIMIT $2;
             """,
             notified_only,
             limit,
+            instruments,
         )
         return [dict(r) for r in rows]
+
+    async def freshness_by_instrument(
+        self, instruments: list[int] | None = None
+    ) -> list[tuple[str, Any]]:
+        """Возраст самой свежей минутной свечи по каждому токену (§4 ТЗ 8.3).
+
+        Одна общая строка «данные свежие» на пять токенов бесполезна: сбор мог
+        встать по одному из них, а по остальным идти — и общий показатель
+        остался бы зелёным.
+        """
+        rows = await self._pool.fetch(
+            """
+            SELECT i.symbol AS symbol, max(o.ts) AS last_ts
+              FROM instruments i
+              LEFT JOIN ohlcv o
+                     ON o.instrument_id = i.id AND o.timeframe = '1m'
+             WHERE i.symbol NOT LIKE '%:%'
+               AND ($1::int[] IS NULL OR i.id = ANY($1))
+             GROUP BY i.symbol
+             ORDER BY i.symbol;
+            """,
+            instruments,
+        )
+        return [(str(r["symbol"]), r["last_ts"]) for r in rows]
 
     # --- /signal <id> ---
 
@@ -137,9 +243,13 @@ class BotQueries:
                    s.agents_payload::text AS agents_payload,
                    s.calibrated_probability, s.calibration_id,
                    s.inputs_hash, s.is_repeat,
+                   -- Этап 8.1: токенов пять, и карточка обязана называть тот,
+                   -- по которому выдан сигнал.
+                   i.symbol      AS symbol,
                    c.built_at    AS calibration_built_at,
                    c.sample_size AS calibration_sample_size
             FROM signals s
+            JOIN instruments i ON i.id = s.instrument_id
             LEFT JOIN calibration_curves c ON c.id = s.calibration_id
             WHERE s.id = $1;
             """,
@@ -151,14 +261,39 @@ class BotQueries:
 
         evals = await self._pool.fetch(
             """
-            SELECT horizon, price_at_close, pnl_pct, drawdown_pct, success
+            SELECT horizon, horizon_h, price_at_close, pnl_pct, drawdown_pct, success
             FROM signal_evaluations WHERE signal_id = $1;
             """,
             signal_id,
         )
         by_horizon = {e["horizon"]: dict(e) for e in evals}
+        # Этап 8.1: горизонтов четыре. Ключи 1h/4h сохранены (их читает прежняя
+        # разметка карточки), 12h/24h добавлены рядом.
+        card["evals_by_horizon"] = {
+            int(e["horizon_h"]): dict(e) for e in evals if e["horizon_h"] is not None
+        }
         card["eval_1h"] = by_horizon.get("1h")
         card["eval_4h"] = by_horizon.get("4h")
+
+        # Замороженные цели сигнала (Этап 8.2 §6). Читается именно то, что было
+        # сказано человеку В МОМЕНТ СИГНАЛА, а не сегодняшняя цель из
+        # risk_targets: карточка обязана показывать сказанное, а не текущее.
+        # Отсутствие таблицы — не повод ронять карточку: она существует с
+        # миграции 014, а /signal работает и на томе, где её ещё не применили.
+        try:
+            targets = await self._pool.fetch(
+                """
+                SELECT horizon_h, direction, target_pct, target_price, hit_rate,
+                       covers_fees, no_target_reason
+                FROM signal_targets WHERE signal_id = $1;
+                """,
+                signal_id,
+            )
+            card["targets_by_horizon"] = {
+                int(t["horizon_h"]): dict(t) for t in targets
+            }
+        except Exception:  # noqa: BLE001 — карточка важнее блока цели
+            card["targets_by_horizon"] = {}
 
         # Цена на момент сигнала — close ближайшей 1m-свечи на/до ts.
         card["price_at_signal"] = await self._pool.fetchval(
@@ -207,17 +342,38 @@ class BotQueries:
         )
         return [int(r["logic_version"]) for r in rows]
 
+    async def logic_version_started_at(self, logic_version: int) -> Any:
+        """Момент начала версии логики (§6 Этапа 8.1) или ``None``.
+
+        §4 ТЗ 8.3: статистика показывается по ТЕКУЩЕЙ версии с указанием, с
+        какой даты она действует. Без даты человек не может понять, почему
+        выборка мала: «мало сигналов» и «версия работает вторые сутки» — разные
+        вещи, требующие разных решений.
+        """
+        return await self._pool.fetchval(
+            "SELECT started_at FROM logic_version_windows WHERE logic_version = $1;",
+            int(logic_version),
+        )
+
     async def stats_block(
         self,
         period_sec: int,
         independent: bool,
         logic_version: int | None,
+        horizon_h: int = 4,
     ) -> dict[str, Any]:
         """Агрегаты по закрытым сигналам за период И одну версию логики.
 
         ``independent=True`` — по одному (самому раннему) сигналу на каждое
         4-часовое окно (честная выборка). Иначе — по всей массе подряд.
         ``logic_version=None`` → без фильтра версии (когда закрытых сигналов нет).
+
+        ``horizon_h`` — горизонт оценки, выбранный пользователем (§4 ТЗ 8.3).
+        Оценка ищется по числовой колонке ``horizon_h``, а не по текстовой
+        подписи: подпись — для человека, ключ — для соединения (Этап 8.1).
+        Возвращаются и счётчики попаданий отдельно по buy и sell: §4 требует
+        показывать число наблюдений РЯДОМ с процентом, а знаменатель у долей
+        свой и от размера выборки отличается.
         """
         if independent:
             query = f"""
@@ -227,7 +383,7 @@ class BotQueries:
                            e4.drawdown_pct AS dd, {_WINDOW_EXPR} AS win
                     FROM signals s
                     LEFT JOIN signal_evaluations e4
-                           ON e4.signal_id = s.id AND e4.horizon = '4h'
+                           ON e4.signal_id = s.id AND e4.horizon_h = $3
                     WHERE s.status = 'closed'
                       AND ($1 = 0 OR s.ts > now() - $1 * interval '1 second')
                       AND ($2::smallint IS NULL OR s.logic_version = $2)
@@ -242,6 +398,10 @@ class BotQueries:
                              THEN success::int END) AS sr_buy,
                     avg(CASE WHEN decision = 'sell' AND success IS NOT NULL
                              THEN success::int END) AS sr_sell,
+                    count(*) FILTER (WHERE decision = 'buy'
+                                     AND success IS NOT NULL) AS n_buy,
+                    count(*) FILTER (WHERE decision = 'sell'
+                                     AND success IS NOT NULL) AS n_sell,
                     avg(pnl) AS avg_pnl,
                     avg(dd)  AS avg_dd
                 FROM windowed;
@@ -257,16 +417,22 @@ class BotQueries:
                              THEN e4.success::int END) AS sr_buy,
                     avg(CASE WHEN s.decision = 'sell' AND e4.success IS NOT NULL
                              THEN e4.success::int END) AS sr_sell,
+                    count(*) FILTER (WHERE s.decision = 'buy'
+                                     AND e4.success IS NOT NULL) AS n_buy,
+                    count(*) FILTER (WHERE s.decision = 'sell'
+                                     AND e4.success IS NOT NULL) AS n_sell,
                     avg(e4.pnl_pct)      AS avg_pnl,
                     avg(e4.drawdown_pct) AS avg_dd
                 FROM signals s
                 LEFT JOIN signal_evaluations e4
-                       ON e4.signal_id = s.id AND e4.horizon = '4h'
+                       ON e4.signal_id = s.id AND e4.horizon_h = $3
                 WHERE s.status = 'closed'
                   AND ($1 = 0 OR s.ts > now() - $1 * interval '1 second')
                   AND ($2::smallint IS NULL OR s.logic_version = $2);
             """
-        row = await self._pool.fetchrow(query, period_sec, logic_version)
+        row = await self._pool.fetchrow(
+            query, period_sec, logic_version, int(horizon_h)
+        )
         return dict(row) if row else {}
 
     async def notify_filter_counts(
