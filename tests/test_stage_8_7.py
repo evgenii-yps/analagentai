@@ -25,6 +25,7 @@ from backtest.evaluate import Costs, gross_pnl_pct, net_pnl_pct
 from src.health import daily_report
 
 ROOT = Path(__file__).resolve().parents[1]
+INSTALL_SH = (ROOT / "deploy" / "install.sh").read_text(encoding="utf-8")
 
 
 # --- 8.7-A. Круговая комиссия = вход + выход -------------------------------
@@ -76,6 +77,44 @@ def test_stage_7_4_report_marks_the_halved_costs() -> None:
     assert "Пересчёт Этапа 7.4 НЕ ВЫПОЛНЯЛСЯ" in text
 
 
+# --- 8.7-A2. RISK_COST_ROUNDTRIP_PCT объявлен там, где его обещает код ------
+
+_RISK_COST_DEFAULT = 0.22
+
+
+def test_risk_cost_is_declared_in_env_example() -> None:
+    text = (ROOT / ".env.example").read_text(encoding="utf-8")
+    assert "\nRISK_COST_ROUNDTRIP_PCT=0.22" in text
+
+
+def test_risk_cost_is_written_by_the_installer() -> None:
+    """Замер на сервере 25.08.2026: ключа в рабочем .env не было вовсе.
+
+    Комментарий src/core/config.py заявлял, что значение вынесено в .env, а
+    установщик его туда никогда не писал. Строка добавлена в блок write_env.
+    """
+    assert "RISK_COST_ROUNDTRIP_PCT=${RISK_COST_ROUNDTRIP_PCT:-0.22}" in INSTALL_SH
+
+
+def test_risk_cost_matches_the_code_default_so_nothing_changes() -> None:
+    """Ключевое: объявленное значение РАВНО умолчанию кода.
+
+    Иначе добавление строки в .env было бы не гигиеной, а тихой сменой порога
+    covers_fees — то есть изменением текста сигнала, запрещённым §1 ТЗ.
+    """
+    from src.core.config import settings
+
+    assert settings.RISK_COST_ROUNDTRIP_PCT == _RISK_COST_DEFAULT
+    example = (ROOT / ".env.example").read_text(encoding="utf-8")
+    declared = [
+        line.split("=", 1)[1].split("#")[0].strip()
+        for line in example.splitlines()
+        if line.startswith("RISK_COST_ROUNDTRIP_PCT=")
+    ]
+    assert declared == ["0.22"]
+    assert float(declared[0]) == _RISK_COST_DEFAULT
+
+
 # --- 8.7-B. Проверочный скрипт печатает действующий параметр ---------------
 
 def test_verify_7_3_reads_the_funding_window_from_env() -> None:
@@ -119,9 +158,6 @@ def test_silence_sql_reports_the_excluded_count_separately() -> None:
 
 
 # --- 8.7-D. Идемпотентность установки ключей -------------------------------
-
-INSTALL_SH = (ROOT / "deploy" / "install.sh").read_text(encoding="utf-8")
-
 
 def _extract_helpers() -> str:
     """Тело функций-помощников install.sh, пригодное для source в bash.

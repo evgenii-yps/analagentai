@@ -134,7 +134,10 @@ fi
 # рядом: именно их смешение и было предметом остановки §2.3.
 risk_cost="$(env_value "${ENV_FILE}" RISK_COST_ROUNDTRIP_PCT)"
 if [[ -z "${risk_cost}" ]]; then
-  note_unk "RISK_COST_ROUNDTRIP_PCT в .env не задан — порог covers_fees не показать"
+  note_warn "RISK_COST_ROUNDTRIP_PCT в .env не задан — действует умолчание кода 0.22"
+  info "значение верное, поведение правильное, но настройки нет там, где её обещает"
+  info "комментарий в src/core/config.py. Ключ добавлен в блок установщика Этапом 8.7:"
+  info "допишите строку RISK_COST_ROUNDTRIP_PCT=0.22 в ${ENV_FILE} либо перезапустите установщик"
 else
   echo "    RISK_COST_ROUNDTRIP_PCT: ${risk_cost}  → порог covers_fees = 3 × ${risk_cost} = $(awk -v c="${risk_cost}" 'BEGIN{printf "%.4f", c*3}')"
   note_ok "порог покрытия издержек не зависит от BT_FEE_ROUNDTRIP_PCT (ключи разные)"
