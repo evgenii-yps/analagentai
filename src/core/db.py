@@ -771,6 +771,173 @@ class DB:
         )
         return [dict(r) for r in rows]
 
+    # --- Исход по границам (Этап 8.8) ---
+
+    async def ensure_barrier_schema(self) -> None:
+        """Идемпотентно создаёт таблицу исходов по границам (миграция 015).
+
+        Сервисы проекта гарантируют свою схему при старте: миграция могла быть
+        не применена на уже работающем томе. Расчёт исходов при этом НЕ
+        является горячим путём — он не влияет ни на одно решение системы.
+        """
+        await self.pool.execute(BARRIER_OUTCOMES_DDL)
+        await self.pool.execute(BARRIER_OUTCOMES_CHECKS)
+        await self.pool.execute(
+            "CREATE INDEX IF NOT EXISTS ix_barrier_horizon_outcome "
+            "ON signal_outcomes_barrier (logic_version, horizon_h, outcome);"
+        )
+
+    async def get_barrier_candidates(
+        self,
+        *,
+        logic_version: int,
+        horizon_h: int,
+        now: datetime,
+        recompute: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Сигналы, готовые к оценке по границам на этом горизонте.
+
+        Отбор ЖЁСТКИЙ и полностью выражен в запросе, а не в коде поверх него:
+
+        * направленные сигналы (``decision <> 'wait'``) заданной версии логики —
+          версии не смешиваются (правило проекта);
+        * ``t + h`` уже в прошлом (§7): у сигнала, чей горизонт не наступил,
+          исхода ещё не существует;
+        * есть ЗАМОРОЖЕННАЯ цель ``signal_targets.target_pct`` на ЭТОТ горизонт.
+          Сигналы без неё пропускаются, и подставлять им сегодняшнюю цель из
+          ``risk_targets`` запрещено (§7 ТЗ): это подделка истории.
+
+        ``recompute=False`` (по умолчанию) отдаёт только НЕПОСЧИТАННЫЕ пары.
+        Так суточный запуск идемпотентен по построению и, главное, не понижает
+        уже снятое разрешение: минутные свечи удаляются политикой хранения
+        через ``RETENTION_1M_DAYS`` суток, и пересчёт старого сигнала выдал бы
+        ``resolution='1h'`` там, где однажды было измерено ``'1m'``.
+        """
+        query = """
+            SELECT s.id, s.instrument_id, s.ts, s.decision, s.logic_version,
+                   t.direction, t.price_at_signal, t.target_pct
+            FROM signals s
+            JOIN signal_targets t
+              ON t.signal_id = s.id AND t.horizon_h = $2
+            WHERE s.decision <> 'wait'
+              AND s.logic_version = $1
+              AND t.target_pct IS NOT NULL
+              AND s.ts + make_interval(hours => $2) <= $3
+              AND ($4::boolean OR NOT EXISTS (
+                      SELECT 1 FROM signal_outcomes_barrier b
+                      WHERE b.signal_id = s.id AND b.horizon_h = $2
+                  ))
+            ORDER BY s.ts ASC, s.id ASC;
+        """
+        rows = await self.pool.fetch(
+            query, int(logic_version), int(horizon_h), now, bool(recompute)
+        )
+        return [dict(r) for r in rows]
+
+    async def count_barrier_skipped(
+        self, *, logic_version: int, horizon_h: int, now: datetime
+    ) -> int:
+        """Сигналы, пропущенные из-за ОТСУТСТВИЯ замороженной цели (§7).
+
+        Число выводится отдельно и в журнал, и в отчёт: «цели не было» и
+        «исход не посчитан» — разные состояния, и молчание сделало бы их
+        неотличимыми.
+        """
+        value = await self.pool.fetchval(
+            """
+            SELECT count(*)
+            FROM signals s
+            LEFT JOIN signal_targets t
+              ON t.signal_id = s.id AND t.horizon_h = $2
+            WHERE s.decision <> 'wait'
+              AND s.logic_version = $1
+              AND s.ts + make_interval(hours => $2) <= $3
+              AND (t.signal_id IS NULL OR t.target_pct IS NULL);
+            """,
+            int(logic_version), int(horizon_h), now,
+        )
+        return int(value or 0)
+
+    async def get_ohlcv_bars(
+        self,
+        instrument_id: int,
+        timeframe: str,
+        ts_from: datetime,
+        ts_to: datetime,
+    ) -> list[dict[str, Any]]:
+        """Свечи по ВКЛЮЧИТЕЛЬНЫМ границам времени открытия, по возрастанию.
+
+        Отдельный метод рядом с ``get_ohlcv_window`` заведён намеренно: там
+        границы полуоткрытые ``(start, end]`` и это часть поведения оценщика,
+        а окно §3 задано включительно по обоим концам. Переиспользовать чужие
+        границы, «поправив» аргумент на один бар, значит спрятать правило окна
+        в арифметике вызова.
+        """
+        rows = await self.pool.fetch(
+            """
+            SELECT ts, open, high, low, close
+            FROM ohlcv
+            WHERE instrument_id = $1 AND timeframe = $2
+              AND ts >= $3 AND ts <= $4
+            ORDER BY ts ASC;
+            """,
+            int(instrument_id), str(timeframe), ts_from, ts_to,
+        )
+        return [dict(r) for r in rows]
+
+    async def save_barrier_outcome(self, row: dict[str, Any]) -> None:
+        """Запись исхода по границам. Существующая строка НЕ переписывается.
+
+        ``ON CONFLICT DO NOTHING`` по первичному ключу (signal_id, horizon_h) —
+        это и есть идемпотентность §7: повторный запуск на тех же данных не
+        меняет ни одной строки, а значит, снимок таблицы совпадает побайтно.
+        Принудительный пересчёт идёт отдельным путём (``--recompute``), который
+        сначала удаляет строку: переписывание «на всякий случай» скрыло бы
+        расхождение расчётов вместо того, чтобы его показать.
+        """
+        await self.pool.execute(
+            """
+            INSERT INTO signal_outcomes_barrier
+                (signal_id, horizon_h, logic_version, direction, price_at_signal,
+                 target_pct, stop_pct, cost_pct, outcome, hit_at, bars_to_hit,
+                 net_pnl_pct, mae_pct, mfe_pct, resolution, computed_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                    $14, $15, $16)
+            ON CONFLICT (signal_id, horizon_h) DO NOTHING;
+            """,
+            int(row["signal_id"]),
+            int(row["horizon_h"]),
+            int(row["logic_version"]),
+            str(row["direction"]),
+            _num(row["price_at_signal"]),
+            _num(row["target_pct"]),
+            _num(row["stop_pct"]),
+            _num(row["cost_pct"]),
+            str(row["outcome"]),
+            row.get("hit_at"),
+            None if row.get("bars_to_hit") is None else int(row["bars_to_hit"]),
+            _num(row.get("net_pnl_pct")),
+            _num(row["mae_pct"]),
+            _num(row["mfe_pct"]),
+            str(row["resolution"]),
+            row["computed_at"],
+        )
+
+    async def delete_barrier_outcomes(
+        self, *, logic_version: int, horizon_h: int
+    ) -> int:
+        """Удаляет посчитанные исходы одного горизонта (только ``--recompute``).
+
+        Возвращает число удалённых строк — оно идёт в журнал: пересчёт, стёрший
+        больше, чем ожидалось, обязан быть виден.
+        """
+        status = await self.pool.execute(
+            "DELETE FROM signal_outcomes_barrier "
+            "WHERE logic_version = $1 AND horizon_h = $2;",
+            int(logic_version), int(horizon_h),
+        )
+        return int(status.rsplit(" ", 1)[-1]) if status else 0
+
     # --- Калибровочные кривые (Этап 7.3, Блок B) ---
 
     async def get_active_calibration(
@@ -1469,6 +1636,90 @@ CREATE TABLE IF NOT EXISTS signal_targets (
     frozen_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (signal_id, horizon_h)
 );
+"""
+
+# --- Этап 8.8 §6: исход по границам ---
+#
+# Схема повторяет миграцию 015_barrier_outcomes.sql. Дубль намеренный и того же
+# рода, что у risk_targets: сервис гарантирует свою схему при старте, потому что
+# миграция могла быть не применена на уже работающем томе. Расхождение этих двух
+# описаний ловит раздел 3 deploy/verify_8_8.sh — он сверяет их построчно.
+BARRIER_OUTCOMES_DDL = """
+CREATE TABLE IF NOT EXISTS signal_outcomes_barrier (
+    signal_id       BIGINT      NOT NULL REFERENCES signals(id),
+    horizon_h       SMALLINT    NOT NULL,
+    logic_version   SMALLINT    NOT NULL,
+    direction       TEXT        NOT NULL,
+    price_at_signal NUMERIC(20,8) NOT NULL,
+    target_pct      NUMERIC(10,6) NOT NULL,
+    stop_pct        NUMERIC(10,6) NOT NULL,
+    cost_pct        NUMERIC(10,6) NOT NULL,
+    outcome         TEXT        NOT NULL,
+    hit_at          TIMESTAMPTZ,
+    bars_to_hit     INTEGER,
+    net_pnl_pct     NUMERIC(12,6),
+    mae_pct         NUMERIC(12,6) NOT NULL,
+    mfe_pct         NUMERIC(12,6) NOT NULL,
+    resolution      TEXT        NOT NULL,
+    computed_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (signal_id, horizon_h)
+);
+"""
+
+# Ограничения заводятся отдельно от CREATE TABLE по той же причине, что в
+# миграции: на томе, где таблица уже создана, CREATE TABLE IF NOT EXISTS её
+# не меняет, и ограничения иначе не появились бы никогда.
+BARRIER_OUTCOMES_CHECKS = """
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'signal_outcomes_barrier_outcome_chk') THEN
+        ALTER TABLE signal_outcomes_barrier
+            ADD CONSTRAINT signal_outcomes_barrier_outcome_chk
+            CHECK (outcome IN ('target', 'stop', 'timeout', 'ambiguous', 'no_data'));
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'signal_outcomes_barrier_resolution_chk') THEN
+        ALTER TABLE signal_outcomes_barrier
+            ADD CONSTRAINT signal_outcomes_barrier_resolution_chk
+            CHECK (resolution IN ('1m', '1h'));
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'signal_outcomes_barrier_direction_chk') THEN
+        ALTER TABLE signal_outcomes_barrier
+            ADD CONSTRAINT signal_outcomes_barrier_direction_chk
+            CHECK (direction IN ('buy', 'sell'));
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'signal_outcomes_barrier_logic_version_chk') THEN
+        ALTER TABLE signal_outcomes_barrier
+            ADD CONSTRAINT signal_outcomes_barrier_logic_version_chk
+            CHECK (logic_version > 0);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'signal_outcomes_barrier_bounds_chk') THEN
+        ALTER TABLE signal_outcomes_barrier
+            ADD CONSTRAINT signal_outcomes_barrier_bounds_chk
+            CHECK (horizon_h > 0 AND price_at_signal > 0 AND stop_pct > 0);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'signal_outcomes_barrier_shape_chk') THEN
+        ALTER TABLE signal_outcomes_barrier
+            ADD CONSTRAINT signal_outcomes_barrier_shape_chk
+            CHECK (
+                CASE outcome
+                    WHEN 'target'    THEN hit_at IS NOT NULL AND bars_to_hit IS NOT NULL
+                                          AND net_pnl_pct IS NOT NULL
+                    WHEN 'stop'      THEN hit_at IS NOT NULL AND bars_to_hit IS NOT NULL
+                                          AND net_pnl_pct IS NOT NULL
+                    WHEN 'timeout'   THEN hit_at IS NULL AND bars_to_hit IS NULL
+                                          AND net_pnl_pct IS NOT NULL
+                    ELSE                  hit_at IS NULL AND bars_to_hit IS NULL
+                                          AND net_pnl_pct IS NULL
+                END
+            );
+    END IF;
+END $$;
 """
 
 # Строки signal_targets НИКОГДА не обновляются (§3, §12 ТЗ 8.2), поэтому

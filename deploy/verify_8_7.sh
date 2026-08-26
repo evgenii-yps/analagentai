@@ -299,19 +299,41 @@ fi
 # ---------------------------------------------------------------------------
 echo
 echo "── 8. Решение системы не изменилось (§1) ─────────────────────────────────"
+# ДЕФЕКТ РАЗДЕЛА, ИСПРАВЛЕННЫЙ В ЭТАПЕ 8.8. Прежде слепок снимался СИСТЕМНЫМ
+# python3 на хосте. Это отвечало на вопрос «что решает КОД В РЕПОЗИТОРИИ», тогда
+# как решения принимает КОД В ОБРАЗЕ, и разойтись они могут ровно тогда, когда
+# это важнее всего: образ не пересобран после правки. Вдобавок хостовому python3
+# нужны pydantic/structlog, которых на хосте нет и не будет (правило D-3), —
+# раздел молча падал в ⚪ на исправной системе. Теперь слепок снимается ВНУТРИ
+# контейнера, а хостовый запуск остаётся лишь запасным путём и помечается.
 parity="${APP_DIR}/scripts/decision_parity_8_7.py"
 if [[ ! -f "${parity}" ]]; then
   note_unk "нет файла ${parity} — слепок решений не снять"
 else
-  digest="$(POSTGRES_PASSWORD=parity python3 "${parity}" 2>/dev/null \
-            | python3 -c "import json,sys; print(json.load(sys.stdin)['digest_sha256'])" 2>/dev/null)"
+  # Скрипт лежит в scripts/, а в образ копируются только src/ и backtest/ —
+  # поэтому он подаётся в контейнер ЧЕРЕЗ stdin, а не запускается по пути.
+  digest="$(docker compose exec -T -e POSTGRES_PASSWORD=parity decision \
+              python - < "${parity}" 2>/dev/null \
+            | docker compose exec -T decision python -c \
+              "import json,sys; print(json.load(sys.stdin)['digest_sha256'])" 2>/dev/null)"
+  parity_env="в контейнере decision"
+  if [[ -z "${digest}" ]]; then
+    # Запасной путь: контейнера нет (проверка на стенде до развёртывания).
+    digest="$(POSTGRES_PASSWORD=parity python3 "${parity}" 2>/dev/null \
+              | python3 -c "import json,sys; print(json.load(sys.stdin)['digest_sha256'])" 2>/dev/null)"
+    parity_env="системным python3 на хосте (КОД РЕПОЗИТОРИЯ, не образа)"
+  fi
   expected="1f12d5d29d64eb17911b2a20196311fdde6a66e9f932120a7d5d412aac0de18d"
   echo "    отпечаток решений: ${digest:-не получен}"
   echo "    ожидается:         ${expected}"
+  echo "    снят:              ${parity_env}"
   if [[ -z "${digest}" ]]; then
     note_unk "слепок не снят — вывод о неизменности решений сделать нельзя"
   elif [[ "${digest}" == "${expected}" ]]; then
     note_ok "decision, probability и calibrated_probability на 323 наборах входов не изменились"
+    if [[ "${parity_env}" != "в контейнере decision" ]]; then
+      note_warn "слепок снят на хосте: он подтверждает код репозитория, а не образа"
+    fi
   else
     note_block "решения ИЗМЕНИЛИСЬ — это нарушает жёсткую границу этапа"
   fi
