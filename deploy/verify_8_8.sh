@@ -36,7 +36,31 @@ cd "${APP_DIR}" || { echo "Нет каталога ${APP_DIR}"; exit 2; }
 blocking=0
 attention=0
 unknown=0
-note_block() { echo "  🔴 БЛОКИРУЮЩЕЕ:     $*"; blocking=$((blocking + 1)); }
+# ДВА КЛАССА БЛОКИРУЮЩЕГО (правка Этапа 8.9 §9.2). Прежде их не различали, и
+# ненайденный файл расписания вёл к тому же вердикту «откатить всё», что и
+# нарушение границы этапа. Это разные вещи: одно чинится одной командой за
+# секунду, другое означает, что этап сделал запрещённое.
+#
+#   note_block  — ОТКАТ ОБЯЗАТЕЛЕН: нарушена граница этапа, изменено то, что
+#                 меняться не должно было. Устранить командой нельзя.
+#   note_fix    — УСТРАНЯЕТСЯ КОМАНДОЙ: развёртывание неполно, но ничего
+#                 запрещённого не произошло. Откат не нужен.
+#
+# Оба считаются блокирующими: и то и другое обязано быть снято до открытия
+# окна наблюдения. Различается ЧТО ДЕЛАТЬ, а не серьёзность.
+declare -a ROLLBACK_ITEMS=()
+declare -a FIX_ITEMS=()
+note_block() {  # $1 = текст
+  echo "  🔴 БЛОКИРУЮЩЕЕ (откат):      $*"
+  blocking=$((blocking + 1))
+  ROLLBACK_ITEMS+=("$*")
+}
+note_fix() {    # $1 = текст, $2 = команда устранения
+  echo "  🔴 БЛОКИРУЮЩЕЕ (устранимо):  $1"
+  echo "     └ команда: $2"
+  blocking=$((blocking + 1))
+  FIX_ITEMS+=("$1"$'\n'"       $2")
+}
 note_warn()  { echo "  🟡 ТРЕБУЕТ ВНИМАНИЯ: $*"; attention=$((attention + 1)); }
 note_unk()   { echo "  ⚪ НЕ ПРОВЕРЕНО:    $*"; unknown=$((unknown + 1)); }
 note_ok()    { echo "  🟢 $*"; }
@@ -127,17 +151,37 @@ echo "── 3. Существующие таблицы не дополнены 
 # Обещание «signals, signal_evaluations, signal_targets, risk_targets не
 # изменяются» проверяется ЧИСЛОМ КОЛОНОК, а не чтением диффа: диффа на сервере
 # нет, а таблицы есть.
-declare -A EXPECTED_COLS=(
-  [signals]=19 [signal_evaluations]=9 [signal_targets]=12 [risk_targets]=18
+# ПРАВКА ЭТАПА 8.9 §9.3. Прежде сверялось ЧИСЛО колонок, и ожидание для
+# signal_evaluations (9) устарело — на сервере их десять. Проверка объявляла
+# находку там, где ничего не менялось. Число колонок — плохой признак: оно
+# меняется от любой правки схемы, включая безобидную, и ничего не говорит о
+# том, что именно изменилось.
+#
+# Теперь сверяются ИМЕНА обязательных колонок. Обещание этапа звучит как
+# «существующие таблицы не изменяются», и его настоящее нарушение — исчезнувшая
+# или переименованная колонка, а не появление новой. Лишние колонки печатаются
+# поимённо как справка, а не как находка.
+declare -A REQUIRED_COLS=(
+  [signals]="id instrument_id ts decision probability logic_version status success pnl_pct"
+  [signal_evaluations]="signal_id horizon horizon_h price_at_signal price_at_close pnl_pct drawdown_pct success evaluated_at"
+  [signal_targets]="signal_id horizon_h direction price_at_signal target_pct target_price frozen_at"
+  [risk_targets]="instrument_id horizon_h direction computed_at target_pct cost_roundtrip_pct"
 )
 for t in signals signal_evaluations signal_targets risk_targets; do
-  n="$(psql_val "SELECT count(*) FROM information_schema.columns WHERE table_name='${t}';")"
-  if [[ -z "${n}" || "${n}" == "0" ]]; then
+  actual="$(psql_val "SELECT string_agg(column_name, ' ' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_name='${t}';")"
+  if [[ -z "${actual}" ]]; then
     note_unk "таблицы ${t} нет — сверить состав колонок нечем"
-  elif [[ "${n}" == "${EXPECTED_COLS[$t]}" ]]; then
-    note_ok "${t}: колонок ${n} — как до этапа"
+    continue
+  fi
+  missing=""
+  for col in ${REQUIRED_COLS[$t]}; do
+    [[ " ${actual} " == *"${col}"* ]] || missing="${missing} ${col}"
+  done
+  n="$(psql_val "SELECT count(*) FROM information_schema.columns WHERE table_name='${t}';")"
+  if [[ -n "${missing}" ]]; then
+    note_block "${t}: пропали обязательные колонки —${missing}"
   else
-    note_warn "${t}: колонок ${n} (ожидалось ${EXPECTED_COLS[$t]}) — сверьте, чем именно дополнена"
+    note_ok "${t}: все обязательные колонки на месте (всего в таблице ${n})"
   fi
 done
 
@@ -146,8 +190,8 @@ echo
 echo "── 4. Таблица исходов создана и ограничена (§6) ──────────────────────────"
 exists="$(psql_val "SELECT to_regclass('signal_outcomes_barrier') IS NOT NULL;")"
 if [[ "${exists}" != "t" ]]; then
-  note_block "таблицы signal_outcomes_barrier нет — миграция не применена"
-  info "docker compose exec -T postgres psql -U ${DB_USER} -d ${DB_NAME} < db/migrations/015_barrier_outcomes.sql"
+  note_fix "таблицы signal_outcomes_barrier нет — миграция не применена" \
+           "docker compose exec -T postgres psql -U ${DB_USER} -d ${DB_NAME} < db/migrations/015_barrier_outcomes.sql"
 else
   note_ok "таблица signal_outcomes_barrier существует"
   pk="$(psql_val "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid='signal_outcomes_barrier'::regclass AND contype='p';")"
@@ -178,7 +222,8 @@ echo "── 5. Таблица защищена от политики хране
 if grep -q '"signal_outcomes_barrier"' "${APP_DIR}/scripts/retention.py" 2>/dev/null; then
   note_ok "signal_outcomes_barrier в PROTECTED_TABLES — не удаляется никогда"
 else
-  note_block "signal_outcomes_barrier НЕ защищена — политика хранения может её снести"
+  note_fix "signal_outcomes_barrier НЕ защищена — политика хранения может её снести" \
+           "вернуть 'signal_outcomes_barrier' в PROTECTED_TABLES в scripts/retention.py и развернуть заново"
 fi
 
 # ---------------------------------------------------------------------------
@@ -318,7 +363,8 @@ if grep -qE "^[[:space:]]*barrier:" "${APP_DIR}/docker-compose.yml" 2>/dev/null;
     note_warn "сервис barrier вне профиля tools — появится лишний постоянный контейнер"
   fi
 else
-  note_block "сервиса barrier в docker-compose.yml нет"
+  note_fix "сервиса barrier в docker-compose.yml нет" \
+           "обновить код до ревизии Этапа 8.8 и пересобрать образы"
 fi
 cron_found=0
 for f in "${CRON_FILES[@]}"; do
@@ -333,7 +379,8 @@ for f in "${CRON_FILES[@]}"; do
     note_warn "расписание отличается от 04:10 UTC, заданного §7 ТЗ"
   fi
 done
-[[ "${cron_found}" == "1" ]] || note_block "задача barrier в cron не найдена — расчёт не запускается сам"
+[[ "${cron_found}" == "1" ]] || note_fix "задача barrier в cron не найдена — расчёт не запускается сам" \
+    "sudo cp ${APP_DIR}/deploy/agent-trade-barrier.cron /etc/cron.d/agent-trade-barrier && sudo chmod 644 /etc/cron.d/agent-trade-barrier"
 
 # ---------------------------------------------------------------------------
 echo
@@ -381,20 +428,39 @@ echo " 🟡 Требующих внимания (откат не нужен): ${
 echo " ⚪ Не проверено (проверять было нечем): ${unknown}"
 echo
 if [[ "${blocking}" -gt 0 ]]; then
-  echo " ДЕЙСТВИЕ: развёртывание Этапа 8.8 ОТКАТИТЬ, пока 🔴 не сняты."
-  echo
-  echo "   раздел 1  (решения изменились)   → откат обязателен: этап нарушил §1 ТЗ."
-  echo "   раздел 4  (таблицы нет)          → применить db/migrations/015_barrier_outcomes.sql"
-  echo "   раздел 5  (таблица не защищена)  → вернуть её в PROTECTED_TABLES"
-  echo "   раздел 8  (цели подменены)       → строки исходов удалить и посчитать заново"
-  echo "   раздел 10 (нет cron)             → cp deploy/agent-trade-barrier.cron /etc/cron.d/"
-  echo "   раздел 12 (горячий путь)         → откат обязателен: расчёт попал в решение."
-  echo
-  echo " Откат этапа целиком (данные действующей оценки не затрагиваются):"
-  echo "   docker compose exec -T postgres psql -U ${DB_USER} -d ${DB_NAME} \\"
-  echo "       < db/migrations/015_barrier_outcomes_rollback.sql"
-  echo "   git -C ${APP_DIR} checkout <предыдущая ревизия>"
-  echo "   docker compose build --no-cache --profile \"*\" && docker compose up -d --remove-orphans"
+  # ПРАВКА ЭТАПА 8.9 §9.1. Прежде здесь печатался СПРАВОЧНИК всех возможных
+  # причин — включая заведомо ложные: «таблицы нет» при таблице с десятками
+  # тысяч строк. Человек, читающий отчёт, вынужден был сам угадывать, какая из
+  # строк относится к делу, а какая напечатана всегда. Теперь печатается только
+  # то, что ФАКТИЧЕСКИ сработало, и ничего кроме.
+  if [[ "${#FIX_ITEMS[@]}" -gt 0 ]]; then
+    echo " УСТРАНИМО КОМАНДОЙ — откат НЕ нужен (${#FIX_ITEMS[@]}):"
+    echo
+    for item in "${FIX_ITEMS[@]}"; do
+      echo "   • ${item}"
+      echo
+    done
+  fi
+  if [[ "${#ROLLBACK_ITEMS[@]}" -gt 0 ]]; then
+    echo " ОТКАТ ОБЯЗАТЕЛЕН — нарушена граница этапа (${#ROLLBACK_ITEMS[@]}):"
+    echo
+    for item in "${ROLLBACK_ITEMS[@]}"; do
+      echo "   • ${item}"
+    done
+    echo
+    echo " Этап обещал не менять ни одного решения системы. Перечисленное выше"
+    echo " означает, что обещание нарушено, и одной командой это не чинится."
+    echo
+    echo "   docker compose exec -T postgres psql -U ${DB_USER} -d ${DB_NAME} \\"
+    echo "       < ${APP_DIR}/db/migrations/015_barrier_outcomes_rollback.sql"
+    echo "   git -C ${APP_DIR} checkout <предыдущая ревизия>"
+    echo "   docker compose --profile \"*\" build --no-cache && docker compose up -d --remove-orphans"
+    echo
+    echo " Строки выше передайте исполнителю: по ним видно, что именно разошлось."
+    exit 1
+  fi
+  echo " ДЕЙСТВИЕ: выполните команды выше и запустите проверку снова."
+  echo " Откат НЕ нужен: границу этапа ничто из найденного не нарушает."
   exit 1
 elif [[ "${attention}" -gt 0 || "${unknown}" -gt 0 ]]; then
   echo " ДЕЙСТВИЕ: откат НЕ НУЖЕН. Вторая оценка исхода работает параллельно действующей."

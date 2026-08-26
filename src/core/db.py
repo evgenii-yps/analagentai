@@ -938,6 +938,202 @@ class DB:
         )
         return int(status.rsplit(" ", 1)[-1]) if status else 0
 
+    # --- Базовые стратегии (Этап 8.9) ---
+
+    async def ensure_strategy_schema(self) -> None:
+        """Идемпотентно создаёт таблицу базовых стратегий (миграция 016)."""
+        await self.pool.execute(STRATEGY_OUTCOMES_DDL)
+        await self.pool.execute(STRATEGY_OUTCOMES_CHECKS)
+        await self.pool.execute(
+            "CREATE INDEX IF NOT EXISTS ix_strategy_outcomes_signal "
+            "ON strategy_outcomes (signal_id, horizon_h, strategy);"
+        )
+        await self.pool.execute(
+            "CREATE INDEX IF NOT EXISTS ix_strategy_outcomes_strategy "
+            "ON strategy_outcomes (strategy, horizon_h, outcome);"
+        )
+
+    async def get_strategy_anchors(
+        self,
+        *,
+        logic_version: int,
+        since: datetime | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Моменты входа для стратегий §4 — ИЗ ``signal_outcomes_barrier``.
+
+        Источник выбран не произвольно: базовые стратегии обязаны считаться на
+        ТЕХ ЖЕ моментах и ТЕХ ЖЕ ценах входа, что и решения системы. Взяв их из
+        таблицы исходов системы, мы получаем это по построению, а не по
+        совпадению — и заодно исключаем пары, которые система сама не считала.
+
+        Возвращается ОДНА строка на пару (сигнал, горизонт): все четыре
+        стратегии §4 считаются на одном и том же окне свечей, и читать его
+        четырежды незачем.
+        """
+        query = """
+            SELECT b.signal_id, b.horizon_h, b.logic_version, b.direction,
+                   b.price_at_signal, b.target_pct, s.instrument_id, s.ts
+            FROM signal_outcomes_barrier b
+            JOIN signals s ON s.id = b.signal_id
+            WHERE b.logic_version = $1
+              AND ($2::timestamptz IS NULL OR s.ts >= $2)
+            ORDER BY s.ts ASC, b.signal_id ASC, b.horizon_h ASC
+        """
+        args: list[Any] = [int(logic_version), since]
+        if limit is not None:
+            query += " LIMIT $3"
+            args.append(int(limit))
+        rows = await self.pool.fetch(query + ";", *args)
+        return [dict(r) for r in rows]
+
+    async def get_risk_target_asof(
+        self,
+        instrument_id: int,
+        horizon_h: int,
+        direction: str,
+        as_of: datetime,
+    ) -> dict[str, Any] | None:
+        """Историческая цель на дату входа: последняя строка НЕ ПОЗЖЕ ``as_of``.
+
+        Это единственный законный источник цели для ВСТРЕЧНОГО направления:
+        замороженной цели для него не существует — замораживалось только
+        направление выданного сигнала. Условие ``computed_at <= as_of``
+        обязательно: взять сегодняшнюю цель для вчерашнего входа значило бы
+        утверждать, что в тот момент система знала то, чего не знала.
+        """
+        row = await self.pool.fetchrow(
+            """
+            SELECT instrument_id, horizon_h, direction, computed_at, target_pct
+            FROM risk_targets
+            WHERE instrument_id = $1 AND horizon_h = $2 AND direction = $3
+              AND computed_at <= $4 AND target_pct IS NOT NULL
+            ORDER BY computed_at DESC
+            LIMIT 1;
+            """,
+            int(instrument_id), int(horizon_h), str(direction), as_of,
+        )
+        return dict(row) if row is not None else None
+
+    async def get_grid_prices(
+        self,
+        instrument_id: int,
+        timeframe: str,
+        since: datetime,
+        until: datetime,
+    ) -> list[dict[str, Any]]:
+        """Цены входа сетки §5: закрытия свечей ровно в 00 минут каждого часа.
+
+        Отбор минуты выполняет БАЗА, а не код: тянуть все минутные свечи окна,
+        чтобы оставить каждую шестидесятую, значило бы прочитать в шестьдесят
+        раз больше строк ради того же ответа.
+        """
+        rows = await self.pool.fetch(
+            """
+            SELECT ts, close
+            FROM ohlcv
+            WHERE instrument_id = $1 AND timeframe = $2
+              AND ts >= $3 AND ts <= $4
+              AND EXTRACT(minute FROM ts) = 0
+              AND EXTRACT(second FROM ts) = 0
+            ORDER BY ts ASC;
+            """,
+            int(instrument_id), str(timeframe), since, until,
+        )
+        return [dict(r) for r in rows]
+
+    async def get_barrier_window(
+        self, *, logic_version: int
+    ) -> dict[str, Any] | None:
+        """Границы окна наблюдения системы: первый и последний момент сигнала.
+
+        Нужны сетке §5. Сетка обязана лежать РОВНО в том же отрезке рынка, на
+        котором считалась система: фон, снятый на другом отрезке, отвечал бы на
+        вопрос о другом рынке, и разница между ним и системой отражала бы смену
+        отрезка, а не разницу правил.
+        """
+        row = await self.pool.fetchrow(
+            """
+            SELECT min(s.ts) AS ts_from, max(s.ts) AS ts_to, count(*) AS rows
+            FROM signal_outcomes_barrier b
+            JOIN signals s ON s.id = b.signal_id
+            WHERE b.logic_version = $1;
+            """,
+            int(logic_version),
+        )
+        return dict(row) if row is not None else None
+
+    async def save_strategy_outcome(self, row: dict[str, Any]) -> None:
+        """Запись исхода стратегии. Существующая строка НЕ переписывается.
+
+        ``ON CONFLICT DO NOTHING`` по первичному ключу — это и есть
+        идемпотентность §7: повторный запуск на тех же данных не меняет ни
+        одной строки, и снимок таблицы совпадает побайтно.
+        """
+        await self.pool.execute(
+            """
+            INSERT INTO strategy_outcomes
+                (strategy, instrument_id, entry_ts, horizon_h, signal_id,
+                 logic_version, direction, price_at_entry, target_pct,
+                 target_source, stop_pct, cost_pct, outcome, hit_at,
+                 net_pnl_pct, mae_pct, mfe_pct, resolution, seed, computed_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                    $14, $15, $16, $17, $18, $19, $20)
+            ON CONFLICT (strategy, instrument_id, entry_ts, horizon_h)
+            DO NOTHING;
+            """,
+            str(row["strategy"]),
+            int(row["instrument_id"]),
+            row["entry_ts"],
+            int(row["horizon_h"]),
+            None if row.get("signal_id") is None else int(row["signal_id"]),
+            int(row["logic_version"]),
+            str(row["direction"]),
+            _num(row["price_at_entry"]),
+            _num(row["target_pct"]),
+            str(row["target_source"]),
+            _num(row["stop_pct"]),
+            _num(row["cost_pct"]),
+            str(row["outcome"]),
+            row.get("hit_at"),
+            _num(row.get("net_pnl_pct")),
+            _num(row["mae_pct"]),
+            _num(row["mfe_pct"]),
+            str(row["resolution"]),
+            None if row.get("seed") is None else int(row["seed"]),
+            row["computed_at"],
+        )
+
+    async def delete_strategy_outcomes(
+        self, *, strategy: str, logic_version: int
+    ) -> int:
+        """Удаляет посчитанные строки одной стратегии (только ``--recompute``)."""
+        status = await self.pool.execute(
+            "DELETE FROM strategy_outcomes "
+            "WHERE strategy = $1 AND logic_version = $2;",
+            str(strategy), int(logic_version),
+        )
+        return int(status.rsplit(" ", 1)[-1]) if status else 0
+
+    async def get_strategy_pairs_done(
+        self, *, logic_version: int
+    ) -> set[tuple[str, int, datetime, int]]:
+        """Уже посчитанные ключи — чтобы не читать окно свечей ради ничего.
+
+        Без этого множества идемпотентный повторный прогон всё равно прочитал
+        бы все окна заново и только потом узнал от ``ON CONFLICT``, что писать
+        нечего. На десятках тысяч пар это разница между секундами и минутами.
+        """
+        rows = await self.pool.fetch(
+            "SELECT strategy, instrument_id, entry_ts, horizon_h "
+            "FROM strategy_outcomes WHERE logic_version = $1;",
+            int(logic_version),
+        )
+        return {
+            (r["strategy"], r["instrument_id"], r["entry_ts"], r["horizon_h"])
+            for r in rows
+        }
+
     # --- Калибровочные кривые (Этап 7.3, Блок B) ---
 
     async def get_active_calibration(
@@ -1718,6 +1914,112 @@ BEGIN
                                           AND net_pnl_pct IS NULL
                 END
             );
+    END IF;
+END $$;
+"""
+
+# --- Этап 8.9 §6: исходы базовых стратегий ---
+#
+# Схема повторяет миграцию 016_strategy_outcomes.sql по той же причине, что и
+# у двух предыдущих таблиц: сервис гарантирует свою схему при старте, потому
+# что миграция могла быть не применена на уже работающем томе.
+STRATEGY_OUTCOMES_DDL = """
+CREATE TABLE IF NOT EXISTS strategy_outcomes (
+    strategy        TEXT        NOT NULL,
+    instrument_id   INT         NOT NULL REFERENCES instruments(id),
+    entry_ts        TIMESTAMPTZ NOT NULL,
+    horizon_h       SMALLINT    NOT NULL,
+    signal_id       BIGINT      REFERENCES signals(id),
+    logic_version   SMALLINT    NOT NULL,
+    direction       TEXT        NOT NULL,
+    price_at_entry  NUMERIC(20,8) NOT NULL,
+    target_pct      NUMERIC(10,6) NOT NULL,
+    target_source   TEXT        NOT NULL,
+    stop_pct        NUMERIC(10,6) NOT NULL,
+    cost_pct        NUMERIC(10,6) NOT NULL,
+    outcome         TEXT        NOT NULL,
+    hit_at          TIMESTAMPTZ,
+    net_pnl_pct     NUMERIC(12,6),
+    mae_pct         NUMERIC(12,6) NOT NULL,
+    mfe_pct         NUMERIC(12,6) NOT NULL,
+    resolution      TEXT        NOT NULL,
+    seed            BIGINT,
+    computed_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (strategy, instrument_id, entry_ts, horizon_h)
+);
+"""
+
+STRATEGY_OUTCOMES_CHECKS = r"""
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'strategy_outcomes_strategy_chk') THEN
+        ALTER TABLE strategy_outcomes
+            ADD CONSTRAINT strategy_outcomes_strategy_chk
+            CHECK (strategy IN ('always_buy', 'always_sell', 'coin_flip',
+                                'system', 'grid_buy', 'grid_sell'));
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'strategy_outcomes_outcome_chk') THEN
+        ALTER TABLE strategy_outcomes
+            ADD CONSTRAINT strategy_outcomes_outcome_chk
+            CHECK (outcome IN ('target', 'stop', 'timeout', 'ambiguous', 'no_data'));
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'strategy_outcomes_resolution_chk') THEN
+        ALTER TABLE strategy_outcomes
+            ADD CONSTRAINT strategy_outcomes_resolution_chk
+            CHECK (resolution IN ('1m', '1h'));
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'strategy_outcomes_direction_chk') THEN
+        ALTER TABLE strategy_outcomes
+            ADD CONSTRAINT strategy_outcomes_direction_chk
+            CHECK (direction IN ('buy', 'sell'));
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'strategy_outcomes_bounds_chk') THEN
+        ALTER TABLE strategy_outcomes
+            ADD CONSTRAINT strategy_outcomes_bounds_chk
+            CHECK (horizon_h > 0 AND price_at_entry > 0 AND stop_pct > 0
+                   AND logic_version > 0);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'strategy_outcomes_target_source_chk') THEN
+        ALTER TABLE strategy_outcomes
+            ADD CONSTRAINT strategy_outcomes_target_source_chk
+            CHECK (target_source = 'frozen'
+                   OR target_source ~ '^risk_targets:\d{4}-\d{2}-\d{2}$');
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'strategy_outcomes_shape_chk') THEN
+        ALTER TABLE strategy_outcomes
+            ADD CONSTRAINT strategy_outcomes_shape_chk
+            CHECK (
+                CASE outcome
+                    WHEN 'target'  THEN hit_at IS NOT NULL AND net_pnl_pct IS NOT NULL
+                    WHEN 'stop'    THEN hit_at IS NOT NULL AND net_pnl_pct IS NOT NULL
+                    WHEN 'timeout' THEN hit_at IS NULL AND net_pnl_pct IS NOT NULL
+                    ELSE                hit_at IS NULL AND net_pnl_pct IS NULL
+                END
+            );
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'strategy_outcomes_signal_link_chk') THEN
+        ALTER TABLE strategy_outcomes
+            ADD CONSTRAINT strategy_outcomes_signal_link_chk
+            CHECK (
+                CASE WHEN strategy IN ('grid_buy', 'grid_sell')
+                     THEN signal_id IS NULL
+                     ELSE signal_id IS NOT NULL
+                END
+            );
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'strategy_outcomes_seed_chk') THEN
+        ALTER TABLE strategy_outcomes
+            ADD CONSTRAINT strategy_outcomes_seed_chk
+            CHECK ((strategy = 'coin_flip') = (seed IS NOT NULL));
     END IF;
 END $$;
 """

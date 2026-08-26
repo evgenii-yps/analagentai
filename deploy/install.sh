@@ -642,7 +642,7 @@ setup_operations() {
     # перезаписывается, а не дополняется, и сразу проходит снятие повторов
     # (Этап 8.7 §5). Именно ручное дописывание строки калибровки поверх
     # установленной установщиком дало дубль комментария на сервере.
-    log "Прописываю cron-задачи (бэкап §8, хранение §9, сводка §10, вотчдог §11, цели 8.2 §7, границы 8.8 §7)."
+    log "Прописываю cron-задачи (бэкап §8, хранение §9, сводка §10, вотчдог §11, цели 8.2 §7, границы 8.8 §7, линейка 8.9 §7)."
     cron_install /etc/cron.d/agent-trade <<EOF
 # Agent Trade — регламентные задачи (Этап 6.5). Выполняются под пользователем ${APP_USER}.
 SHELL=/bin/bash
@@ -672,6 +672,11 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # дал бы разрешение '1m' по свечам, которых через полчаса уже не будет.
 # Вторая оценка исхода: ни одно решение системы от неё не зависит.
 10 4 * * * ${APP_USER} cd ${APP_DIR} && /usr/bin/docker compose --profile tools run --rm --no-deps barrier >> ${APP_DIR}/logs/barrier.log 2>&1
+# Этап 8.9 §7 Базовые стратегии — ежедневно 04:25 UTC (внутри контейнера, D-3).
+# ПОСЛЕ исходов системы (04:10): моменты входа берутся из их таблицы, и запуск
+# раньше строил бы линейку на вчерашнем наборе сигналов. Нового сервиса нет —
+# тот же контейнер профиля tools с другой командой.
+25 4 * * * ${APP_USER} cd ${APP_DIR} && /usr/bin/docker compose --profile tools run --rm --no-deps barrier python -m src.baseline_main >> ${APP_DIR}/logs/baseline.log 2>&1
 EOF
     log "Cron-задачи установлены (/etc/cron.d/agent-trade)."
 
@@ -680,7 +685,8 @@ EOF
     # но повторы в них снимает: дефект один и тот же, и лечится он одинаково.
     local cronfile
     for cronfile in /etc/cron.d/agent-trade-export /etc/cron.d/agent-trade-risk \
-                    /etc/cron.d/agent-trade-barrier; do
+                    /etc/cron.d/agent-trade-barrier \
+                    /etc/cron.d/agent-trade-baseline; do
         normalize_declarations "$cronfile"
     done
 
@@ -784,7 +790,8 @@ check_no_duplicate_declarations() {
     local f found=0 files=()
     files=("$APP_DIR/.env")
     for f in /etc/cron.d/agent-trade /etc/cron.d/agent-trade-export \
-             /etc/cron.d/agent-trade-risk /etc/cron.d/agent-trade-barrier; do
+             /etc/cron.d/agent-trade-risk /etc/cron.d/agent-trade-barrier \
+             /etc/cron.d/agent-trade-baseline; do
         [[ -f "$f" ]] && files+=("$f")
     done
 
