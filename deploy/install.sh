@@ -642,7 +642,7 @@ setup_operations() {
     # перезаписывается, а не дополняется, и сразу проходит снятие повторов
     # (Этап 8.7 §5). Именно ручное дописывание строки калибровки поверх
     # установленной установщиком дало дубль комментария на сервере.
-    log "Прописываю cron-задачи (бэкап §8, хранение §9, сводка §10, вотчдог §11, цели 8.2 §7, границы 8.8 §7, линейка 8.9 §7)."
+    log "Прописываю cron-задачи (бэкап §8, хранение §9, сводка §10, вотчдог §11, цели 8.2 §7, границы 8.8 §7, линейка 8.9 §7, подвижный выход 8.10 §7)."
     cron_install /etc/cron.d/agent-trade <<EOF
 # Agent Trade — регламентные задачи (Этап 6.5). Выполняются под пользователем ${APP_USER}.
 SHELL=/bin/bash
@@ -677,6 +677,14 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # раньше строил бы линейку на вчерашнем наборе сигналов. Нового сервиса нет —
 # тот же контейнер профиля tools с другой командой.
 25 4 * * * ${APP_USER} cd ${APP_DIR} && /usr/bin/docker compose --profile tools run --rm --no-deps barrier python -m src.baseline_main >> ${APP_DIR}/logs/baseline.log 2>&1
+# Этап 8.10 §7 Подвижный выход — ежедневно 04:40 UTC (внутри контейнера, D-3).
+# ПОСЛЕ исходов системы (04:10): пары входа берутся из их таблицы, и запуск
+# раньше считал бы варианты выхода на вчерашнем наборе сигналов. Замер задним
+# числом: ни одно решение системы от него не зависит, выбор «лучшего» варианта
+# для внедрения запрещён §5.4 ТЗ. Код 1 здесь означает в том числе расхождение
+# контрольного варианта с signal_outcomes_barrier — тогда сравнение вариантов
+# недействительно целиком.
+40 4 * * * ${APP_USER} cd ${APP_DIR} && /usr/bin/docker compose --profile tools run --rm --no-deps barrier python -m src.trailing_main >> ${APP_DIR}/logs/trailing.log 2>&1
 EOF
     log "Cron-задачи установлены (/etc/cron.d/agent-trade)."
 
@@ -686,7 +694,8 @@ EOF
     local cronfile
     for cronfile in /etc/cron.d/agent-trade-export /etc/cron.d/agent-trade-risk \
                     /etc/cron.d/agent-trade-barrier \
-                    /etc/cron.d/agent-trade-baseline; do
+                    /etc/cron.d/agent-trade-baseline \
+                    /etc/cron.d/agent-trade-trailing; do
         normalize_declarations "$cronfile"
     done
 
@@ -791,7 +800,7 @@ check_no_duplicate_declarations() {
     files=("$APP_DIR/.env")
     for f in /etc/cron.d/agent-trade /etc/cron.d/agent-trade-export \
              /etc/cron.d/agent-trade-risk /etc/cron.d/agent-trade-barrier \
-             /etc/cron.d/agent-trade-baseline; do
+             /etc/cron.d/agent-trade-baseline /etc/cron.d/agent-trade-trailing; do
         [[ -f "$f" ]] && files+=("$f")
     done
 
