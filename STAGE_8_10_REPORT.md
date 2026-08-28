@@ -69,8 +69,37 @@ $ git ls-remote origin main          # ПОСЛЕ слияния
 9e117558d8d09d4a4f5e19a25451aa6c2b0f10a1	refs/heads/main
 ```
 
-Слитая ветка `claude/stage-8-10-trailing-exit-t24php` удалена — и на сервере, и
-локально.
+**Слитая ветка удалена ЛОКАЛЬНО, но НЕ на сервере — и это не забывчивость.**
+Удаление удалённой ветки в среде исполнителя не проходит: обе формы команды
+дают одну и ту же ошибку сети, причём соединение рвётся на отправке, а ветка
+остаётся на месте (проверено `git ls-remote --heads origin`):
+
+```
+$ git push origin --delete claude/stage-8-10-trailing-exit-t24php
+send-pack: unexpected disconnect while reading sideband packet
+fatal: the remote end hung up unexpectedly
+Everything up-to-date
+
+$ git push origin :refs/heads/claude/stage-8-10-trailing-exit-t24php
+send-pack: unexpected disconnect while reading sideband packet
+fatal: the remote end hung up unexpectedly
+```
+
+Выполнено четыре попытки с нарастающей паузой (2, 4, 8, 16 секунд) — результат
+одинаков. Доступного обходного пути нет: `gh` в среде отсутствует, а набор
+инструментов GitHub, которым располагает исполнитель, умеет создавать ветку, но
+не удалять. **Та же неудача зафиксирована в Этапе 8.8** (коммит `f1e74f4`,
+«docs(8.8): зафиксировать факт слияния и неудачу удаления ветки»), то есть
+ограничение среды устойчивое, а не случайный сбой.
+
+Ветка влита полностью и никаких уникальных коммитов не содержит, поэтому её
+удаление безопасно и требует одной команды на машине владельца:
+
+```
+git push origin --delete claude/stage-8-10-trailing-exit-t24php
+```
+
+Либо кнопкой «Delete branch» на странице ветки в GitHub.
 
 ---
 
