@@ -1134,6 +1134,195 @@ class DB:
             for r in rows
         }
 
+    # --- Подвижный выход (Этап 8.10) ---
+
+    async def ensure_trailing_schema(self) -> None:
+        """Идемпотентно создаёт таблицу исходов подвижного выхода (миграция 017)."""
+        await self.pool.execute(TRAILING_OUTCOMES_DDL)
+        await self.pool.execute(TRAILING_OUTCOMES_CHECKS)
+        await self.pool.execute(
+            "CREATE INDEX IF NOT EXISTS ix_trailing_outcomes_variant "
+            "ON trailing_outcomes "
+            "(logic_version, activation_ratio, retrace_ratio, horizon_h);"
+        )
+        await self.pool.execute(
+            "CREATE INDEX IF NOT EXISTS ix_trailing_outcomes_reason "
+            "ON trailing_outcomes (exit_reason, horizon_h);"
+        )
+
+    async def get_trailing_anchors(
+        self,
+        *,
+        logic_version: int,
+        since: datetime | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Пары (сигнал, горизонт) для расчёта — ИЗ ``signal_outcomes_barrier``.
+
+        Источник выбран не произвольно, и это ключевое решение этапа. Вместе с
+        парой оттуда берутся ВСЕ входные числа: направление, цена решения,
+        замороженная цель, предел и издержки. Собери мы их заново из
+        ``signal_targets`` и ``.env``, контрольный вариант разошёлся бы с
+        Этапом 8.8 в тот день, когда на сервере изменится ``BARRIER_STOP_PCT``
+        или ``RISK_COST_ROUNDTRIP_PCT``, — причём разошёлся бы молча, и §4 ТЗ
+        («совпасть до последнего знака») было бы нарушено не ошибкой расчёта,
+        а сменой настройки.
+        """
+        query = """
+            SELECT b.signal_id, b.horizon_h, b.logic_version, b.direction,
+                   b.price_at_signal, b.target_pct, b.stop_pct, b.cost_pct,
+                   s.instrument_id, s.ts
+            FROM signal_outcomes_barrier b
+            JOIN signals s ON s.id = b.signal_id
+            WHERE b.logic_version = $1
+              AND ($2::timestamptz IS NULL OR s.ts >= $2)
+            ORDER BY s.ts ASC, b.signal_id ASC, b.horizon_h ASC
+        """
+        args: list[Any] = [int(logic_version), since]
+        if limit is not None:
+            query += " LIMIT $3"
+            args.append(int(limit))
+        rows = await self.pool.fetch(query + ";", *args)
+        return [dict(r) for r in rows]
+
+    async def get_trailing_pairs_done(
+        self, *, logic_version: int, variants: int
+    ) -> set[tuple[int, int]]:
+        """Пары, у которых посчитаны ВСЕ варианты — их окно читать незачем.
+
+        Условие ``count(*) = variants`` намеренно жёстче, чем «есть хоть одна
+        строка»: пара, недосчитанная из-за прерванного прогона, обязана быть
+        досчитана следующим запуском, а не остаться навсегда с четырьмя
+        вариантами из тринадцати. Без этого множества идемпотентный повторный
+        прогон всё равно прочитал бы все окна и только потом узнал бы от
+        ``ON CONFLICT``, что писать нечего.
+        """
+        rows = await self.pool.fetch(
+            "SELECT signal_id, horizon_h FROM trailing_outcomes "
+            "WHERE logic_version = $1 "
+            "GROUP BY signal_id, horizon_h HAVING count(*) >= $2;",
+            int(logic_version), int(variants),
+        )
+        return {(int(r["signal_id"]), int(r["horizon_h"])) for r in rows}
+
+    async def save_trailing_outcomes(self, rows: list[dict[str, Any]]) -> int:
+        """Запись исходов пачкой. Существующие строки НЕ переписываются.
+
+        Пачкой, а не по одной, потому что на пару приходится тринадцать строк, а
+        пар — десятки тысяч: ``executemany`` превращает тринадцать обращений к
+        базе в одно. ``ON CONFLICT DO NOTHING`` по первичному ключу — это и есть
+        идемпотентность §7: повторный запуск на тех же данных не меняет ни одной
+        строки. Принудительный пересчёт идёт отдельным путём (``--recompute``),
+        который сначала удаляет строки: переписывание «на всякий случай» скрыло
+        бы расхождение расчётов вместо того, чтобы его показать.
+        """
+        if not rows:
+            return 0
+        await self.pool.executemany(
+            """
+            INSERT INTO trailing_outcomes
+                (signal_id, horizon_h, activation_ratio, retrace_ratio,
+                 logic_version, direction, price_at_signal, target_pct,
+                 stop_pct, cost_pct, exit_reason, hit_at, bars_to_hit,
+                 net_pnl_pct, peak_pct, mae_pct, mfe_pct, resolution,
+                 computed_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                    $14, $15, $16, $17, $18, $19)
+            ON CONFLICT (signal_id, horizon_h, activation_ratio, retrace_ratio)
+            DO NOTHING;
+            """,
+            [
+                (
+                    int(row["signal_id"]),
+                    int(row["horizon_h"]),
+                    _num(row["activation_ratio"]),
+                    _num(row["retrace_ratio"]),
+                    int(row["logic_version"]),
+                    str(row["direction"]),
+                    _num(row["price_at_signal"]),
+                    _num(row["target_pct"]),
+                    _num(row["stop_pct"]),
+                    _num(row["cost_pct"]),
+                    str(row["exit_reason"]),
+                    row.get("hit_at"),
+                    None if row.get("bars_to_hit") is None else int(row["bars_to_hit"]),
+                    _num(row.get("net_pnl_pct")),
+                    _num(row["peak_pct"]),
+                    _num(row["mae_pct"]),
+                    _num(row["mfe_pct"]),
+                    str(row["resolution"]),
+                    row["computed_at"],
+                )
+                for row in rows
+            ],
+        )
+        return len(rows)
+
+    async def delete_trailing_outcomes(self, *, logic_version: int) -> int:
+        """Удаляет посчитанные исходы подвижного выхода (только ``--recompute``).
+
+        Возвращает число удалённых строк — оно идёт в журнал: пересчёт, стёрший
+        больше, чем ожидалось, обязан быть виден.
+        """
+        status = await self.pool.execute(
+            "DELETE FROM trailing_outcomes WHERE logic_version = $1;",
+            int(logic_version),
+        )
+        return int(status.rsplit(" ", 1)[-1]) if status else 0
+
+    async def check_trailing_control(
+        self, *, logic_version: int
+    ) -> dict[str, int]:
+        """Сверка КОНТРОЛЬНОГО варианта с ``signal_outcomes_barrier`` (§4 ТЗ).
+
+        Контрольный вариант — та же фиксированная цель, что в Этапе 8.8, и
+        считается он прямым вызовом того же кода. Значит, его строки обязаны
+        совпасть с таблицей 8.8 ДО ПОСЛЕДНЕГО ЗНАКА. Сверка идёт в базе, а не в
+        памяти: сравниваются значения, которые РЕАЛЬНО ЗАПИСАНЫ, вместе со всеми
+        округлениями типа NUMERIC. Сравнение в памяти пропустило бы расхождение,
+        возникшее при записи.
+
+        ``IS DISTINCT FROM`` вместо ``<>`` обязателен: NULL <> NULL даёт NULL, и
+        расхождение по полю, где с одной стороны NULL, осталось бы незамеченным.
+
+        Возвращает три числа: сколько строк сверено, сколько разошлось и сколько
+        строк 8.8 не получили контрольной пары вовсе. Несовпадение — БЛОКИРУЮЩЕЕ
+        (§4 ТЗ): оно означает, что правила касания разошлись, и тогда
+        недействительно ВСЁ сравнение вариантов, а не только контрольная строка.
+        """
+        row = await self.pool.fetchrow(
+            """
+            SELECT
+                count(*) FILTER (WHERE t.signal_id IS NOT NULL) AS compared,
+                count(*) FILTER (WHERE t.signal_id IS NULL)     AS missing,
+                count(*) FILTER (WHERE t.signal_id IS NOT NULL AND (
+                        t.exit_reason     IS DISTINCT FROM b.outcome
+                     OR t.hit_at          IS DISTINCT FROM b.hit_at
+                     OR t.bars_to_hit     IS DISTINCT FROM b.bars_to_hit
+                     OR t.net_pnl_pct     IS DISTINCT FROM b.net_pnl_pct
+                     OR t.mae_pct         IS DISTINCT FROM b.mae_pct
+                     OR t.mfe_pct         IS DISTINCT FROM b.mfe_pct
+                     OR t.resolution      IS DISTINCT FROM b.resolution
+                     OR t.direction       IS DISTINCT FROM b.direction
+                     OR t.price_at_signal IS DISTINCT FROM b.price_at_signal
+                     OR t.target_pct      IS DISTINCT FROM b.target_pct
+                     OR t.stop_pct        IS DISTINCT FROM b.stop_pct
+                     OR t.cost_pct        IS DISTINCT FROM b.cost_pct
+                )) AS mismatched
+            FROM signal_outcomes_barrier b
+            LEFT JOIN trailing_outcomes t
+              ON t.signal_id = b.signal_id AND t.horizon_h = b.horizon_h
+             AND t.activation_ratio = 0 AND t.retrace_ratio = 0
+            WHERE b.logic_version = $1;
+            """,
+            int(logic_version),
+        )
+        return {
+            "compared": int(row["compared"] or 0),
+            "missing": int(row["missing"] or 0),
+            "mismatched": int(row["mismatched"] or 0),
+        }
+
     # --- Калибровочные кривые (Этап 7.3, Блок B) ---
 
     async def get_active_calibration(
@@ -2023,6 +2212,111 @@ BEGIN
     END IF;
 END $$;
 """
+
+# --- Этап 8.10 §6: подвижный выход ---
+#
+# Схема повторяет миграцию 017_trailing_outcomes.sql по той же причине, что и
+# две предыдущие: расчёт гарантирует свою схему при старте, потому что миграция
+# могла быть не применена на уже работающем томе. Расхождение этих двух описаний
+# ловит раздел 4 deploy/verify_8_10.sh.
+TRAILING_OUTCOMES_DDL = """
+CREATE TABLE IF NOT EXISTS trailing_outcomes (
+    signal_id       BIGINT      NOT NULL REFERENCES signals(id),
+    horizon_h       SMALLINT    NOT NULL,
+    activation_ratio NUMERIC(4,2) NOT NULL,
+    retrace_ratio   NUMERIC(4,2) NOT NULL,
+    logic_version   SMALLINT    NOT NULL,
+    direction       TEXT        NOT NULL,
+    price_at_signal NUMERIC(20,8) NOT NULL,
+    target_pct      NUMERIC(10,6) NOT NULL,
+    stop_pct        NUMERIC(10,6) NOT NULL,
+    cost_pct        NUMERIC(10,6) NOT NULL,
+    exit_reason     TEXT        NOT NULL,
+    hit_at          TIMESTAMPTZ,
+    bars_to_hit     INTEGER,
+    net_pnl_pct     NUMERIC(12,6),
+    peak_pct        NUMERIC(12,6) NOT NULL,
+    mae_pct         NUMERIC(12,6) NOT NULL,
+    mfe_pct         NUMERIC(12,6) NOT NULL,
+    resolution      TEXT        NOT NULL,
+    computed_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (signal_id, horizon_h, activation_ratio, retrace_ratio)
+);
+"""
+
+TRAILING_OUTCOMES_CHECKS = """
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'trailing_outcomes_exit_reason_chk') THEN
+        ALTER TABLE trailing_outcomes
+            ADD CONSTRAINT trailing_outcomes_exit_reason_chk
+            CHECK (exit_reason IN ('target', 'stop', 'trail', 'timeout',
+                                   'ambiguous', 'no_data'));
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'trailing_outcomes_variant_chk') THEN
+        ALTER TABLE trailing_outcomes
+            ADD CONSTRAINT trailing_outcomes_variant_chk
+            CHECK ((activation_ratio, retrace_ratio) IN (
+                (0.00, 0.00),
+                (0.25, 0.20), (0.25, 0.33), (0.25, 0.50),
+                (0.50, 0.20), (0.50, 0.33), (0.50, 0.50),
+                (0.75, 0.20), (0.75, 0.33), (0.75, 0.50),
+                (1.00, 0.20), (1.00, 0.33), (1.00, 0.50)
+            ));
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'trailing_outcomes_resolution_chk') THEN
+        ALTER TABLE trailing_outcomes
+            ADD CONSTRAINT trailing_outcomes_resolution_chk
+            CHECK (resolution IN ('1m', '1h'));
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'trailing_outcomes_direction_chk') THEN
+        ALTER TABLE trailing_outcomes
+            ADD CONSTRAINT trailing_outcomes_direction_chk
+            CHECK (direction IN ('buy', 'sell'));
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'trailing_outcomes_bounds_chk') THEN
+        ALTER TABLE trailing_outcomes
+            ADD CONSTRAINT trailing_outcomes_bounds_chk
+            CHECK (horizon_h > 0 AND price_at_signal > 0 AND stop_pct > 0
+                   AND logic_version > 0);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'trailing_outcomes_shape_chk') THEN
+        ALTER TABLE trailing_outcomes
+            ADD CONSTRAINT trailing_outcomes_shape_chk
+            CHECK (
+                CASE exit_reason
+                    WHEN 'target'  THEN hit_at IS NOT NULL AND bars_to_hit IS NOT NULL
+                                        AND net_pnl_pct IS NOT NULL
+                    WHEN 'stop'    THEN hit_at IS NOT NULL AND bars_to_hit IS NOT NULL
+                                        AND net_pnl_pct IS NOT NULL
+                    WHEN 'trail'   THEN hit_at IS NOT NULL AND bars_to_hit IS NOT NULL
+                                        AND net_pnl_pct IS NOT NULL
+                    WHEN 'timeout' THEN hit_at IS NULL AND bars_to_hit IS NULL
+                                        AND net_pnl_pct IS NOT NULL
+                    ELSE                hit_at IS NULL AND bars_to_hit IS NULL
+                                        AND net_pnl_pct IS NULL
+                END
+            );
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'trailing_outcomes_reason_variant_chk') THEN
+        ALTER TABLE trailing_outcomes
+            ADD CONSTRAINT trailing_outcomes_reason_variant_chk
+            CHECK (
+                (exit_reason <> 'trail'  OR activation_ratio > 0)
+                AND
+                (exit_reason <> 'target' OR activation_ratio = 0)
+            );
+    END IF;
+END $$;
+"""
+
 
 # Строки signal_targets НИКОГДА не обновляются (§3, §12 ТЗ 8.2), поэтому
 # запрос — чистый INSERT без UPDATE в конфликте. ``DO NOTHING`` нужен на случай
