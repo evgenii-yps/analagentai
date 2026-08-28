@@ -793,6 +793,7 @@ class DB:
         logic_version: int,
         horizon_h: int,
         now: datetime,
+        settle_seconds: int = 0,
         recompute: bool = False,
     ) -> list[dict[str, Any]]:
         """Сигналы, готовые к оценке по границам на этом горизонте.
@@ -801,8 +802,18 @@ class DB:
 
         * направленные сигналы (``decision <> 'wait'``) заданной версии логики —
           версии не смешиваются (правило проекта);
-        * ``t + h`` уже в прошлом (§7): у сигнала, чей горизонт не наступил,
-          исхода ещё не существует;
+        * ``t + h`` уже в прошлом (§7), И СВЕРХ ТОГО прошёл ``settle_seconds``:
+          у сигнала, чей горизонт не наступил, исхода ещё не существует, а у
+          сигнала, чей горизонт наступил только что, ПОСЛЕДНИЙ БАР ОКНА ЕЩЁ НЕ
+          ЗАКРЫТ. Второе условие добавлено Этапом 8.10.1 после разбора двух
+          расхождений на сервере: окно ``t+1 … t+h`` кончается баром, который
+          ОТКРЫВАЕТСЯ в момент срока, а закрывается через целый бар после него
+          (минуту или час). Расчёт, допущенный к паре в момент срока, читал
+          формирующийся бар: его ``close`` — цена «пока что», коллектор
+          перезапишет её следующим опросом (UPSERT с DO UPDATE), и записанный
+          исход ``timeout`` окажется посчитанным по цене, которой на срок не
+          было. Это не ускорение и не задержка ради удобства: это разница между
+          измерением и черновиком;
         * есть ЗАМОРОЖЕННАЯ цель ``signal_targets.target_pct`` на ЭТОТ горизонт.
           Сигналы без неё пропускаются, и подставлять им сегодняшнюю цель из
           ``risk_targets`` запрещено (§7 ТЗ): это подделка истории.
@@ -822,7 +833,8 @@ class DB:
             WHERE s.decision <> 'wait'
               AND s.logic_version = $1
               AND t.target_pct IS NOT NULL
-              AND s.ts + make_interval(hours => $2) <= $3
+              AND s.ts + make_interval(hours => $2)
+                       + make_interval(secs => $5) <= $3
               AND ($4::boolean OR NOT EXISTS (
                       SELECT 1 FROM signal_outcomes_barrier b
                       WHERE b.signal_id = s.id AND b.horizon_h = $2
@@ -830,18 +842,26 @@ class DB:
             ORDER BY s.ts ASC, s.id ASC;
         """
         rows = await self.pool.fetch(
-            query, int(logic_version), int(horizon_h), now, bool(recompute)
+            query, int(logic_version), int(horizon_h), now, bool(recompute),
+            float(settle_seconds),
         )
         return [dict(r) for r in rows]
 
     async def count_barrier_skipped(
-        self, *, logic_version: int, horizon_h: int, now: datetime
+        self, *, logic_version: int, horizon_h: int, now: datetime,
+        settle_seconds: int = 0,
     ) -> int:
         """Сигналы, пропущенные из-за ОТСУТСТВИЯ замороженной цели (§7).
 
         Число выводится отдельно и в журнал, и в отчёт: «цели не было» и
         «исход не посчитан» — разные состояния, и молчание сделало бы их
         неотличимыми.
+
+        Годность здесь определяется ТЕМ ЖЕ условием, что в
+        ``get_barrier_candidates``, включая запас на закрытие последнего бара.
+        Разные определения годности в двух запросах дали бы счётчик, который
+        считает не то, что считает расчёт, — и он врал бы ровно в те дни, когда
+        на границе окна что-то происходит.
         """
         value = await self.pool.fetchval(
             """
@@ -851,10 +871,11 @@ class DB:
               ON t.signal_id = s.id AND t.horizon_h = $2
             WHERE s.decision <> 'wait'
               AND s.logic_version = $1
-              AND s.ts + make_interval(hours => $2) <= $3
+              AND s.ts + make_interval(hours => $2)
+                       + make_interval(secs => $4) <= $3
               AND (t.signal_id IS NULL OR t.target_pct IS NULL);
             """,
-            int(logic_version), int(horizon_h), now,
+            int(logic_version), int(horizon_h), now, float(settle_seconds),
         )
         return int(value or 0)
 

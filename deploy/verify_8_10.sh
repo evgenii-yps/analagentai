@@ -267,6 +267,45 @@ else
              "cd ${APP_DIR} && docker compose --profile tools run --rm --no-deps barrier python -m src.trailing_main"
   else
     note_block "контрольный вариант РАЗОШЁЛСЯ с 8.8 (${mismatched}) — сравнение вариантов недействительно"
+    # ДИАГНОСТИКА, А НЕ СМЯГЧЕНИЕ. Допуск сравнения не расширяется ничем: пары
+    # ниже остаются расхождением и остаются блокирующими. Печатаются они затем,
+    # что «разошлось 2» без указания, ЧТО именно разошлось, заставляет искать
+    # причину вручную — а Этап 8.10.1 показал, что причина видна из полей.
+    echo "    разошедшиеся пары (сигнал, горизонт, исход, итоги 8.10 против 8.8):"
+    psql_tbl "SELECT b.signal_id, b.horizon_h, b.outcome,
+                     t.net_pnl_pct, b.net_pnl_pct,
+                     (t.net_pnl_pct - b.net_pnl_pct) AS delta
+              FROM signal_outcomes_barrier b
+              JOIN trailing_outcomes t
+                ON t.signal_id = b.signal_id AND t.horizon_h = b.horizon_h
+               AND t.activation_ratio = 0 AND t.retrace_ratio = 0
+              WHERE t.exit_reason IS DISTINCT FROM b.outcome
+                 OR t.hit_at IS DISTINCT FROM b.hit_at
+                 OR t.bars_to_hit IS DISTINCT FROM b.bars_to_hit
+                 OR t.net_pnl_pct IS DISTINCT FROM b.net_pnl_pct
+                 OR t.mae_pct IS DISTINCT FROM b.mae_pct
+                 OR t.mfe_pct IS DISTINCT FROM b.mfe_pct
+                 OR t.resolution IS DISTINCT FROM b.resolution
+              ORDER BY b.signal_id LIMIT 20;" | sed 's/^/      /'
+    # Признак ИЗВЕСТНОЙ причины (Этап 8.10.1): исход timeout, различие только в
+    # итоге. Тогда 8.8 посчитал пару по ещё формировавшемуся последнему бару.
+    known="$(psql_val "SELECT count(*) FROM signal_outcomes_barrier b
+                       JOIN trailing_outcomes t
+                         ON t.signal_id = b.signal_id AND t.horizon_h = b.horizon_h
+                        AND t.activation_ratio = 0 AND t.retrace_ratio = 0
+                       WHERE b.outcome = 'timeout'
+                         AND t.net_pnl_pct IS DISTINCT FROM b.net_pnl_pct
+                         AND t.exit_reason = b.outcome
+                         AND t.mae_pct = b.mae_pct AND t.mfe_pct = b.mfe_pct
+                         AND t.resolution = b.resolution;")"
+    if [[ "${known:-0}" == "${mismatched}" ]]; then
+      info "все расхождения имеют признак известной причины (Этап 8.10.1):"
+      info "  исход timeout, различие ТОЛЬКО в итоге — строка 8.8 посчитана по"
+      info "  ещё формировавшемуся последнему бару окна. Правило годности с"
+      info "  запасом не даёт этому повториться, но УЖЕ ЗАПИСАННЫЕ строки"
+      info "  чинятся только пересчётом, а это правка signal_outcomes_barrier —"
+      info "  решение владельца, не скрипта."
+    fi
   fi
 fi
 
@@ -400,6 +439,95 @@ for pkg in agents decision notify evaluator risk; do
   fi
 done
 [[ "${hot}" == "0" ]] && note_ok "agents, decision, notify, evaluator, risk о подвижном выходе не знают"
+
+# ---------------------------------------------------------------------------
+echo
+echo "── 11. Запас на закрытие последнего бара (Этап 8.10.1 §1) ────────────────"
+# Пара становится годной к расчёту не в момент срока, а после того, как её
+# последний бар закрылся. Без этого запаса исход timeout считается по цене
+# «пока что» — так и разошлись две строки на сервере 28.08.2026.
+settle_env="$(env_value "${ENV_FILE}" BARRIER_SETTLE_MINUTES)"
+echo "    .env: BARRIER_SETTLE_MINUTES=${settle_env:-· (действует умолчание кода 5)}"
+if grep -rq "settle_seconds" "${APP_DIR}/src/barrier/" 2>/dev/null; then
+  note_ok "правило годности учитывает закрытие последнего бара"
+else
+  note_fix "запас не развёрнут: расчёт допускает пары с незакрытым последним баром" \
+           "git -C ${APP_DIR} pull --ff-only && docker compose --profile \"*\" build --no-cache"
+fi
+if [[ -f "${APP_DIR}/logs/barrier.log" ]]; then
+  last_settle="$(grep -oE '\"?settle_seconds\"?[=:] ?[0-9]+' "${APP_DIR}/logs/barrier.log" \
+                 2>/dev/null | tail -1 | grep -oE '[0-9]+$')"
+  echo "    в журнале последнего прогона 8.8: settle_seconds=${last_settle:-·}"
+  if [[ -z "${last_settle}" ]]; then
+    note_warn "прогон 8.8 с запасом ещё не выполнялся — число появится после следующего"
+  elif [[ "${last_settle}" -lt 3600 ]]; then
+    note_warn "запас меньше часового бара (${last_settle} с): пары на часовом ряду не защищены"
+  else
+    note_ok "запас перекрывает часовой бар (${last_settle} с)"
+  fi
+else
+  note_unk "нет ${APP_DIR}/logs/barrier.log — судить о запасе по журналу нечем"
+fi
+
+# ---------------------------------------------------------------------------
+echo
+echo "── 12. Подпись клиента при обращении к бирже (Этап 8.10.1) ───────────────"
+# OKX с 28.08.2026 отбивает питоновские подписи кодом 403/1010 ещё ДО проверки
+# ключа — даже на публичном эндпоинте. Требование: подпись браузерная и берётся
+# из одного места, чтобы новый код не наступал на это снова.
+if [[ ! -f "${APP_DIR}/src/core/http.py" ]]; then
+  note_fix "нет src/core/http.py — единого места для подписи клиента" \
+           "git -C ${APP_DIR} pull --ff-only && docker compose --profile \"*\" build --no-cache"
+else
+  ua="$(grep -oE 'Mozilla/[0-9.]+' "${APP_DIR}/src/core/http.py" | head -1)"
+  echo "    подпись в едином месте: ${ua:-не найдена}"
+  if [[ -n "${ua}" ]]; then
+    note_ok "подпись браузерная (${ua}...)"
+  else
+    note_block "подпись в src/core/http.py не браузерная — OKX ответит 403/1010"
+  fi
+  missing_ua=""
+  for f in src/core/exchange.py backtest/loader.py scripts/geo_check.py; do
+    if [[ ! -f "${APP_DIR}/${f}" ]]; then continue; fi
+    grep -q "exchange_headers\|EXCHANGE_USER_AGENT" "${APP_DIR}/${f}" 2>/dev/null \
+      || missing_ua="${missing_ua} ${f}"
+  done
+  if [[ -z "${missing_ua}" ]]; then
+    note_ok "ccxt-клиент, загрузчик истории и гео-тест берут заголовки из единого места"
+  else
+    note_block "берут подпись мимо единого места:${missing_ua}"
+  fi
+fi
+# ЖИВАЯ ПРОВЕРКА. Публичный эндпоинт времени — самый дешёвый и не требует ключа.
+probe_url="https://www.okx.com/api/v5/public/time"
+if docker compose ps --status running --services 2>/dev/null | grep -qx collector; then
+  code_py="$(docker compose exec -T collector python -c "
+import asyncio, sys
+sys.path.insert(0, '/app')
+from src.core.exchange import create_exchange
+async def main():
+    ex = create_exchange('okx')
+    try:
+        r = await ex.fetch('${probe_url}')
+        print(200 if r else 0)
+    except Exception as exc:
+        print(getattr(exc, 'http_status', 0) or 0)
+    finally:
+        await ex.close()
+asyncio.run(main())
+" 2>/dev/null | tr -d '[:space:]')"
+  echo "    ответ биржи клиенту проекта: ${code_py:-нет ответа}"
+  if [[ "${code_py}" == "200" ]]; then
+    note_ok "биржа отвечает 200 клиенту с браузерной подписью"
+  elif [[ -z "${code_py}" || "${code_py}" == "0" ]]; then
+    note_unk "живой запрос не выполнен (нет сети наружу?) — вывод о подписи только по коду"
+  else
+    note_warn "биржа ответила ${code_py} — проверьте подпись и регион вручную:"
+    info "  curl -s -o /dev/null -w '%{http_code}' ${probe_url}"
+  fi
+else
+  note_unk "контейнер collector не запущен — живой запрос к бирже не выполнен"
+fi
 
 # ---------------------------------------------------------------------------
 echo

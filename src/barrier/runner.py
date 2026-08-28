@@ -3,8 +3,9 @@
 ЧТО ДЕЛАЕТ РАСЧЁТ, по шагам:
 
   1. для каждого горизонта из ``EVAL_HORIZONS`` отбирает направленные сигналы
-     текущей версии логики, у которых ``t + h`` уже в прошлом И есть
-     ЗАМОРОЖЕННАЯ цель в ``signal_targets``;
+     текущей версии логики, у которых ``t + h`` уже в прошлом НЕ МЕНЕЕ ЧЕМ НА
+     длину бара плюс запас (``settle_seconds``) И есть ЗАМОРОЖЕННАЯ цель в
+     ``signal_targets``;
   2. читает свечи окна: сначала минутные, и только если они покрывают ВЕСЬ
      интервал — считает по ним (§4); иначе переходит на часовые;
   3. применяет правило §3 (чистая функция ``src.barrier.outcomes.resolve``);
@@ -22,6 +23,15 @@
 разрешение, которым посчитан исход, ХРАНИТСЯ В СТРОКЕ: без него нельзя
 отличить измеренный порядок от неизвестного.
 
+ПОЧЕМУ ПАРА ЖДЁТ ДОЛЬШЕ СВОЕГО СРОКА (правка Этапа 8.10.1). Окно ``t+1 … t+h``
+кончается баром, который ОТКРЫВАЕТСЯ в момент срока, а закрывается через целый
+бар после него. Прежнее правило годности «``t + h`` уже в прошлом» пускало
+расчёт к этому бару, пока он ещё формировался: его ``close`` — цена «пока что»,
+и коллектор перезаписывает её следующим опросом. Исход ``timeout`` берёт итог
+именно из этого ``close``, поэтому две строки из 65 594 на сервере оказались
+посчитаны по цене, которой на срок не было. Теперь пара становится годной не
+раньше, чем её последний бар закрылся и прошёл запас на задержку коллектора.
+
 СИГНАЛЫ БЕЗ ЗАМОРОЖЕННОЙ ЦЕЛИ ПРОПУСКАЮТСЯ, и их число печатается отдельно
 (§7). Подставить им сегодняшнюю цель из ``risk_targets`` нельзя: сегодняшняя
 цель посчитана по сегодняшнему рынку, и её подстановка означала бы, что система
@@ -37,6 +47,7 @@ from typing import Any
 import structlog
 
 from src.barrier.outcomes import (
+    BAR_SECONDS,
     OUTCOME_AMBIGUOUS,
     RESOLUTION_1H,
     RESOLUTION_1M,
@@ -77,6 +88,27 @@ def _bars(rows: list[dict[str, Any]]) -> list[Bar]:
             close=float(r["close"]))
         for r in rows
     ]
+
+
+def settle_seconds() -> int:
+    """Сколько ждать ПОСЛЕ срока, прежде чем считать пару (Этап 8.10.1 §1).
+
+    ОКНО КОНЧАЕТСЯ БАРОМ, КОТОРЫЙ ОТКРЫВАЕТСЯ В МОМЕНТ СРОКА. Закрывается он
+    через целый бар после него: минутный — через минуту, часовой — через час.
+    Правило годности «t + h уже в прошлом» пускало расчёт к паре в момент
+    срока, то есть к ЕЩЁ ФОРМИРУЮЩЕМУСЯ последнему бару. Его ``close`` — цена
+    «пока что», и коллектор перезаписывает её следующим опросом (UPSERT с
+    DO UPDATE). Исход ``timeout`` берёт итог именно из этого ``close``.
+
+    БЕРЁТСЯ ДЛИНА ГРУБОГО БАРА, а не того, который окажется выбран. Разрешение
+    выясняется ПОСЛЕ отбора кандидатов — по факту покрытия окна минутным рядом,
+    — а ждать надо до отбора. Ждать по минутному бару значило бы допускать к
+    расчёту пары, которые посчитаются по часовому ряду с незакрытым последним
+    часом. Лишнее ожидание стоит суток отсрочки для нескольких пар; недостаток
+    ожидания стоит неверного числа в таблице, и это не равноценный размен.
+    """
+    coarse = BAR_SECONDS[settings.BARRIER_COARSE_TIMEFRAME]
+    return coarse + settings.BARRIER_SETTLE_MINUTES * 60
 
 
 def ambiguous_share(by_outcome: dict[str, int]) -> float | None:
@@ -174,11 +206,14 @@ async def compute_horizon(
             logic_version=logic_version, horizon_h=horizon_h
         )
 
+    settle = settle_seconds()
     item.skipped_no_target = await db.count_barrier_skipped(
-        logic_version=logic_version, horizon_h=horizon_h, now=now
+        logic_version=logic_version, horizon_h=horizon_h, now=now,
+        settle_seconds=settle,
     )
     candidates = await db.get_barrier_candidates(
-        logic_version=logic_version, horizon_h=horizon_h, now=now, recompute=recompute
+        logic_version=logic_version, horizon_h=horizon_h, now=now,
+        settle_seconds=settle, recompute=recompute,
     )
     item.candidates = len(candidates)
 
@@ -215,6 +250,7 @@ async def compute_horizon(
         written=item.written,
         deleted=item.deleted,
         skipped_no_target=item.skipped_no_target,
+        settle_seconds=settle,
         **{f"outcome_{k}": v for k, v in sorted(item.by_outcome.items())},
         **{f"resolution_{k}": v for k, v in sorted(item.by_resolution.items())},
     )

@@ -36,6 +36,13 @@ import sys
 import urllib.error
 import urllib.request
 
+# Единое место проекта для подписи клиента (Этап 8.10.1). Модуль намеренно
+# написан на одной стандартной библиотеке — иначе этот скрипт, работающий на
+# «голом» сервере до установки pip-пакетов, не смог бы его импортировать.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from src.core.http import exchange_headers  # noqa: E402
+
 # --- Параметры (можно переопределить переменными окружения) ---
 REST_URL = os.environ.get(
     "GEO_OKX_REST_URL",
@@ -73,7 +80,11 @@ def _log(msg: str) -> None:
 def check_rest() -> bool:
     """REST-проверка OKX. True — если получен корректный ответ 200 с данными."""
     _log(f"[REST] Запрос к OKX: {REST_URL}")
-    req = urllib.request.Request(REST_URL, headers={"User-Agent": "agent-trade-geocheck/1.0"})
+    # Подпись браузерная и общая с остальным проектом: своя честная подпись
+    # ``agent-trade-geocheck/1.0`` с 28.08.2026 получает от OKX 403/1010, то
+    # есть гео-тест провалился бы на исправном сервере и был бы прочитан как
+    # блокировка по региону — вывод, противоположный истине.
+    req = urllib.request.Request(REST_URL, headers=exchange_headers())
     try:
         with urllib.request.urlopen(req, timeout=REST_TIMEOUT) as resp:
             status = resp.getcode()
@@ -262,7 +273,7 @@ def check_websocket() -> bool:
 def _get_json(url: str) -> tuple[int, dict]:
     """GET с разбором JSON. Возвращает (код ответа, тело). Не бросает."""
     req = urllib.request.Request(
-        url, headers={"User-Agent": "agent-trade-geocheck/1.0"}
+        url, headers=exchange_headers()
     )
     try:
         with urllib.request.urlopen(req, timeout=REST_TIMEOUT) as resp:
