@@ -37,7 +37,7 @@ DECISION_EMOJI = {"buy": "🟢", "sell": "🔴", "wait": "⚪"}
 # Известные команды (для маршрутизации и подсказки в /help).
 KNOWN_COMMANDS = (
     "start", "help", "status", "last", "signal", "agents", "stats", "summary",
-    "settings",
+    "settings", "positions",
 )
 
 
@@ -198,6 +198,7 @@ def render_help() -> str:
         "/agents — что три агента думают прямо сейчас\n"
         "/stats [24h|7d|30d|all] — как система отрабатывает (по умолчанию 7d)\n"
         "/summary — суточная сводка по запросу\n"
+        "/positions — виртуальные позиции: открытые и итог за 7 дней\n"
         "/help — эта справка"
     )
 
@@ -614,6 +615,96 @@ def render_summary(
         "суточной сводке в 06:00 UTC."
     )
     return "\n".join(lines)
+
+
+def render_positions(
+    open_rows: list[dict[str, Any]],
+    summary: dict[str, Any],
+    now: datetime,
+    days: int = 7,
+) -> str:
+    """/positions: открытые виртуальные позиции и итог за окно (§10 ТЗ 9.1).
+
+    СЛОВО «ВИРТУАЛЬНО» СТОИТ В ЗАГОЛОВКЕ и убираться не должно, пока позиции
+    виртуальные: человек, открывший бота, не обязан помнить, какой этап проекта
+    сейчас идёт.
+
+    ВЫВОДА О ПРИБЫЛЬНОСТИ ЗДЕСЬ НЕТ И БЫТЬ НЕ ДОЛЖНО. На десятке позиций
+    разница без доверительного интервала — впечатление, а не измерение.
+    Печатаются числа; что они значат, решает не бот.
+    """
+    lines = [
+        "<b>💼 Виртуальные позиции (Этап 9.1)</b>",
+        "<i>Ордера на биржу не отправляются.</i>",
+        "",
+    ]
+
+    lines.append(f"<b>Открыто сейчас: {len(open_rows)}</b>")
+    if not open_rows:
+        lines.append("Открытых позиций нет.")
+    for row in open_rows:
+        left = row["deadline_at"] - now
+        left_txt = (
+            "срок истёк" if left.total_seconds() <= 0
+            else f"до срока {int(left.total_seconds() // 3600)} ч "
+                 f"{int(left.total_seconds() % 3600 // 60)} мин"
+        )
+        current = row.get("last_price")
+        unreal = row.get("unrealized_pct")
+        lines.append("")
+        lines.append(f"<b>{esc(row['symbol'])}</b> (сигнал #{int(row['signal_id'])})")
+        lines.append(
+            f"вход {esc(_num_str(row['entry_price']))} → "
+            f"сейчас {esc(_num_str(current)) if current is not None else '—'}"
+        )
+        lines.append(
+            "нереализованный итог с учётом издержек: "
+            + (_pct(unreal) if unreal is not None else "— (нет свежей свечи)")
+        )
+        lines.append(
+            f"цель {esc(_num_str(row['target_price']))} "
+            f"(+{float(row['target_pct']):.2f}%) · "
+            f"предел {esc(_num_str(row['stop_price']))} "
+            f"(−{float(row['stop_pct']):.2f}%)"
+        )
+        lines.append(left_txt)
+
+    closed = int(summary.get("closed") or 0)
+    lines.append("")
+    lines.append(f"<b>Закрыто за {days} дней: {closed}</b>")
+    if closed:
+        by_reason = summary.get("by_reason") or []
+        decoded = ", ".join(f"{esc(name)}: {n}" for name, n in by_reason) or "нет"
+        lines.append(f"По причинам выхода: {decoded}")
+        lines.append(f"Средний итог: {_pct(summary.get('avg_net_pnl_pct'))}")
+        total_usd = summary.get("sum_net_pnl_usd")
+        lines.append(
+            "Сумма итогов: "
+            + ("—" if total_usd is None else f"${float(total_usd):+.3f}")
+        )
+        # ОТДЕЛЬНОЙ СТРОКОЙ и только когда их больше нуля: у этих позиций цель и
+        # предел задеты в одной свече, порядок событий внутри минуты неизвестен,
+        # и итог взят по пределу — пессимистично.
+        uncertain = int(summary.get("uncertain") or 0)
+        if uncertain:
+            share = 100.0 * uncertain / closed
+            lines.append(
+                f"⚠ Из них с неопределённым порядком касаний: {uncertain} "
+                f"({share:.0f}%) — итог взят по пределу"
+            )
+    else:
+        lines.append("Закрытых позиций за окно нет.")
+
+    return "\n".join(lines)
+
+
+def _num_str(value: Any) -> str:
+    """Цена строкой. Знаков — по величине: у копеечных инструментов их больше."""
+    if value is None:
+        return "—"
+    value = float(value)
+    digits = 2 if abs(value) >= 100 else (4 if abs(value) >= 1 else 6)
+    return f"{value:,.{digits}f}".replace(",", " ")
 
 
 def _parse_iso(value: str | None) -> datetime | None:

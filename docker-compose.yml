@@ -115,6 +115,33 @@ services:
       retries: 3
       start_period: 20s
 
+  positions:
+    build: .
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # Этап 9.1: ведение одной позиции на инструмент, ВИРТУАЛЬНО (тот же образ,
+    # своя команда). Сервис ПОСТОЯННЫЙ, а не задача из cron: позиция
+    # закрывается по касанию внутри минуты, и суточный прогон пропустил бы и
+    # цель, и предел. Сеть наружу ему не нужна — он читает только собственные
+    # свечи из public.ohlcv и не читает ключи API биржи.
+    command: ["python", "-m", "src.positions_main"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-m", "src.healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   evaluator:
     build: .
     env_file: .env

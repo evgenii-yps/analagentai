@@ -522,3 +522,88 @@ class BotQueries:
         return await self._pool.fetchval(
             "SELECT pg_size_pretty(pg_database_size(current_database()));"
         )
+
+    # --- /positions (Этап 9.1 §10) ---
+
+    async def positions_open(self) -> list[dict[str, Any]]:
+        """Открытые позиции с ТЕКУЩЕЙ ценой инструмента.
+
+        Текущая цена — закрытие последней минутной свечи. Она подтягивается
+        боковым запросом (LATERAL), а не отдельным вызовом на каждую позицию:
+        позиций не больше пяти, но пять последовательных обращений к базе ради
+        пяти чисел — это пять сетевых задержек там, где достаточно одной.
+
+        Нереализованный итог считается ЗДЕСЬ ЖЕ и с вычетом издержек: без них
+        человек видел бы «+0.15%» у позиции, которая на самом деле в минусе,
+        потому что круговые издержки 0.22% ещё не заплачены только на бумаге.
+        """
+        rows = await self._pool.fetch(
+            """
+            SELECT p.id, p.symbol_id AS instrument_id, p.symbol, p.entry_price,
+                   p.target_price, p.stop_price, p.target_pct, p.stop_pct,
+                   p.cost_pct, p.opened_at, p.deadline_at, p.notional_usd,
+                   p.signal_id, p.last_price,
+                   CASE WHEN p.last_price IS NULL THEN NULL
+                        ELSE (p.last_price / p.entry_price - 1) * 100 - p.cost_pct
+                   END AS unrealized_pct
+            FROM (
+                SELECT pos.id, pos.instrument_id AS symbol_id, i.symbol,
+                       pos.entry_price, pos.target_price, pos.stop_price,
+                       pos.target_pct, pos.stop_pct, pos.cost_pct,
+                       pos.opened_at, pos.deadline_at, pos.notional_usd,
+                       pos.signal_id, last.close AS last_price
+                FROM positions pos
+                JOIN instruments i ON i.id = pos.instrument_id
+                LEFT JOIN LATERAL (
+                    SELECT o.close
+                    FROM ohlcv o
+                    WHERE o.instrument_id = pos.instrument_id
+                      AND o.timeframe = '1m'
+                    ORDER BY o.ts DESC
+                    LIMIT 1
+                ) last ON TRUE
+                WHERE pos.status = 'open'
+            ) p
+            ORDER BY p.opened_at ASC;
+            """
+        )
+        return [dict(r) for r in rows]
+
+    async def positions_summary(self, days: int = 7) -> dict[str, Any]:
+        """Итог по закрытым позициям за окно: счёт, разбивка, средние.
+
+        Число закрытий с ``outcome_certain = FALSE`` считается ОТДЕЛЬНО и
+        показывается отдельной строкой: у таких позиций итог взят по пределу
+        (пессимистично), потому что порядок событий внутри минуты неизвестен, —
+        и знать их долю нужно, иначе средний итог читался бы как измеренный,
+        а он частично оценочный.
+        """
+        row = await self._pool.fetchrow(
+            """
+            SELECT count(*) AS closed,
+                   count(*) FILTER (WHERE outcome_certain = FALSE) AS uncertain,
+                   avg(net_pnl_pct) AS avg_net_pnl_pct,
+                   sum(net_pnl_usd) AS sum_net_pnl_usd,
+                   avg(entry_slippage_pct) AS avg_slippage_pct
+            FROM positions
+            WHERE status = 'closed'
+              AND closed_at >= now() - make_interval(days => $1::int);
+            """,
+            int(days),
+        )
+        reasons = await self._pool.fetch(
+            """
+            SELECT exit_reason, count(*) AS n
+            FROM positions
+            WHERE status = 'closed'
+              AND closed_at >= now() - make_interval(days => $1::int)
+            GROUP BY exit_reason
+            ORDER BY n DESC;
+            """,
+            int(days),
+        )
+        summary = dict(row) if row is not None else {}
+        summary["by_reason"] = [
+            (str(r["exit_reason"]), int(r["n"])) for r in reasons
+        ]
+        return summary
