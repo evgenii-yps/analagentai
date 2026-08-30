@@ -239,6 +239,8 @@ class BotPoller:
             return await self._cmd_stats(args, now, chat_id)
         if cmd == "summary":
             return await self._cmd_summary(now)
+        if cmd == "positions":
+            return await self._cmd_positions(now)
         return handlers.render_unknown()
 
     async def _handle_callback(
@@ -447,6 +449,17 @@ class BotPoller:
         )
         db_size = await self.queries.db_size()
         return handlers.render_summary(hb_rows, data_counts, signal_counts, db_size, now)
+
+    async def _cmd_positions(self, now: datetime) -> str:
+        """/positions: виртуальные позиции (Этап 9.1 §10).
+
+        БОТ ОСТАЁТСЯ ТОЛЬКО НА ЧТЕНИЕ. Право записи у роли ``agenttrade_ro``
+        единственное — таблица ``user_settings``, — и этот этап его не
+        расширяет: команда ничего не открывает и не закрывает.
+        """
+        open_rows = await self.queries.positions_open()
+        summary = await self.queries.positions_summary(days=7)
+        return handlers.render_positions(open_rows, summary, now, days=7)
 
     async def _heartbeat(self) -> None:
         """Пишет в Redis отметку живости бота (bot:heartbeat, ISO, TTL 300)."""

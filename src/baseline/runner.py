@@ -48,7 +48,7 @@ from typing import Any
 import structlog
 
 from src.barrier.outcomes import resolve
-from src.barrier.runner import pick_series
+from src.barrier.runner import pick_series, settle_seconds
 from src.baseline.strategies import (
     COIN_FLIP,
     GRID_STRATEGIES,
@@ -330,8 +330,18 @@ async def compute_grid_strategies(
                 if price is None or price <= 0:
                     # Свечи ровно на этот час нет — входить не по чему.
                     continue
-                if entry_ts + timedelta(hours=horizon_h) > now:
-                    # Горизонт ещё не наступил: исхода не существует.
+                # ОКНО КОНЧАЕТСЯ БАРОМ, КОТОРЫЙ ОТКРЫВАЕТСЯ В МОМЕНТ СРОКА, а
+                # закрывается через целый бар после него. Пока он формируется,
+                # его close — цена «пока что», и коллектор перезапишет её
+                # следующим опросом (UPSERT с DO UPDATE); исход timeout берёт
+                # итог именно из этого close. Запас берётся из ОДНОГО места с
+                # Этапом 8.10.1 (settle_seconds), а не переписывается формулой:
+                # две копии одного правила разошлись бы при следующей правке, и
+                # разошлись бы молча.
+                if entry_ts + timedelta(
+                    hours=horizon_h, seconds=settle_seconds()
+                ) > now:
+                    # Горизонт ещё не наступил ЛИБО последний бар окна не закрыт.
                     continue
                 used += 1
                 stats.grid_entries += 1

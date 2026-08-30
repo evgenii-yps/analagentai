@@ -1136,6 +1136,95 @@ class DB:
         )
         return int(status.rsplit(" ", 1)[-1]) if status else 0
 
+    # --- Починка строк, посчитанных по незакрытому бару (Этап 9.1, Задача Б) ---
+    #
+    # ПРИЗНАК ИСПОРЧЕННОЙ СТРОКИ ОДИН: расчёт произошёл РАНЬШЕ, чем закрылся
+    # последний бар окна. До Этапа 9.1 сеточные стратегии считали годность
+    # входа условием «срок наступил», без ожидания закрытия последнего бара
+    # (см. src/baseline/runner.py). Такая строка получила итог из ``close``
+    # ещё формировавшейся свечи — цены «пока что», которую коллектор
+    # перезаписал следующим опросом.
+    #
+    # ПЕРЕПИСАТЬ ЕЁ НЕЛЬЗЯ НИКАКИМ ПОСЛЕДУЮЩИМ ПРОГОНОМ: запись идёт через
+    # ON CONFLICT DO NOTHING, а ключи уже посчитанных строк отсеиваются до
+    # чтения окна (get_strategy_pairs_done). Поэтому единственный способ
+    # пересчитать — сначала удалить.
+
+    STRATEGY_UNSETTLED_PREDICATE = (
+        "computed_at < entry_ts "
+        "+ make_interval(hours => horizon_h::int) "
+        "+ make_interval(secs => $1::int)"
+    )
+
+    async def count_strategy_outcomes_unsettled(
+        self, *, settle_seconds: int
+    ) -> int:
+        """Сколько строк посчитано раньше, чем закрылся последний бар окна."""
+        value = await self.pool.fetchval(
+            "SELECT count(*) FROM strategy_outcomes "
+            f"WHERE {self.STRATEGY_UNSETTLED_PREDICATE};",
+            int(settle_seconds),
+        )
+        return int(value or 0)
+
+    async def get_strategy_outcomes_unsettled(
+        self, *, settle_seconds: int, limit: int | None = None
+    ) -> list[dict[str, Any]]:
+        """Подозрительные строки целиком — для разбивок и примеров в отчёте."""
+        query = (
+            "SELECT strategy, instrument_id, entry_ts, horizon_h, computed_at, "
+            "       outcome, net_pnl_pct, logic_version "
+            "FROM strategy_outcomes "
+            f"WHERE {self.STRATEGY_UNSETTLED_PREDICATE} "
+            "ORDER BY entry_ts DESC, strategy ASC"
+        )
+        args: list[Any] = [int(settle_seconds)]
+        if limit is not None:
+            query += " LIMIT $2"
+            args.append(int(limit))
+        rows = await self.pool.fetch(query + ";", *args)
+        return [dict(r) for r in rows]
+
+    async def delete_strategy_outcomes_unsettled(
+        self, *, settle_seconds: int
+    ) -> int:
+        """Удаляет ТОЛЬКО подозрительные строки. Возвращает число удалённых.
+
+        Пересчёт этот метод НЕ выполняет и выполнять не должен: удалённые ключи
+        исчезают из множества «уже посчитано», и очередной штатный прогон
+        базовых стратегий посчитает их заново — уже исправленным правилом
+        годности. Отдельный путь пересчёта означал бы второй код, считающий то
+        же самое, и однажды он разошёлся бы со штатным.
+        """
+        status = await self.pool.execute(
+            "DELETE FROM strategy_outcomes "
+            f"WHERE {self.STRATEGY_UNSETTLED_PREDICATE};",
+            int(settle_seconds),
+        )
+        return int(status.rsplit(" ", 1)[-1]) if status else 0
+
+    async def get_strategy_stats_snapshot(self) -> list[dict[str, Any]]:
+        """Снимок «до/после» по каждой паре (стратегия, горизонт).
+
+        Три величины на пару: число строк, доля исходов ``target`` и средний
+        ``net_pnl_pct``. Строки без итога (``no_data``, ``ambiguous``) в среднее
+        не входят — среднее по неизвестному не определено, — но в общее число
+        строк входят: иначе по снимку нельзя было бы понять, изменился ли
+        состав выборки или только её среднее.
+        """
+        rows = await self.pool.fetch(
+            """
+            SELECT strategy, horizon_h,
+                   count(*) AS rows,
+                   count(*) FILTER (WHERE outcome = 'target') AS targets,
+                   avg(net_pnl_pct) AS avg_net_pnl_pct
+            FROM strategy_outcomes
+            GROUP BY strategy, horizon_h
+            ORDER BY strategy ASC, horizon_h ASC;
+            """
+        )
+        return [dict(r) for r in rows]
+
     async def get_strategy_pairs_done(
         self, *, logic_version: int
     ) -> set[tuple[str, int, datetime, int]]:
@@ -1154,6 +1243,295 @@ class DB:
             (r["strategy"], r["instrument_id"], r["entry_ts"], r["horizon_h"])
             for r in rows
         }
+
+    # --- Ведение одной позиции, ВИРТУАЛЬНО (Этап 9.1) ---
+
+    async def ensure_positions_schema(self) -> None:
+        """Идемпотентно создаёт таблицу позиций (миграция 018).
+
+        ДВА ИНДЕКСА ЗДЕСЬ — НЕ УСКОРЕНИЕ, А ПРАВИЛО ЭТАПА, ЗАПИСАННОЕ БАЗОЙ.
+        Проверка «нет открытой позиции» в коде переживает ровно до первой
+        гонки: сервис перезапустили, две итерации наложились — и позиций стало
+        две. База такого не допустит вовсе.
+        """
+        await self.pool.execute(POSITIONS_DDL)
+        await self.pool.execute(POSITIONS_CHECKS)
+        await self.pool.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_positions_one_open_per_instrument "
+            "ON positions (instrument_id) WHERE status = 'open';"
+        )
+        await self.pool.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_positions_signal "
+            "ON positions (signal_id);"
+        )
+        await self.pool.execute(
+            "CREATE INDEX IF NOT EXISTS ix_positions_status_opened "
+            "ON positions (status, opened_at DESC);"
+        )
+        # Роль только на чтение (сервис бота) должна видеть таблицу сразу:
+        # её GRANT ON ALL TABLES отработал, когда таблицы ещё не было, и без
+        # явного права бот молча перестал бы отвечать на /positions.
+        await self.pool.execute(
+            """
+            DO $$
+            BEGIN
+                IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agenttrade_ro') THEN
+                    GRANT SELECT ON positions TO agenttrade_ro;
+                END IF;
+            END $$;
+            """
+        )
+
+    async def get_position_candidates(
+        self,
+        *,
+        logic_version: int,
+        horizon_h: int,
+        min_probability: float,
+        max_signal_age_sec: int,
+        now: datetime,
+    ) -> list[dict[str, Any]]:
+        """Сигналы-кандидаты на открытие позиции (§4.1 ТЗ 9.1).
+
+        УСЛОВИЯ ВЫРАЖЕНЫ В ЗАПРОСЕ, А НЕ В КОДЕ ПОВЕРХ НЕГО. Иначе сервис тянул
+        бы все сигналы за сутки, чтобы отбросить 99% из них в питоне, и — что
+        хуже — правило отбора существовало бы в двух местах: в запросе, который
+        «примерно» сужает выборку, и в коде, который решает на самом деле.
+
+        ЗДЕСЬ ПРОВЕРЯЕТСЯ ШЕСТЬ УСЛОВИЙ ИЗ ДЕВЯТИ: решение, версия логики,
+        полнота кворума (``degraded = FALSE`` — это и есть признак полного
+        состава трёх агентов, его ставит сам decision), порог вероятности,
+        возраст сигнала и наличие ЗАМОРОЖЕННОЙ цели на нужный горизонт. Плюс
+        два условия единственности: по инструменту нет открытой позиции и по
+        этому сигналу позиция НИКОГДА не открывалась.
+
+        Оставшееся условие — свежая закрытая свеча — в запрос НЕ вносится: оно
+        требует чтения ряда с учётом запаса на закрытие бара, и попытка выразить
+        его здесь превратила бы отбор в соединение с ``ohlcv`` ради одной
+        строки на инструмент.
+
+        ЦЕНА РЕШЕНИЯ БЕРЁТСЯ ИЗ ``signal_targets.price_at_signal``, а не из
+        ``signals``: в ``signals`` цены нет вовсе, и именно замороженная строка
+        хранит ту цену, от которой система назвала цель человеку.
+
+        ОТБОР НЕ СМОТРИТ НА ``notified``. У уведомлений своя защита от потока —
+        она бережёт внимание человека, а не моделирует торговлю; привязка
+        позиций к отправке внесла бы в замер ограничения, не имеющие отношения
+        к рынку.
+        """
+        rows = await self.pool.fetch(
+            """
+            SELECT s.id AS signal_id, s.instrument_id, s.ts AS signal_ts,
+                   s.decision, s.probability, s.degraded, s.logic_version,
+                   t.price_at_signal, t.target_pct,
+                   i.symbol,
+                   EXTRACT(EPOCH FROM ($5::timestamptz - s.ts)) AS age_sec
+            FROM signals s
+            JOIN signal_targets t
+              ON t.signal_id = s.id AND t.horizon_h = $2
+            JOIN instruments i ON i.id = s.instrument_id
+            WHERE s.decision = 'buy'
+              AND s.logic_version = $1
+              AND s.degraded = FALSE
+              AND s.probability IS NOT NULL
+              AND s.probability >= $3
+              AND t.target_pct IS NOT NULL
+              AND t.price_at_signal > 0
+              AND s.ts >= $5::timestamptz - make_interval(secs => $4::int)
+              AND NOT EXISTS (
+                    SELECT 1 FROM positions p WHERE p.signal_id = s.id
+              )
+              AND NOT EXISTS (
+                    SELECT 1 FROM positions p
+                    WHERE p.instrument_id = s.instrument_id
+                      AND p.status = 'open'
+              )
+            ORDER BY s.ts DESC, s.id DESC;
+            """,
+            int(logic_version), int(horizon_h), float(min_probability),
+            int(max_signal_age_sec), now,
+        )
+        return [dict(r) for r in rows]
+
+    async def count_open_positions(self) -> int:
+        """Сколько слотов занято прямо сейчас."""
+        value = await self.pool.fetchval(
+            "SELECT count(*) FROM positions WHERE status = 'open';"
+        )
+        return int(value or 0)
+
+    async def get_open_positions(self) -> list[dict[str, Any]]:
+        """Все открытые позиции с символом инструмента, старейшие первыми."""
+        rows = await self.pool.fetch(
+            """
+            SELECT p.*, i.symbol
+            FROM positions p
+            JOIN instruments i ON i.id = p.instrument_id
+            WHERE p.status = 'open'
+            ORDER BY p.opened_at ASC;
+            """
+        )
+        return [dict(r) for r in rows]
+
+    async def get_last_closed_bar(
+        self, instrument_id: int, timeframe: str, not_after: datetime
+    ) -> dict[str, Any] | None:
+        """Последняя свеча, ОТКРЫВШАЯСЯ не позже ``not_after``.
+
+        Границу «что считается закрытым» задаёт вызывающий, передавая
+        ``not_after`` уже с вычтенным запасом: коллектор перезаписывает
+        формирующуюся свечу (UPSERT с DO UPDATE), и бар, взятый в момент его
+        закрытия, ещё может измениться. Прятать этот запас внутрь запроса
+        нельзя — тогда правило существовало бы в двух местах.
+        """
+        row = await self.pool.fetchrow(
+            """
+            SELECT ts, open, high, low, close
+            FROM ohlcv
+            WHERE instrument_id = $1 AND timeframe = $2 AND ts <= $3
+            ORDER BY ts DESC
+            LIMIT 1;
+            """,
+            int(instrument_id), str(timeframe), not_after,
+        )
+        return dict(row) if row is not None else None
+
+    async def open_position(self, row: dict[str, Any]) -> int | None:
+        """Открывает позицию. ``None`` означает «кто-то опередил», а не сбой.
+
+        ГОНКА ЗАКРЫВАЕТСЯ БАЗОЙ. Нарушение ``ux_positions_one_open_per_instrument``
+        или ``ux_positions_signal`` — это ШТАТНЫЙ исход: две итерации сервиса
+        наложились (перезапуск, длинная итерация), и вторая обязана уступить,
+        а не уронить весь цикл. Возвращённый ``None`` вызывающий пишет в журнал
+        ключом ``positions_race_skipped=1``.
+        """
+        try:
+            value = await self.pool.fetchval(
+                """
+                INSERT INTO positions
+                    (instrument_id, signal_id, logic_version, horizon_h, side,
+                     is_virtual, status, signal_ts, signal_price, opened_at,
+                     entry_price, entry_lag_sec, entry_slippage_pct, qty,
+                     notional_usd, target_pct, target_price, stop_pct,
+                     stop_price, cost_pct, deadline_at, last_checked_ts,
+                     resolution)
+                VALUES ($1, $2, $3, $4, $5, TRUE, 'open', $6, $7, $8, $9, $10,
+                        $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+                RETURNING id;
+                """,
+                int(row["instrument_id"]),
+                int(row["signal_id"]),
+                int(row["logic_version"]),
+                int(row["horizon_h"]),
+                str(row["side"]),
+                row["signal_ts"],
+                _num(row["signal_price"]),
+                row["opened_at"],
+                _num(row["entry_price"]),
+                int(row["entry_lag_sec"]),
+                _num(row["entry_slippage_pct"]),
+                _num(row["qty"]),
+                _num(row["notional_usd"]),
+                _num(row["target_pct"]),
+                _num(row["target_price"]),
+                _num(row["stop_pct"]),
+                _num(row["stop_price"]),
+                _num(row["cost_pct"]),
+                row["deadline_at"],
+                row.get("last_checked_ts"),
+                str(row["resolution"]),
+            )
+            return int(value) if value is not None else None
+        except asyncpg.UniqueViolationError:
+            return None
+
+    async def touch_position(
+        self, position_id: int, last_checked_ts: datetime
+    ) -> None:
+        """Двигает отметку «докуда разобрано». Позиция остаётся открытой."""
+        await self.pool.execute(
+            "UPDATE positions SET last_checked_ts = $2, updated_at = now() "
+            "WHERE id = $1;",
+            int(position_id), last_checked_ts,
+        )
+
+    async def close_position(
+        self,
+        position_id: int,
+        *,
+        closed_at: datetime,
+        exit_price: float,
+        exit_reason: str,
+        outcome_certain: bool,
+        net_pnl_pct: float,
+        net_pnl_usd: float,
+        bars_held: int,
+        mae_pct: float,
+        mfe_pct: float,
+        last_checked_ts: datetime,
+    ) -> bool:
+        """Закрывает позицию ОДНИМ UPDATE. Возвращает, изменилась ли строка.
+
+        Условие ``status = 'open'`` в запросе обязательно: закрыть уже закрытую
+        позицию значило бы переписать её итог задним числом, и сделала бы это
+        итерация, которая просто отстала. Ноль изменённых строк — это ответ
+        «уже закрыта», а не ошибка.
+        """
+        status = await self.pool.execute(
+            """
+            UPDATE positions
+               SET status = 'closed', closed_at = $2, exit_price = $3,
+                   exit_reason = $4, outcome_certain = $5, net_pnl_pct = $6,
+                   net_pnl_usd = $7, bars_held = $8, mae_pct = $9,
+                   mfe_pct = $10, last_checked_ts = $11, updated_at = now()
+             WHERE id = $1 AND status = 'open';
+            """,
+            int(position_id), closed_at, _num(exit_price), str(exit_reason),
+            bool(outcome_certain), _num(net_pnl_pct), _num(net_pnl_usd),
+            int(bars_held), _num(mae_pct), _num(mfe_pct), last_checked_ts,
+        )
+        return bool(status and status.rsplit(" ", 1)[-1] != "0")
+
+    async def get_positions_summary(self, *, days: int = 7) -> dict[str, Any]:
+        """Итог по закрытым позициям за окно — для бота (§10) и отчёта.
+
+        Средний ``net_pnl_pct`` и сумма ``net_pnl_usd`` считаются по ВСЕМ
+        закрытым позициям окна, включая ``ambiguous``: у тех итог определён (он
+        взят по пределу, пессимистично), просто менее достоверен. Их число
+        печатается ОТДЕЛЬНОЙ строкой — так видно, велика ли их доля, и при этом
+        средний итог не оказывается посчитанным по выборке, отличной от той,
+        которую человек видит в разбивке по причинам.
+        """
+        row = await self.pool.fetchrow(
+            """
+            SELECT count(*) AS closed,
+                   count(*) FILTER (WHERE outcome_certain = FALSE) AS uncertain,
+                   avg(net_pnl_pct) AS avg_net_pnl_pct,
+                   sum(net_pnl_usd) AS sum_net_pnl_usd,
+                   avg(entry_slippage_pct) AS avg_slippage_pct,
+                   avg(entry_lag_sec) AS avg_lag_sec
+            FROM positions
+            WHERE status = 'closed'
+              AND closed_at >= now() - make_interval(days => $1::int);
+            """,
+            int(days),
+        )
+        reasons = await self.pool.fetch(
+            """
+            SELECT exit_reason, count(*) AS n
+            FROM positions
+            WHERE status = 'closed'
+              AND closed_at >= now() - make_interval(days => $1::int)
+            GROUP BY exit_reason
+            ORDER BY n DESC;
+            """,
+            int(days),
+        )
+        summary = dict(row) if row is not None else {}
+        summary["by_reason"] = {
+            str(r["exit_reason"]): int(r["n"]) for r in reasons
+        }
+        return summary
 
     # --- Подвижный выход (Этап 8.10) ---
 
@@ -2343,6 +2721,109 @@ END $$;
 # запрос — чистый INSERT без UPDATE в конфликте. ``DO NOTHING`` нужен на случай
 # повторной попытки записи того же сигнала после сбоя сети: он оставляет
 # ПЕРВУЮ версию строки, а не переписывает её второй.
+# --- Этап 9.1 §5: ведение одной позиции (ВИРТУАЛЬНО) ---
+#
+# Схема повторяет миграцию 018_positions.sql по той же причине, что и четыре
+# предыдущие таблицы: сервис гарантирует свою схему при старте, потому что
+# миграция могла быть не применена на уже работающем томе. Расхождение этих
+# двух описаний ловит deploy/schema_drift.sh.
+POSITIONS_DDL = """
+CREATE TABLE IF NOT EXISTS positions (
+    id                  BIGSERIAL PRIMARY KEY,
+    instrument_id       INT           NOT NULL REFERENCES instruments(id),
+    signal_id           BIGINT        NOT NULL REFERENCES signals(id),
+    logic_version       SMALLINT      NOT NULL,
+    horizon_h           SMALLINT      NOT NULL,
+    side                TEXT          NOT NULL,
+    is_virtual          BOOLEAN       NOT NULL DEFAULT TRUE,
+    status              TEXT          NOT NULL,
+    signal_ts           TIMESTAMPTZ   NOT NULL,
+    signal_price        NUMERIC(20,8) NOT NULL,
+    opened_at           TIMESTAMPTZ   NOT NULL,
+    entry_price         NUMERIC(20,8) NOT NULL,
+    entry_lag_sec       INTEGER       NOT NULL,
+    entry_slippage_pct  NUMERIC(12,6) NOT NULL,
+    qty                 NUMERIC(28,12) NOT NULL,
+    notional_usd        NUMERIC(12,4) NOT NULL,
+    target_pct          NUMERIC(10,6) NOT NULL,
+    target_price        NUMERIC(20,8) NOT NULL,
+    stop_pct            NUMERIC(10,6) NOT NULL,
+    stop_price          NUMERIC(20,8) NOT NULL,
+    cost_pct            NUMERIC(10,6) NOT NULL,
+    deadline_at         TIMESTAMPTZ   NOT NULL,
+    last_checked_ts     TIMESTAMPTZ,
+    closed_at           TIMESTAMPTZ,
+    exit_price          NUMERIC(20,8),
+    exit_reason         TEXT,
+    outcome_certain     BOOLEAN,
+    net_pnl_pct         NUMERIC(12,6),
+    net_pnl_usd         NUMERIC(14,6),
+    bars_held           INTEGER,
+    mae_pct             NUMERIC(12,6),
+    mfe_pct             NUMERIC(12,6),
+    resolution          TEXT          NOT NULL,
+    created_at          TIMESTAMPTZ   NOT NULL DEFAULT now(),
+    updated_at          TIMESTAMPTZ   NOT NULL DEFAULT now()
+);
+"""
+
+POSITIONS_CHECKS = """
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'positions_side_chk') THEN
+        ALTER TABLE positions
+            ADD CONSTRAINT positions_side_chk CHECK (side = 'buy');
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'positions_status_chk') THEN
+        ALTER TABLE positions
+            ADD CONSTRAINT positions_status_chk
+            CHECK (status IN ('open', 'closed'));
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'positions_reason_chk') THEN
+        ALTER TABLE positions
+            ADD CONSTRAINT positions_reason_chk
+            CHECK (exit_reason IS NULL OR exit_reason IN
+                   ('target', 'stop', 'timeout', 'ambiguous'));
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'positions_resolution_chk') THEN
+        ALTER TABLE positions
+            ADD CONSTRAINT positions_resolution_chk CHECK (resolution = '1m');
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'positions_bounds_chk') THEN
+        ALTER TABLE positions
+            ADD CONSTRAINT positions_bounds_chk
+            CHECK (horizon_h > 0 AND entry_price > 0
+                   AND signal_price > 0 AND stop_pct > 0
+                   AND qty > 0 AND notional_usd > 0
+                   AND logic_version > 0);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'positions_shape_chk') THEN
+        ALTER TABLE positions
+            ADD CONSTRAINT positions_shape_chk
+            CHECK (
+                CASE status
+                    WHEN 'open'   THEN closed_at IS NULL AND exit_price IS NULL
+                                       AND exit_reason IS NULL
+                                       AND net_pnl_pct IS NULL
+                                       AND outcome_certain IS NULL
+                    ELSE               closed_at IS NOT NULL
+                                       AND exit_price IS NOT NULL
+                                       AND exit_reason IS NOT NULL
+                                       AND net_pnl_pct IS NOT NULL
+                                       AND outcome_certain IS NOT NULL
+                END
+            );
+    END IF;
+END $$;
+"""
+
+
 SIGNAL_TARGET_INSERT = """
     INSERT INTO signal_targets
         (signal_id, horizon_h, direction, price_at_signal, target_pct,
