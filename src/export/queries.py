@@ -183,6 +183,27 @@ async def apply_migrations(conn: asyncpg.Connection) -> None:
         "ALTER TABLE signals ADD COLUMN IF NOT EXISTS is_repeat BOOLEAN NOT NULL "
         "DEFAULT FALSE;"
     )
+    # Отметки о записи позиции в торговый журнал (Этап 9.1.2, миграция 020).
+    # Причина та же, что у колонок выше: выгрузка держит СВОЙ пул и запускается
+    # одноразовым контейнером из cron — она может прийти на том, где миграцию
+    # ещё не применяли, и SELECT по отсутствующей колонке упал бы. Таблицы
+    # positions при этом может не быть вовсе (Этап 9.1 не развёрнут), поэтому
+    # ALTER выполняется только при её наличии.
+    if await conn.fetchval("SELECT to_regclass('positions') IS NOT NULL;"):
+        await conn.execute(
+            "ALTER TABLE positions "
+            "ADD COLUMN IF NOT EXISTS sheet_opened_at TIMESTAMPTZ;"
+        )
+        await conn.execute(
+            "ALTER TABLE positions "
+            "ADD COLUMN IF NOT EXISTS sheet_closed_at TIMESTAMPTZ;"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS positions_sheet_pending_idx "
+            "ON positions (opened_at) "
+            "WHERE sheet_opened_at IS NULL "
+            "OR (status = 'closed' AND sheet_closed_at IS NULL);"
+        )
 
 
 async def fetch_unexported_for_sheets(
@@ -437,3 +458,152 @@ async def count_exported(conn: asyncpg.Connection, target: str) -> int:
         )
         or 0
     )
+
+
+# ===========================================================================
+# ЭТАП 9.1.2. Торговый журнал: очередь на запись и отметки
+# ===========================================================================
+
+# Поля, нужные обоим сборщикам строк (открытие и закрытие) и заметке. Список
+# один на две выборки: разойдись они — заметка открытия и заметка закрытия
+# считались бы по разным наборам полей, и расхождение вылезло бы в листе.
+_POSITION_COLUMNS = """
+    p.id, p.signal_id, i.symbol, p.side, p.status,
+    p.signal_ts, p.opened_at, p.entry_price, p.notional_usd,
+    p.entry_lag_sec, p.target_price, p.target_pct,
+    p.stop_price, p.stop_pct, p.cost_pct,
+    p.closed_at, p.exit_price, p.exit_reason,
+    p.net_pnl_pct, p.net_pnl_usd, p.outcome_certain,
+    p.sheet_opened_at, p.sheet_closed_at,
+    s.probability
+"""
+
+_POSITION_JOINS = """
+    FROM positions p
+    JOIN instruments i ON i.id = p.instrument_id
+    LEFT JOIN signals s ON s.id = p.signal_id
+"""
+
+
+async def positions_table_exists(conn: asyncpg.Connection) -> bool:
+    """Есть ли таблица позиций вообще (Этап 9.1 мог быть не развёрнут).
+
+    Отсутствие таблицы — не ошибка выгрузки: сигналы выгружаются и без позиций.
+    Молча падать на ``SELECT ... FROM positions`` было бы худшим ответом на
+    вопрос «а есть ли что выгружать».
+    """
+    return bool(
+        await conn.fetchval("SELECT to_regclass('positions') IS NOT NULL;")
+    )
+
+
+async def fetch_positions_pending_open(
+    conn: asyncpg.Connection, batch_size: int
+) -> list[dict[str, Any]]:
+    """Позиции без отметки открытия — строки для них ещё не созданы.
+
+    ПОРЯДОК ПО ``opened_at`` ПО ВОЗРАСТАНИЮ, и он содержателен: строки ложатся в
+    лист в том же порядке, в каком сделки случались. Обратный порядок дал бы
+    журнал, читающийся снизу вверх, — и любой ручной просмотр «что было вчера»
+    начинался бы с выяснения, как этот лист вообще отсортирован.
+
+    ОТКРЫТЫЕ ПОЗИЦИИ ВХОДЯТ В ВЫБОРКУ НАРАВНЕ С ЗАКРЫТЫМИ. В этом всё отличие
+    от прежней редакции: сделка видна в листе, пока она ещё идёт, а не только
+    после того, как кончилась.
+    """
+    rows = await conn.fetch(
+        f"""
+        SELECT {_POSITION_COLUMNS}
+        {_POSITION_JOINS}
+        WHERE p.sheet_opened_at IS NULL
+        ORDER BY p.opened_at ASC, p.id ASC
+        LIMIT $1;
+        """,
+        int(batch_size),
+    )
+    return [dict(r) for r in rows]
+
+
+async def fetch_positions_pending_close(
+    conn: asyncpg.Connection, batch_size: int
+) -> list[dict[str, Any]]:
+    """Закрытые позиции без отметки закрытия — выход ещё не дописан.
+
+    УСЛОВИЕ ``sheet_opened_at IS NOT NULL`` СТОИТ ЗДЕСЬ НАМЕРЕННО, и это
+    сознательное ужесточение §6 ТЗ («выборка закрытых без отметки закрытия»).
+    Без него позиция, чья строка открытия НЕ записалась (сбой сети в этом же
+    прогоне), попала бы в дозапись, получила бы от приёмника ``notFound``, и
+    клиент создал бы ей полную строку. А следующий прогон увидел бы её ещё раз
+    в выборке ОТКРЫТИЙ — отметки-то нет — и создал бы ВТОРУЮ строку той же
+    сделки. Условие закрывает этот путь: открытия идут первыми в том же
+    прогоне, поэтому нормальный случай «открылась и закрылась между прогонами»
+    по-прежнему обрабатывается за один проход.
+    """
+    rows = await conn.fetch(
+        f"""
+        SELECT {_POSITION_COLUMNS}
+        {_POSITION_JOINS}
+        WHERE p.status = 'closed'
+          AND p.sheet_closed_at IS NULL
+          AND p.sheet_opened_at IS NOT NULL
+        ORDER BY p.closed_at ASC, p.id ASC
+        LIMIT $1;
+        """,
+        int(batch_size),
+    )
+    return [dict(r) for r in rows]
+
+
+async def mark_positions_sheet_opened(
+    conn: asyncpg.Connection, position_ids: list[int]
+) -> None:
+    """Отметка «строка создана» — ВСЕЙ ПАЧКЕ ОДНИМ UPDATE.
+
+    Один запрос, а не N: отметка ставится ПОСЛЕ подтверждённой записи всей
+    пачки, и ставить её по одной значило бы допустить состояние, в котором часть
+    пачки отмечена, а часть нет, — при том что в листе записано всё.
+
+    ``WHERE sheet_opened_at IS NULL`` делает вызов идемпотентным: повторная
+    отметка не переписала бы момент ПЕРВОЙ записи вторым, и по колонке
+    по-прежнему можно сказать, когда строка попала в лист.
+    """
+    if not position_ids:
+        return
+    await conn.execute(
+        "UPDATE positions SET sheet_opened_at = now(), updated_at = now() "
+        "WHERE id = ANY($1::bigint[]) AND sheet_opened_at IS NULL;",
+        [int(pid) for pid in position_ids],
+    )
+
+
+async def mark_positions_sheet_closed(
+    conn: asyncpg.Connection, position_ids: list[int]
+) -> None:
+    """Отметка «выход дописан» — всей пачке одним UPDATE, идемпотентно."""
+    if not position_ids:
+        return
+    await conn.execute(
+        "UPDATE positions SET sheet_closed_at = now(), updated_at = now() "
+        "WHERE id = ANY($1::bigint[]) AND sheet_closed_at IS NULL;",
+        [int(pid) for pid in position_ids],
+    )
+
+
+async def count_positions_pending(conn: asyncpg.Connection) -> tuple[int, int]:
+    """Сколько позиций ждёт записи открытия и сколько — дозаписи закрытия.
+
+    Для строки алерта: «не выгружено столько-то» без разбивки на два вида
+    заставляло бы гадать, что именно застряло.
+    """
+    if not await positions_table_exists(conn):
+        return (0, 0)
+    row = await conn.fetchrow(
+        """
+        SELECT count(*) FILTER (WHERE sheet_opened_at IS NULL) AS to_open,
+               count(*) FILTER (WHERE status = 'closed'
+                                AND sheet_closed_at IS NULL
+                                AND sheet_opened_at IS NOT NULL) AS to_close
+        FROM positions;
+        """
+    )
+    return (int(row["to_open"]), int(row["to_close"]))

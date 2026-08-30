@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -43,6 +43,18 @@ class SheetsResult:
     # Версия развёрнутого приёмника из его ответа (Этап 8.4.1). None означает
     # «приёмник версию не сообщил» — то есть развёрнута версия до 8.4.1.
     receiver_version: str | None = None
+    # --- Этап 9.1.2, режимы торгового журнала ---
+    # Сколько строк ДОСТРОЕНО (table_update), номер первой созданной строки
+    # (table_append) — по нему видно, куда именно легла пачка.
+    updated: int = 0
+    start_row: int | None = None
+    # Предупреждение приёмника при ok=true. Сегодня оно одно: формулы протянуть
+    # было неоткуда. Это НЕ ошибка (строки записаны), но и не мелочь: строка без
+    # формул выглядит записанной и не считается никак.
+    warning: str | None = None
+    # Метки, для которых строка в листе не нашлась. Приёмник не угадывает
+    # строку, а возвращает метку сюда; что с ней делать, решает вызывающий.
+    not_found: list[str] = field(default_factory=list)
 
 
 def normalize_batch(
@@ -85,22 +97,55 @@ async def post_rows(
     mode: str,
     rows: list[list[Any]],
     header: list[str] | None = None,
+    *,
+    notes: list[str] | None = None,
+    note_column: int | None = None,
+    totals_marker: str | None = None,
+    formula_from_column: int | None = None,
+    updates: list[dict[str, Any]] | None = None,
 ) -> SheetsResult:
     """POST пачки строк на Apps Script с таймаутом и повторами (5/15/45 сек).
 
     Возвращает :class:`SheetsResult`. Исключений не бросает — сеть/HTTP/парсинг
     ошибки сворачиваются в ``ok=False`` с текстом причины.
+
+    ЧЕТЫРЕ РЕЖИМА, И ДВА ИЗ НИХ ОСТОРОЖНЕЕ ОСТАЛЬНЫХ:
+
+    * ``append`` и ``replace`` (Этап 6.6) — служебные листы выгрузки, целиком
+      наши: их можно и создать, и переписать;
+    * ``table_append`` и ``table_update`` (Этап 9.1.2) — торговый журнал, лист
+      ВЛАДЕЛЬЦА с его формулами. Заголовок в него не отправляется: он там уже
+      есть, и посылать свой значило бы переписать чужую строку 1.
+
+    ``notes``/``note_column``/``totals_marker``/``formula_from_column`` — поля
+    ``table_append``; ``updates`` — поле ``table_update``. Лишние поля в других
+    режимах не отправляются вовсе: приёмник их проигнорировал бы, но запрос,
+    несущий бессмысленные поля, вводит в заблуждение того, кто смотрит журнал.
     """
-    # Выравнивание ширины ДО отправки (Этап 8.4.1) — см. модульный докстринг.
-    rows, header = normalize_batch(rows, header)
     payload: dict[str, Any] = {
         "secret": secret,
         "sheet": sheet,
         "mode": mode,
-        "rows": rows,
     }
-    if header is not None:
-        payload["header"] = header
+    if mode == "table_update":
+        # Строк здесь нет вовсе: дозапись адресуется метками, а не порядком.
+        payload["updates"] = updates or []
+        if note_column is not None:
+            payload["noteColumn"] = note_column
+    else:
+        # Выравнивание ширины ДО отправки (Этап 8.4.1) — см. модульный докстринг.
+        rows, header = normalize_batch(rows, header)
+        payload["rows"] = rows
+        if header is not None:
+            payload["header"] = header
+        if notes is not None:
+            payload["notes"] = notes
+        if note_column is not None:
+            payload["noteColumn"] = note_column
+        if totals_marker is not None:
+            payload["totalsMarker"] = totals_marker
+        if formula_from_column is not None:
+            payload["formulaFromColumn"] = formula_from_column
 
     last_error = "неизвестная ошибка"
     for attempt, delay in enumerate((0.0, *_RETRY_DELAYS)):
@@ -130,19 +175,39 @@ async def post_rows(
 
         if body.get("ok") is True:
             version = body.get("version")
+            warning = body.get("warning")
+            not_found = [str(item) for item in (body.get("notFound") or [])]
             # Версию печатаем всегда: по ней владелец видит в журнале, что
             # развёрнутая на стороне Google версия приёмника действительно
             # обновилась. Её отсутствие — признак версии до 8.4.1.
             _log.info(
                 "Sheets: пачка принята",
                 sheet=sheet,
+                mode=mode,
                 rows=len(rows),
+                updated=int(body.get("updated", 0)),
                 receiver_version=version or "до 8.4.1 (версию не сообщает)",
             )
+            if warning:
+                # ПРЕДУПРЕЖДЕНИЕ ПРИ ok=true ПЕЧАТАЕТСЯ УРОВНЕМ warning, а не
+                # тонет в info: сегодня оно означает «строки записаны, но
+                # формулы протянуть было неоткуда», и такая строка выглядит
+                # записанной, ничего при этом не считая.
+                _log.warning(
+                    "Sheets: приёмник предупреждает",
+                    sheet=sheet, mode=mode, warning=str(warning),
+                )
             return SheetsResult(
                 ok=True,
                 inserted=int(body.get("inserted", 0)),
                 receiver_version=None if version is None else str(version),
+                updated=int(body.get("updated", 0)),
+                start_row=(
+                    None if body.get("startRow") is None
+                    else int(body["startRow"])
+                ),
+                warning=None if warning is None else str(warning),
+                not_found=not_found,
             )
         last_error = f"ok=false: {body.get('error', 'без описания')}"
         _log.warning("Sheets: ответ ok=false", attempt=attempt + 1, error=last_error)
