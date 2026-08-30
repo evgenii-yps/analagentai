@@ -470,7 +470,7 @@ check('table_update: закрытие дописано В ТУ ЖЕ строку
     updates: [{
       marker: '[поз. 91]', startColumn: 8,
       values: ['31.08.2026', '21:33:00', 1.43],
-      note: '[поз. 91] цель · цель достигнута · итог системы +0.76%',
+      noteAppend: ' · цель достигнута · итог системы +0.76%',
     }],
   });
   assert(res.ok === true, `ok=false: ${res.error}`);
@@ -503,6 +503,84 @@ check('table_update: метки нет — строка НЕ угадывает�
   // Ненайденная метка не привела к записи НИ В ОДНУ строку.
   assert(sheet.getCell(3, 8) === '' && sheet.getCell(4, 8) === '',
          'запись ушла в угаданную строку');
+});
+
+check('version: приёмник называет версию и НИЧЕГО не пишет', () => {
+  // Клиент спрашивает версию ПЕРЕД первой записью. Вопрос обязан быть
+  // безвредным: если он что-нибудь меняет в листе, им нельзя пользоваться
+  // именно тогда, когда он нужнее всего — перед первой записью в чужой
+  // рабочий документ.
+  const ctx = makeContext();
+  const sheet = makeTradesSheet(ctx, { blank: 3, filled: 1 });
+  const before = JSON.stringify(sheet.grid);
+  const res = post(ctx, { secret: ctx.SECRET, sheet: TRADES, mode: 'version' });
+  assert(res.ok === true, `ok=false: ${res.error}`);
+  assert(res.version === '9.1.2', `version=${res.version}`);
+  assert(JSON.stringify(sheet.grid) === before, 'вопрос о версии изменил лист');
+  assert(res.inserted === undefined && res.updated === undefined,
+         'вопрос о версии отчитался о записи');
+});
+
+check('version: чужой секрет отвергается и здесь', () => {
+  const ctx = makeContext();
+  const res = post(ctx, { secret: 'не тот', sheet: TRADES, mode: 'version' });
+  assert(res.ok === false && res.error === 'forbidden', 'секрет не проверен');
+});
+
+check('table_update: ручной текст владельца СОХРАНЯЕТСЯ, хвост в конце', () => {
+  // Столбец заметок — единственное место строки, куда человек пишет руками.
+  // Пока сделка шла, владелец мог занести туда своё наблюдение; замена ячейки
+  // целиком стёрла бы его молча и безвозвратно.
+  const ctx = makeContext();
+  const sheet = makeTradesSheet(ctx, { blank: 4, filled: 0 });
+  post(ctx, {
+    secret: ctx.SECRET, sheet: TRADES, mode: 'table_append',
+    rows: [openRow('XRP', 1.4161)], notes: ['[поз. 91] цель 1.43'],
+    noteColumn: NOTE_COL, totalsMarker: 'итого:', formulaFromColumn: FORMULA_FROM,
+  });
+  // Владелец дописал своё, пока сделка шла.
+  sheet.setCell(2, NOTE_COL, '[поз. 91] цель 1.43 — ЖДУ ОТСКОКА, следить');
+
+  const tail = ' · цель достигнута · итог системы +0.76%';
+  const res = post(ctx, {
+    secret: ctx.SECRET, sheet: TRADES, mode: 'table_update', noteColumn: NOTE_COL,
+    updates: [{
+      marker: '[поз. 91]', startColumn: 8,
+      values: ['31.08.2026', '21:33:00', 1.43], noteAppend: tail,
+    }],
+  });
+  assert(res.ok === true && res.updated === 1, `updated=${res.updated}`);
+  const note = String(sheet.getCell(2, NOTE_COL));
+  assert(note.indexOf('ЖДУ ОТСКОКА, следить') >= 0,
+         `текст владельца стёрт: «${note}»`);
+  assert(note.endsWith(tail), `хвост не в конце: «${note}»`);
+  assert(note.indexOf('[поз. 91]') === 0, 'метка перестала быть первой');
+});
+
+check('table_update: повторный тот же хвост не удваивает текст', () => {
+  // Запись могла удаться, а ответ — не дойти (обрыв сети), и следующий прогон
+  // пришлёт тот же хвост. Заметка с дважды повторённым итогом выглядела бы как
+  // две сделки в одной строке.
+  const ctx = makeContext();
+  const sheet = makeTradesSheet(ctx, { blank: 4, filled: 0 });
+  post(ctx, {
+    secret: ctx.SECRET, sheet: TRADES, mode: 'table_append',
+    rows: [openRow('XRP', 1.4161)], notes: ['[поз. 92] цель'],
+    noteColumn: NOTE_COL, totalsMarker: 'итого:', formulaFromColumn: FORMULA_FROM,
+  });
+  const tail = ' · цель достигнута · итог системы +0.76%';
+  const body = {
+    secret: ctx.SECRET, sheet: TRADES, mode: 'table_update', noteColumn: NOTE_COL,
+    updates: [{ marker: '[поз. 92]', startColumn: 8,
+                values: ['31.08.2026', '21:33:00', 1.43], noteAppend: tail }],
+  };
+  post(ctx, body);
+  const once = String(sheet.getCell(2, NOTE_COL));
+  post(ctx, body);
+  const twice = String(sheet.getCell(2, NOTE_COL));
+  assert(once === twice, `хвост дописан дважды: «${twice}»`);
+  assert(twice.split('цель достигнута').length - 1 === 1,
+         `причина выхода встречается больше одного раза: «${twice}»`);
 });
 
 check('выгрузка Этапа 6.6 работает по-прежнему (режимы append/replace)', () => {

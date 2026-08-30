@@ -62,7 +62,7 @@ from src.export.transform import (
     build_correlation_row,
     build_independent_row,
     build_notion_properties,
-    build_position_close_note,
+    build_position_close_note_tail,
     build_position_close_values,
     build_position_full_row,
     build_position_note,
@@ -89,6 +89,21 @@ _SHEET_CORRELATION = "Корреляция токенов"
 # выгрузка обращается с ним осторожнее, чем со своими служебными листами:
 # заголовок не отправляет, лист не создаёт, формулы не переписывает.
 _SHEET_TRADES = "торговля тест апи окх чтение"
+# ТРЕБУЕМАЯ ВЕРСИЯ ПРИЁМНИКА для работы с торговым журналом (Этап 9.1.2 §15).
+#
+# ПОЧЕМУ ЭТО ПРОВЕРЯЕТСЯ КОДОМ, А НЕ ИНСТРУКЦИЕЙ. Старый приёмник новых режимов
+# НЕ ЗНАЕТ и не отвергает их — он обрабатывает их веткой по умолчанию, и оба
+# исхода тихие: table_append уходит appendRow-ом в КОНЕЦ ЛИСТА (ниже блока
+# «баланс / начало», вне таблицы и вне формул) с честным ok:true, а table_update
+# не делает НИЧЕГО и возвращает inserted:0 — после чего клиент ставит отметку
+# sheet_closed_at, и закрытие сделки теряется НАВСЕГДА: отметка необратима, и
+# повторно позиция в выборку не попадёт. Инструкция «сначала обновите скрипт»
+# защищает от этого только словами.
+#
+# СРАВНЕНИЕ — ТОЧНОЕ РАВЕНСТВО, а не «не меньше». Сравнение версий по частям —
+# отдельный код с собственными краевыми случаями, который здесь не нужен и
+# однажды ошибётся; «ровно эта строка» ошибиться не может.
+_TRADES_RECEIVER_VERSION = "9.1.2"
 
 
 class ExportError(Exception):
@@ -248,6 +263,40 @@ async def _export_trades(
     created = 0
     updated = 0
 
+    # ПУСТАЯ ОЧЕРЕДЬ — В СЕТЬ НЕ ХОДИМ ВОВСЕ (§15.4). Задача cron идёт каждые
+    # 15 минут, и в большинстве прогонов писать нечего: спрашивать у Google
+    # версию сто раз в сутки ради ответа «нечего делать» — это трафик и записи
+    # в журнале ради ничего.
+    to_open, to_close = await queries.count_positions_pending(conn)
+    if not to_open and not to_close:
+        log.info("Торговый журнал: нечего выгружать")
+        return (0, 0)
+
+    # ВЕРСИЯ ПРИЁМНИКА СПРАШИВАЕТСЯ ДО ПЕРВОЙ ЗАПИСИ (§15.2). Режим "version"
+    # безвреден и на СТАРОМ приёмнике тоже: тот не знает его, идёт общим путём,
+    # не находит строк (rows отсутствует, ширина ноль) и возвращает свою версию,
+    # ничего не записав. Имя листа при этом посылается настоящее — старый
+    # приёмник создаёт лист, если его нет, и подсовывать ему выдуманное имя
+    # значило бы завести в книге владельца пустой лишний лист.
+    probe = await sheets.post_rows(url, secret, _SHEET_TRADES, "version", [])
+    if not probe.ok or probe.receiver_version != _TRADES_RECEIVER_VERSION:
+        got = probe.receiver_version or (
+            "нет ответа" if not probe.ok else "поле version не возвращено"
+        )
+        log.error(
+            "Торговый журнал: приёмник не той версии — не записано НИЧЕГО",
+            receiver_version=got,
+            required=_TRADES_RECEIVER_VERSION,
+            to_open=to_open, to_close=to_close,
+        )
+        raise ExportError(
+            f"торговый журнал: приёмник версии {got}, требуется "
+            f"{_TRADES_RECEIVER_VERSION} — обновите скрипт в Google (§10 ТЗ "
+            "9.1.2). Ни одной строки не записано, отметки не поставлены: "
+            "старая версия записала бы открытия в конец листа, а закрытия "
+            "потеряла бы молча"
+        )
+
     # --- 1. ОТКРЫТИЯ: новые строки, столбцы A–G плюс заметка --------------
     pending_open = await queries.fetch_positions_pending_open(conn, batch)
     if pending_open:
@@ -283,7 +332,10 @@ async def _export_trades(
                 "marker": position_marker(row["id"]),
                 "startColumn": POSITION_CLOSE_START_COLUMN,
                 "values": build_position_close_values(row, tz),
-                "note": build_position_close_note(row, tz),
+                # ТОЛЬКО ХВОСТ (§16 ТЗ): приёмник допишет его к тому, что в
+                # ячейке уже есть. Прислать заметку целиком значило бы стереть
+                # текст, который владелец занёс туда руками, пока сделка шла.
+                "noteAppend": build_position_close_note_tail(row),
             }
             for row in pending_close
         ]
@@ -334,8 +386,6 @@ async def _export_trades(
         await queries.mark_positions_sheet_closed(conn, done_ids)
         log.info("Торговый журнал: закрытия дописаны", updated=updated)
 
-    if not pending_open and not pending_close:
-        log.info("Торговый журнал: нечего выгружать")
     return (created, updated)
 
 

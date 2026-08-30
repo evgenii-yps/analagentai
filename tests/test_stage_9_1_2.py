@@ -47,6 +47,7 @@ from src.export.transform import (
     position_marker,
     position_token,
 )
+from src.export_main import ExportError
 
 _ROOT = pathlib.Path(__file__).resolve().parent.parent
 _TZ = "Europe/Moscow"
@@ -353,7 +354,19 @@ class _FakeConn:
         ]
 
     async def fetchrow(self, query: str, *args: Any) -> dict[str, Any]:
-        return {"to_open": 0, "to_close": 0}
+        # Счётчики очереди СЧИТАЮТСЯ, а не выдаются нулями: по ним клиент решает,
+        # ходить ли в сеть вообще (§15.4), и двойник, всегда отвечающий «пусто»,
+        # молча отключил бы половину проверок.
+        return {
+            "to_open": sum(
+                1 for r in self.rows if r["sheet_opened_at"] is None
+            ),
+            "to_close": sum(
+                1 for r in self.rows
+                if r["status"] == "closed" and r["sheet_closed_at"] is None
+                and r["sheet_opened_at"] is not None
+            ),
+        }
 
     async def execute(self, query: str, *args: Any) -> str:
         ids = set(args[0]) if args else set()
@@ -374,15 +387,29 @@ class _Recorder:
     """Подменённый клиент листа: запоминает запросы, отвечает по сценарию."""
 
     def __init__(self, not_found: list[str] | None = None,
-                 ok: bool = True) -> None:
+                 ok: bool = True, version: str | None = "9.1.2",
+                 version_ok: bool = True) -> None:
         self.calls: list[dict[str, Any]] = []
         self.not_found = not_found or []
         self.ok = ok
+        self.version = version
+        self.version_ok = version_ok
+
+    @property
+    def writes(self) -> list[dict[str, Any]]:
+        """Только ЗАПИСЫВАЮЩИЕ запросы: вопрос о версии ничего не пишет."""
+        return [call for call in self.calls if call["mode"] != "version"]
 
     async def __call__(self, url, secret, sheet, mode, rows, header=None, **kw):
         self.calls.append(
             {"sheet": sheet, "mode": mode, "rows": rows, **kw}
         )
+        if mode == "version":
+            return sheets.SheetsResult(
+                ok=self.version_ok,
+                error=None if self.version_ok else "приёмник недоступен",
+                receiver_version=self.version,
+            )
         if not self.ok:
             return sheets.SheetsResult(ok=False, error="приёмник отказал")
         # Ненайденные метки возвращаются ОДИН раз: второй запрос (спасательный
@@ -426,9 +453,12 @@ async def test_an_open_position_goes_to_opens_and_not_to_closes(
     recorder = _Recorder()
     created, updated = await _run_trades(monkeypatch, conn, recorder)
     assert (created, updated) == (1, 0)
-    assert [call["mode"] for call in recorder.calls] == ["table_append"]
+    # Первый вызов — вопрос о версии, и только потом запись.
+    assert [call["mode"] for call in recorder.calls] == [
+        "version", "table_append",
+    ]
     # Ширина пачки — семь: столбцы H..J у живой сделки не трогаются.
-    assert all(len(row) == 7 for row in recorder.calls[0]["rows"])
+    assert all(len(row) == 7 for row in recorder.writes[0]["rows"])
     assert conn.marked_open == [1]
     assert conn.marked_closed == []
 
@@ -443,7 +473,7 @@ async def test_a_failed_send_leaves_the_mark_unset(
     """
     conn = _FakeConn([_position(id=1, status="open", closed_at=None)])
     recorder = _Recorder(ok=False)
-    with pytest.raises(Exception) as failure:
+    with pytest.raises(ExportError) as failure:
         await _run_trades(monkeypatch, conn, recorder)
     assert "торговый журнал" in str(failure.value)
     assert conn.marked_open == []
@@ -468,10 +498,10 @@ async def test_open_then_close_in_one_pass_then_nothing_at_all(
     recorder = _Recorder()
     created, updated = await _run_trades(monkeypatch, conn, recorder)
     assert (created, updated) == (1, 1)
-    assert [call["mode"] for call in recorder.calls] == [
+    assert [call["mode"] for call in recorder.writes] == [
         "table_append", "table_update",
     ]
-    update = recorder.calls[1]["updates"][0]
+    update = recorder.writes[1]["updates"][0]
     assert update["marker"] == "[поз. 123]"
     assert update["startColumn"] == POSITION_CLOSE_START_COLUMN
     assert len(update["values"]) == 3
@@ -499,9 +529,9 @@ async def test_a_lost_open_row_becomes_a_full_row_with_a_plain_note(
     recorder = _Recorder(not_found=["[поз. 55]"])
     created, updated = await _run_trades(monkeypatch, conn, recorder)
 
-    modes = [call["mode"] for call in recorder.calls]
+    modes = [call["mode"] for call in recorder.writes]
     assert modes == ["table_update", "table_append"]
-    rescue = recorder.calls[1]
+    rescue = recorder.writes[1]
     assert len(rescue["rows"]) == 1
     assert len(rescue["rows"][0]) == 10, "спасательная строка обязана быть A–J"
     assert rescue["notes"][0].startswith("строка открытия не найдена")
@@ -552,7 +582,7 @@ async def test_the_close_batch_never_carries_rows(
     ])
     recorder = _Recorder()
     await _run_trades(monkeypatch, conn, recorder)
-    call = recorder.calls[0]
+    call = recorder.writes[0]
     assert call["mode"] == "table_update"
     assert call["rows"] == []
     assert call["note_column"] == POSITION_NOTE_COLUMN
@@ -571,6 +601,228 @@ def test_the_payload_of_table_update_carries_no_rows_and_no_header() -> None:
     assert '"updates"' in body
     assert '"rows"' not in body
     assert '"header"' not in body
+
+
+# =============================================================================
+# §15. Защита от старого приёмника: версия спрашивается ДО первой записи
+# =============================================================================
+
+async def test_an_old_receiver_stops_the_export_before_a_single_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """§15.2: приёмник версии 8.4.1 — НИ ОДНОГО запроса на запись, ни отметки.
+
+    ПОЧЕМУ ЭТО ЗАЩИТА КОДОМ, А НЕ ИНСТРУКЦИЕЙ. Старый приёмник новых режимов не
+    знает и НЕ ОТВЕРГАЕТ их — он обрабатывает их веткой по умолчанию, и оба
+    исхода тихие. Измерено на настоящем старом коде (``deploy/apps_script.gs``
+    из ``fa07f58``, прогнан в Node):
+
+        mode="version"      → {"ok":true, "version":"8.4.1"}, лист не тронут
+        mode="table_append" → {"ok":true, "inserted":1} — и строка легла НИЖЕ
+                              блока «баланс / начало», вне таблицы и формул
+        mode="table_update" → {"ok":true, "inserted":0} — не сделано НИЧЕГО
+
+    Второй случай хуже первого: клиент считал бы закрытие записанным и ставил
+    отметку ``sheet_closed_at``, а она необратима — закрытие сделки потерялось бы
+    навсегда. Поэтому версия спрашивается ДО первой записи, и несовпадение
+    останавливает шаг целиком.
+    """
+    conn = _FakeConn([_position(id=1, status="open", closed_at=None,
+                                exit_price=None, exit_reason=None)])
+    recorder = _Recorder(version="8.4.1")
+    with pytest.raises(ExportError) as failure:
+        await _run_trades(monkeypatch, conn, recorder)
+
+    text = str(failure.value)
+    assert "8.4.1" in text and "9.1.2" in text
+    assert "обновите скрипт" in text
+    # НИ ОДНОГО ЗАПИСЫВАЮЩЕГО ЗАПРОСА: только вопрос о версии.
+    assert [call["mode"] for call in recorder.calls] == ["version"]
+    assert recorder.writes == []
+    # И НИ ОДНОЙ ОТМЕТКИ: очередь остаётся полной, следующий прогон повторит.
+    assert conn.marked_open == [] and conn.marked_closed == []
+    assert len(await queries.fetch_positions_pending_open(conn, 100)) == 1
+
+
+async def test_a_receiver_without_a_version_field_is_treated_as_old(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """§15.3: поля ``version`` в ответе нет — пишем НИЧЕГО.
+
+    Так отвечает совсем древняя редакция приёмника (до 8.4.1: она версию не
+    сообщала вовсе). Правило «нет версии — не пишем» обязано работать и здесь:
+    отсутствие ответа на вопрос «кто ты» — это не разрешение, а отказ.
+    """
+    conn = _FakeConn([_position(id=1, status="open", closed_at=None)])
+    recorder = _Recorder(version=None)
+    with pytest.raises(ExportError) as failure:
+        await _run_trades(monkeypatch, conn, recorder)
+    assert "version" in str(failure.value) or "не возвращено" in str(failure.value)
+    assert recorder.writes == []
+    assert conn.marked_open == [] and conn.marked_closed == []
+
+
+async def test_an_unreachable_receiver_also_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Вопрос о версии не удался вовсе — тоже ни одной записи.
+
+    Сеть могла лечь между вопросом и ответом. Писать «на всякий случай» в этот
+    момент нельзя: неизвестно даже, кто на том конце.
+    """
+    conn = _FakeConn([_position(id=1, status="open", closed_at=None)])
+    recorder = _Recorder(version=None, version_ok=False)
+    with pytest.raises(ExportError):
+        await _run_trades(monkeypatch, conn, recorder)
+    assert recorder.writes == []
+    assert conn.marked_open == []
+
+
+async def test_an_empty_queue_never_asks_for_the_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """§15.4: писать нечего — в сеть не ходим ВООБЩЕ, даже за версией.
+
+    Задача cron идёт каждые пятнадцать минут, и в большинстве прогонов очередь
+    пуста. Сто обращений в сутки ради ответа «нечего делать» — это трафик и
+    строки в журнале ради ничего.
+    """
+    conn = _FakeConn([
+        _position(
+            id=1,
+            sheet_opened_at=datetime(2026, 8, 31, tzinfo=UTC),
+            sheet_closed_at=datetime(2026, 8, 31, tzinfo=UTC),
+        ),
+    ])
+    recorder = _Recorder()
+    created, updated = await _run_trades(monkeypatch, conn, recorder)
+    assert (created, updated) == (0, 0)
+    assert recorder.calls == [], "спросили версию при пустой очереди"
+
+
+async def test_the_right_version_lets_the_export_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Обратная сторона: при версии 9.1.2 прогон идёт целиком.
+
+    Без этой проверки предыдущие проходили бы и у клиента, который не пишет
+    никогда.
+    """
+    conn = _FakeConn([_position(id=1, status="open", closed_at=None)])
+    recorder = _Recorder(version="9.1.2")
+    created, updated = await _run_trades(monkeypatch, conn, recorder)
+    assert (created, updated) == (1, 0)
+    assert [call["mode"] for call in recorder.calls] == ["version", "table_append"]
+    assert conn.marked_open == [1]
+
+
+def test_the_required_version_lives_in_one_place_and_is_compared_exactly(
+) -> None:
+    """Константа требуемой версии одна, и сравнение — точное равенство.
+
+    Сравнение версий «не меньше» — отдельный код с собственными краевыми
+    случаями (что больше, «9.1.10» или «9.1.2»?), который здесь не нужен и
+    однажды ошибётся. «Ровно эта строка» ошибиться не может.
+    """
+    source = (_ROOT / "src" / "export_main.py").read_text(encoding="utf-8")
+    assert '_TRADES_RECEIVER_VERSION = "9.1.2"' in source
+    assert "probe.receiver_version != _TRADES_RECEIVER_VERSION" in source
+    # Версия НЕ зашита второй раз строкой рядом с запросом.
+    assert source.count('"9.1.2"') == 1, "версия зашита больше чем в одном месте"
+    # И она совпадает с той, что объявлена в приёмнике.
+    receiver = (_ROOT / "deploy" / "apps_script.gs").read_text(encoding="utf-8")
+    assert "const RECEIVER_VERSION = '9.1.2';" in receiver
+
+
+def test_the_version_probe_carries_nothing_and_names_the_real_sheet() -> None:
+    """Вопрос о версии безвреден И на старом приёмнике тоже.
+
+    Старый приёмник СОЗДАЁТ лист, если не находит его по имени, и делает это
+    ДО разбора режима. Поэтому вопрос посылается с НАСТОЯЩИМ именем листа
+    сделок: выдуманное имя (или его отсутствие) завело бы в книге владельца
+    пустой лишний лист — вопросом, который «ничего не делает».
+    """
+    import inspect
+
+    source = (_ROOT / "src" / "export_main.py").read_text(encoding="utf-8")
+    assert 'post_rows(url, secret, _SHEET_TRADES, "version", [])' in source
+
+    client = inspect.getsource(sheets.post_rows)
+    branch = client.split('if mode == "version":', 1)[1].split("elif", 1)[0]
+    assert '"rows"' not in branch and '"updates"' not in branch
+
+
+# =============================================================================
+# §16. Заметка при закрытии дописывается, а не переписывает ячейку
+# =============================================================================
+
+def test_the_close_tail_is_a_tail_and_not_the_whole_note() -> None:
+    """§16.1: клиент шлёт ТОЛЬКО хвост заметки.
+
+    Столбец заметок — единственное место строки, куда человек пишет руками.
+    Пока сделка шла, владелец мог занести туда своё наблюдение; прислать заметку
+    целиком и заменить ею ячейку значило бы стереть его текст — молча и
+    безвозвратно.
+    """
+    from src.export.transform import build_position_close_note_tail
+
+    tail = build_position_close_note_tail(_position())
+    assert tail.startswith(" · ")
+    assert "цель достигнута" in tail
+    assert "итог системы +0.76%" in tail
+    # В ХВОСТЕ НЕТ ГОЛОВЫ: ни метки, ни уровней — иначе они удвоились бы в
+    # ячейке, где голова уже написана при открытии.
+    assert "[поз." not in tail
+    assert "цель 1.4300" not in tail
+    assert "предел" not in tail
+
+    # А полный текст по-прежнему собирается из головы и хвоста — он нужен для
+    # потерянной строки, где дописывать не к чему.
+    assert build_position_close_note(_position(), _TZ) == (
+        build_position_note(_position()) + tail
+    )
+
+
+def test_the_data_gap_tail_carries_the_caveat_and_no_result() -> None:
+    """У ``data_gap`` хвост несёт оговорку вместо итога — и в этом виде тоже."""
+    from src.export.transform import build_position_close_note_tail
+
+    tail = build_position_close_note_tail(
+        _position(exit_reason="data_gap", net_pnl_pct=-0.22, net_pnl_usd=-0.0044)
+    )
+    assert "пробел в данных" in tail
+    assert DATA_GAP_NOTE in tail
+    assert "итог системы" not in tail
+
+
+async def test_the_update_sends_note_append_and_never_note(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """В запросе дозаписи есть ``noteAppend`` и НЕТ ``note``.
+
+    Поле ``note`` заменяло ячейку целиком. Оставь его рядом «на всякий случай» —
+    и однажды кто-нибудь пришлёт оба, а приёмник возьмёт то, которое читает.
+    """
+    conn = _FakeConn([
+        _position(id=7, sheet_opened_at=datetime(2026, 8, 31, tzinfo=UTC)),
+    ])
+    recorder = _Recorder()
+    await _run_trades(monkeypatch, conn, recorder)
+    update = recorder.writes[0]["updates"][0]
+    assert "noteAppend" in update
+    assert "note" not in update
+    assert update["noteAppend"].startswith(" · ")
+    assert "[поз." not in update["noteAppend"]
+
+    # И приёмник читает именно это поле, а прежнее — уже нет.
+    receiver = (_ROOT / "deploy" / "apps_script.gs").read_text(encoding="utf-8")
+    assert "item.noteAppend" in receiver
+    assert "item.note " not in receiver and "item.note;" not in receiver
+    # Дописывание, а не замена: приёмник читает текущее значение ячейки.
+    assert "cell.getValue()" in receiver
+    assert "current + String(tail)" in receiver
+    # И защита от повтора после сбоя сети.
+    assert "current.indexOf(String(tail)) < 0" in receiver
 
 
 def test_the_client_and_the_receiver_agree_on_every_field_name() -> None:
@@ -600,7 +852,9 @@ def test_the_client_and_the_receiver_agree_on_every_field_name() -> None:
     for field, reader in (
         ("marker", "item.marker"),
         ("values", "item.values"),
-        ("note", "item.note"),
+        # Этап 9.1.2 §16: клиент шлёт ХВОСТ заметки, приёмник его ДОПИСЫВАЕТ.
+        # Прежнее поле note заменяло ячейку целиком и стёрло бы текст владельца.
+        ("noteAppend", "item.noteAppend"),
         ("startColumn", "item.startColumn"),
     ):
         assert f'"{field}"' in export_main, f"клиент не отправляет {field}"
