@@ -388,6 +388,12 @@ def _open_kwargs(**overrides):
         bar_age_sec=45.0,
         max_bar_age_sec=300,
         has_frozen_target=True,
+        # Этап 9.1.1 §6.3: проверка свободных денег. Здесь их заведомо хватает —
+        # тесты этого набора проверяют ДРУГИЕ условия, и нехватка денег в
+        # отправной точке сделала бы каждый из них отказом не по своей причине.
+        # Сама проверка денег проверяется в tests/test_stage_9_1_1.py.
+        free_usd=10.0,
+        slot_usd=2.0,
     )
     base.update(overrides)
     return base
@@ -474,6 +480,10 @@ def test_every_refusal_reason_belongs_to_the_closed_list() -> None:
         dict(has_open_position=True), dict(open_count=5),
         dict(signal_age_sec=10_000.0), dict(bar_age_sec=10_000.0),
         dict(bar_age_sec=None), dict(has_frozen_target=False),
+        # Этап 9.1.1 §6.3: перечень расширен ОДНИМ значением, и оно тоже обязано
+        # быть достижимым — иначе ключ ничего не объясняет, но выглядит
+        # объяснением.
+        dict(free_usd=1.0),
     ]
     seen = set()
     for override in broken:
@@ -878,12 +888,20 @@ async def test_the_unsettled_query_finds_a_planted_row_and_spares_a_correct_one(
     ``computed_at`` раньше закрытия последнего бара окна, у второй — позже.
     Найдена обязана быть ровно первая: запрос, находящий обе, удалил бы
     исправные строки вместе с испорченными.
+
+    ЗАПАС СЧИТАЕТСЯ ПО ФАКТИЧЕСКОМУ РАЗРЕШЕНИЮ СТРОКИ (Этап 9.1.1 §2). Обе
+    подкладываемые строки — минутного ряда (``resolution = '1m'``), и последний
+    бар их окна закрывается через 60 секунд после срока, а не через час. Прежняя
+    редакция этого теста брала запас у ``settle_seconds()``, то есть по ГРУБОМУ
+    бару: на боевых данных такой критерий объявил подозрительными 7618
+    ИСПРАВНЫХ строк.
     """
     import asyncpg
 
     from src.core.db import db as database
 
-    settle = settle_seconds()
+    settle_min = settings.BARRIER_SETTLE_MINUTES
+    settle = 60 + settle_min * 60
     entry_ts = datetime(2026, 8, 20, 0, 0, tzinfo=UTC)
     horizon_h = 1
     closes_at = entry_ts + timedelta(hours=horizon_h, seconds=settle)
@@ -918,7 +936,7 @@ async def test_the_unsettled_query_finds_a_planted_row_and_spares_a_correct_one(
             dsn=TEST_DSN, min_size=1, max_size=2
         )
         rows = await database.get_strategy_outcomes_unsettled(
-            settle_seconds=settle
+            settle_minutes=settle_min
         )
         planted = [
             r for r in rows

@@ -56,6 +56,38 @@ def _msk(ts: datetime) -> str:
     return ts.astimezone(_MSK).strftime("%d.%m %H:%M") + " MSK"
 
 
+def signed_usd(value: float) -> str:
+    """Сумма со ЗНАКОМ ВСЕГДА: ``+$0.03``, ``-$0.12``, и ``+$0.00`` при нуле.
+
+    Знак печатается и при нуле намеренно: отсутствие знака читается как
+    «величина неизвестна», а ноль — это измеренный ноль.
+    """
+    value = float(value)
+    sign = "+" if value >= 0 else "-"
+    return f"{sign}${abs(value):.2f}"
+
+
+def balance_line(balance: dict[str, Any] | None) -> str | None:
+    """Одна строка о состоянии счёта (Этап 9.1.1 §6.5).
+
+    ``None`` означает «величины не получены» — тогда строка не печатается
+    ВОВСЕ. Печатать вместо неё нули значило бы сообщить, что на счёте ничего
+    нет, тогда как на самом деле неизвестно, сколько там.
+
+    ПРИБЫЛЬ НЕ РЕИНВЕСТИРУЕТСЯ, и строка это показывает: «в позициях» считается
+    по размеру слотов, а накопленный итог стоит отдельной величиной и в слоты
+    не входит.
+    """
+    if not balance:
+        return None
+    return (
+        f"Счёт: ${float(balance['capital_start']):.2f} старт · "
+        f"${float(balance['in_positions']):.2f} в позициях · "
+        f"${float(balance['free']):.2f} свободно · "
+        f"итог {signed_usd(balance['realized_pnl'])}"
+    )
+
+
 def held_ru(seconds: float) -> str:
     """Длительность удержания словами: ``3 ч 41 мин``, ``17 мин``."""
     total = max(0, int(seconds))
@@ -78,19 +110,24 @@ def opened_text(
     signal_id: int,
     probability: float | None,
     entry_lag_sec: int,
+    balance: dict[str, Any] | None = None,
 ) -> str:
     """Сообщение об открытии позиции."""
     prob = "—" if probability is None else f"{float(probability):.2f}"
-    return (
-        "🟢 <b>Открыта позиция (виртуально)</b>\n"
+    lines = [
+        "🟢 <b>Открыта позиция (виртуально)</b>",
         f"{_esc(symbol)} · вход {_price(entry_price)} · "
-        f"${float(notional_usd):.2f}\n"
+        f"${float(notional_usd):.2f}",
         f"Цель {_price(target_price)} (+{float(target_pct):.2f}%) · "
-        f"предел {_price(stop_price)} (−{float(stop_pct):.2f}%)\n"
-        f"Срок до {_msk(deadline_at)}\n"
+        f"предел {_price(stop_price)} (−{float(stop_pct):.2f}%)",
+        f"Срок до {_msk(deadline_at)}",
         f"Сигнал #{int(signal_id)}, вероятность {prob}, "
-        f"задержка входа {int(entry_lag_sec)} с"
-    )
+        f"задержка входа {int(entry_lag_sec)} с",
+    ]
+    money = balance_line(balance)
+    if money is not None:
+        lines.append(money)
+    return "\n".join(lines)
 
 
 def closed_text(
@@ -103,6 +140,7 @@ def closed_text(
     net_pnl_usd: float,
     cost_pct: float,
     held_sec: float,
+    balance: dict[str, Any] | None = None,
 ) -> str:
     """Сообщение о закрытии позиции.
 
@@ -111,11 +149,15 @@ def closed_text(
     раз обнаруживал бы недостачу и искал ошибку.
     """
     reason = EXIT_RU.get(exit_reason, exit_reason)
-    return (
-        "🔵 <b>Закрыта позиция (виртуально)</b>\n"
-        f"{_esc(symbol)} · {_esc(reason)}\n"
-        f"Вход {_price(entry_price)} → выход {_price(exit_price)}\n"
+    lines = [
+        "🔵 <b>Закрыта позиция (виртуально)</b>",
+        f"{_esc(symbol)} · {_esc(reason)}",
+        f"Вход {_price(entry_price)} → выход {_price(exit_price)}",
         f"Итог {float(net_pnl_pct):+.2f}% (${float(net_pnl_usd):+.3f}) "
-        f"с учётом издержек {float(cost_pct):.2f}%\n"
-        f"В позиции {held_ru(held_sec)}"
-    )
+        f"с учётом издержек {float(cost_pct):.2f}%",
+        f"В позиции {held_ru(held_sec)}",
+    ]
+    money = balance_line(balance)
+    if money is not None:
+        lines.append(money)
+    return "\n".join(lines)

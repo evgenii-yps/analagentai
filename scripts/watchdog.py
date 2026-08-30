@@ -28,7 +28,8 @@ from datetime import UTC, datetime
 
 APP_DIR = os.environ.get("APP_DIR", "/opt/agent-trade")
 
-CONTAINERS = ["postgres", "redis", "collector", "agents", "decision", "notify", "evaluator", "bot"]
+CONTAINERS = ["postgres", "redis", "collector", "agents", "decision", "notify", "evaluator",
+              "bot", "positions"]
 
 # heartbeat-ключ -> (env интервала, дефолт, имя контейнера-владельца).
 HEARTBEATS: list[tuple[str, str, int, str]] = [
@@ -42,6 +43,11 @@ HEARTBEATS: list[tuple[str, str, int, str]] = [
     ("decision:heartbeat", "DECISION_INTERVAL", 60, "decision"),
     ("notify:heartbeat", "NOTIFY_INTERVAL", 30, "notify"),
     ("evaluator:heartbeat", "EVAL_INTERVAL", 300, "evaluator"),
+    # Этап 9.1.1 §5: сервис ведения позиций — на общих основаниях. Умерев
+    # молча, он перестаёт ВЕСТИ уже открытые позиции: цель и предел, задетые за
+    # время простоя, не будут замечены никогда — бары уйдут за отметку
+    # last_checked_ts только вместе с их разбором.
+    ("positions:heartbeat", "POSITION_INTERVAL", 60, "positions"),
     ("bot:heartbeat", "BOT_POLL_TIMEOUT", 30, "bot"),
 ]
 

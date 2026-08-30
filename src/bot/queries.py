@@ -16,6 +16,7 @@ from typing import Any
 import asyncpg
 import structlog
 
+from src.core.db import BALANCE_SQL
 from src.core.user_settings import USER_SETTINGS_DDL
 
 _log = structlog.get_logger().bind(component="bot-queries")
@@ -568,6 +569,29 @@ class BotQueries:
             """
         )
         return [dict(r) for r in rows]
+
+    async def positions_balance(self, capital_start: float) -> dict[str, Any]:
+        """Пять величин счёта (Этап 9.1.1 §6.2).
+
+        Запрос — ТОТ ЖЕ САМЫЙ, что у сервиса позиций
+        (:data:`src.core.db.BALANCE_SQL`), а не его копия здесь. Копия
+        разошлась бы при первой правке, и тогда бот и сообщения показывали бы
+        два РАЗНЫХ баланса одного счёта — расхождение, которое нечем было бы
+        объяснить владельцу.
+
+        Бот остаётся ТОЛЬКО НА ЧТЕНИЕ: это SELECT, ничего не открывающий и не
+        закрывающий.
+        """
+        row = await self._pool.fetchrow(BALANCE_SQL, float(capital_start))
+        if row is None:
+            return {}
+        return {
+            "capital_start": float(row["capital_start"]),
+            "realized_pnl": float(row["realized_pnl"]),
+            "in_positions": float(row["in_positions"]),
+            "free": float(row["free"]),
+            "open_count": int(row["open_count"]),
+        }
 
     async def positions_summary(self, days: int = 7) -> dict[str, Any]:
         """Итог по закрытым позициям за окно: счёт, разбивка, средние.

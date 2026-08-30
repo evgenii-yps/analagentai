@@ -148,3 +148,90 @@ async def post_rows(
         _log.warning("Sheets: ответ ok=false", attempt=attempt + 1, error=last_error)
 
     return SheetsResult(ok=False, error=last_error)
+
+
+async def post_position_row(
+    url: str,
+    secret: str,
+    sheet: str,
+    values: dict[str, Any],
+    headers: dict[str, str],
+) -> SheetsResult:
+    """Одна строка закрытой позиции в лист владельца (Этап 9.1.1 §7.5).
+
+    ОТДЕЛЬНОГО КАНАЛА НЕ ЗАВОДИТСЯ. Действие ``append_position`` живёт в том же
+    приёмнике ``deploy/apps_script.gs`` рядом с выгрузкой Этапа 6.6, и проверка
+    общего секрета — та же самая: второй секрет пришлось бы хранить, менять и
+    однажды забыть поменять в одном из двух мест.
+
+    ``values`` — объект «буква столбца → значение», ровно восемь ключей
+    (:data:`src.positions.sheet.SHEET_COLUMNS`). ``headers`` — ожидаемые
+    заголовки строки 1 в тех же столбцах; приёмник сверяет их с листом и при
+    расхождении ОТКАЗЫВАЕТСЯ писать. Владелец правит лист руками, и молчаливая
+    запись в переименованные столбцы — это порча данных.
+
+    Повторы и таймаут — те же, что у :func:`post_rows` (5/15/45 секунд).
+    Исключений не бросает: сеть, HTTP и разбор ответа сворачиваются в
+    ``ok=False`` с текстом причины. ЭТО ВАЖНО ИМЕННО ЗДЕСЬ: отметка
+    ``sheet_exported_at`` ставится ТОЛЬКО после ``ok=True``, и упавший запрос
+    обязан оставить позицию в очереди, а не уронить сервис.
+    """
+    payload: dict[str, Any] = {
+        "secret": secret,
+        "action": "append_position",
+        "sheet": sheet,
+        "values": values,
+        "headers": headers,
+    }
+
+    last_error = "неизвестная ошибка"
+    for attempt, delay in enumerate((0.0, *_RETRY_DELAYS)):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            async with httpx.AsyncClient(
+                timeout=_TIMEOUT, verify=_verify(), follow_redirects=True
+            ) as client:
+                response = await client.post(url, json=payload)
+        except Exception as exc:  # noqa: BLE001 — сеть не должна ронять сервис
+            last_error = f"сетевая ошибка: {exc}"
+            _log.warning("Sheets: позиция не записана", attempt=attempt + 1,
+                         error=last_error)
+            continue
+
+        if response.status_code != 200:
+            last_error = f"HTTP {response.status_code}"
+            _log.warning("Sheets: неуспешный код", attempt=attempt + 1,
+                         status=response.status_code)
+            continue
+
+        try:
+            body = response.json()
+        except Exception as exc:  # noqa: BLE001
+            last_error = f"нераспознанный ответ: {exc}"
+            _log.warning("Sheets: ответ не JSON", attempt=attempt + 1)
+            continue
+
+        if body.get("ok") is True:
+            version = body.get("version")
+            _log.info(
+                "Sheets: строка позиции записана",
+                sheet=sheet,
+                row=body.get("row"),
+                receiver_version=version or "до 9.1.1 (версию не сообщает)",
+            )
+            return SheetsResult(
+                ok=True,
+                inserted=1,
+                receiver_version=None if version is None else str(version),
+            )
+
+        # ОТКАЗ ПРИЁМНИКА НЕ ПОВТОРЯЕТСЯ. Он означает, что лист устроен не так,
+        # как ждёт код: имя листа не найдено, заголовки переименованы, формулы
+        # не протянулись. Повтор через пять секунд не изменит лист — он лишь
+        # трижды напишет в журнал одно и то же и отложит настоящий разбор.
+        last_error = f"ok=false: {body.get('error', 'без описания')}"
+        _log.warning("Sheets: приёмник отказал", error=last_error)
+        return SheetsResult(ok=False, error=last_error)
+
+    return SheetsResult(ok=False, error=last_error)

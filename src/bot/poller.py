@@ -45,6 +45,11 @@ HEARTBEAT_KEYS: list[tuple[str, str]] = [
     ("decision:heartbeat", "DECISION_INTERVAL"),
     ("notify:heartbeat", "NOTIFY_INTERVAL"),
     ("evaluator:heartbeat", "EVAL_INTERVAL"),
+    # Этап 9.1.1 §5. Сервис ведения позиций кладёт свой heartbeat с Этапа 9.1,
+    # но ни /status, ни вотчдог о нём не знали: сервис, ведущий пять открытых
+    # позиций, мог умереть молча, и узнали бы об этом по тому, что позиции
+    # перестали закрываться.
+    ("positions:heartbeat", "POSITION_INTERVAL"),
     ("bot:heartbeat", "BOT_POLL_TIMEOUT"),
 ]
 
@@ -459,7 +464,13 @@ class BotPoller:
         """
         open_rows = await self.queries.positions_open()
         summary = await self.queries.positions_summary(days=7)
-        return handlers.render_positions(open_rows, summary, now, days=7)
+        balance = await self.queries.positions_balance(
+            settings.POSITION_START_BALANCE_USD
+        )
+        return handlers.render_positions(
+            open_rows, summary, now, days=7,
+            balance=balance, max_open=settings.POSITION_MAX_OPEN,
+        )
 
     async def _heartbeat(self) -> None:
         """Пишет в Redis отметку живости бота (bot:heartbeat, ISO, TTL 300)."""

@@ -65,6 +65,14 @@ REASON_SLOTS_FULL = "slots_full"
 REASON_SIGNAL_TOO_OLD = "signal_too_old"
 REASON_NO_FRESH_BAR = "no_fresh_bar"
 REASON_NO_FROZEN_TARGET = "no_frozen_target"
+# Этап 9.1.1 §6.3: свободных денег меньше размера слота.
+#
+# ЗАЧЕМ ОНА НУЖНА, если пять слотов ровно равны капиталу. При накопленном
+# убытке свободных денег становится меньше пяти слотов, и пятая позиция
+# открываться не должна: денег на неё нет. Без этой проверки система при убытке
+# в 3 доллара продолжала бы открывать пять позиций по два — то есть торговала
+# бы деньгами, которых у неё нет, и весь учёт баланса стал бы декорацией.
+REASON_NO_FREE_CAPITAL = "no_free_capital"
 
 REFUSAL_REASONS = (
     REASON_NOT_BUY,
@@ -76,6 +84,7 @@ REFUSAL_REASONS = (
     REASON_SIGNAL_TOO_OLD,
     REASON_NO_FRESH_BAR,
     REASON_NO_FROZEN_TARGET,
+    REASON_NO_FREE_CAPITAL,
 )
 
 
@@ -195,8 +204,10 @@ def should_open(
     bar_age_sec: float | None,
     max_bar_age_sec: int,
     has_frozen_target: bool,
+    free_usd: float,
+    slot_usd: float,
 ) -> OpenDecision:
-    """Девять условий §4.1, все одновременно. Первый несработавший — и есть отказ.
+    """Десять условий, все одновременно. Первый несработавший — и есть отказ.
 
     ПОЧЕМУ ``degraded`` ДОСТАТОЧНО ВМЕСТО ПЕРЕСЧЁТА СОСТАВА АГЕНТОВ. Признак
     ``signals.degraded = FALSE`` и означает полный кворум трёх агентов: его
@@ -210,6 +221,13 @@ def should_open(
     торговлю. Привязка позиций к отправке внесла бы в замер ограничения, не
     имеющие отношения к рынку: позиция не открылась бы потому, что человеку уже
     написали три раза за час.
+
+    ПРОВЕРКА ДЕНЕГ (Этап 9.1.1 §6.3) СТОИТ ПОСЛЕ СЛОТОВ И ДО СВЕЖЕСТИ БАРА.
+    После слотов — потому что «слоты заняты» точнее и понятнее, чем «денег нет»,
+    когда верны обе причины: занятые слоты и есть то, во что ушли деньги. До
+    свежести бара — потому что свежесть бара это свойство ДАННЫХ, а нехватка
+    денег свойство СЧЁТА, и отказ «нет свежей свечи» на счёте без денег послал
+    бы разбираться с коллектором вместо разбора с балансом.
 
     ФИЛЬТРА ПО ``is_repeat`` ЗДЕСЬ НЕТ, и это не упущение: правило «один
     инструмент — одна позиция» уже исключает повторные входы, а лишнее условие
@@ -236,6 +254,11 @@ def should_open(
         return OpenDecision(False, REASON_INSTRUMENT_BUSY)
     if int(open_count) >= int(max_open):
         return OpenDecision(False, REASON_SLOTS_FULL)
+    # Сравнение НЕСТРОГОЕ в пользу входа: свободных денег ровно на слот —
+    # значит, слот оплачен целиком, и отказывать тут было бы отказом при
+    # достаточных деньгах.
+    if float(free_usd) < float(slot_usd):
+        return OpenDecision(False, REASON_NO_FREE_CAPITAL)
     if bar_age_sec is None or float(bar_age_sec) > float(max_bar_age_sec):
         return OpenDecision(False, REASON_NO_FRESH_BAR)
     return OpenDecision(True, REASON_OK)

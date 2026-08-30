@@ -208,6 +208,20 @@ def render_unknown() -> str:
     return "Не понимаю команду. Наберите /help — покажу список того, что умею."
 
 
+# Человеческие имена сервисов для строки heartbeat (Этап 9.1.1 §5). Словарь
+# НЕ ПОКРЫВАЕТ остальные ключи намеренно: этап разрешает изменить в выводе
+# /status ровно одну строку — новую. Переименование остальных десяти строк
+# сломало бы то, к чему владелец уже привык читать, ради красоты.
+HEARTBEAT_LABELS: dict[str, str] = {
+    "positions:heartbeat": "ведение позиций",
+}
+
+
+def hb_label(key: str) -> str:
+    """Имя строки heartbeat: человеческое, если известно, иначе сам ключ."""
+    return HEARTBEAT_LABELS.get(key, key)
+
+
 def render_status(
     hb_rows: list[tuple[str, str | None, int]],
     db_facts: dict[str, Any],
@@ -229,14 +243,15 @@ def render_status(
         ts = _parse_iso(value)
         age = age_seconds(now, ts)
         threshold = 5 * interval
+        label = hb_label(key)
         if age is None:
-            lines.append(f"🔴 {esc(key)}: нет отметки")
-            problems.append(key)
+            lines.append(f"🔴 {esc(label)}: нет отметки")
+            problems.append(label)
         elif age > threshold:
-            lines.append(f"🔴 {esc(key)}: {age} сек назад (порог 5×{interval})")
-            problems.append(key)
+            lines.append(f"🔴 {esc(label)}: {age} сек назад (порог 5×{interval})")
+            problems.append(label)
         else:
-            lines.append(f"🟢 {esc(key)}: {age} сек назад")
+            lines.append(f"🟢 {esc(label)}: {age} сек назад")
 
     if per_token:
         lines.append("")
@@ -578,11 +593,12 @@ def render_summary(
     for key, value, interval in hb_rows:
         ts = _parse_iso(value)
         age = age_seconds(now, ts)
+        label = hb_label(key)
         if age is None:
-            lines.append(f"🔴 {esc(key)}: нет отметки")
+            lines.append(f"🔴 {esc(label)}: нет отметки")
         else:
             mark = "🟢" if age <= 5 * interval else "🔴"
-            lines.append(f"{mark} {esc(key)}: {age} сек назад")
+            lines.append(f"{mark} {esc(label)}: {age} сек назад")
 
     lines.append("")
     lines.append("<b>📈 Приток данных за 24 часа</b>")
@@ -617,11 +633,54 @@ def render_summary(
     return "\n".join(lines)
 
 
+def render_balance_block(
+    balance: dict[str, Any] | None, max_open: int
+) -> list[str]:
+    """Блок баланса ОТДЕЛЬНО И СВЕРХУ, перед списком позиций (§6.5 ТЗ 9.1.1).
+
+    Сверху потому, что «сколько денег» — вопрос более общий, чем «что открыто»,
+    и человек, открывший команду, читает сверху вниз.
+
+    Пустой список, если величин нет: печатать нули значило бы сообщить, что на
+    счёте ничего нет, тогда как на самом деле неизвестно, сколько там.
+
+    СЛОВО «ВИРТУАЛЬНО» СТОИТ И ЗДЕСЬ. Заголовок команды его уже несёт, но блок
+    с долларами читается отдельно от заголовка — особенно если сообщение
+    пролистали до середины.
+    """
+    if not balance:
+        return []
+    open_count = int(balance["open_count"])
+    return [
+        "<b>💰 Счёт (виртуально)</b>",
+        f"Старт: ${float(balance['capital_start']):.2f}",
+        f"В позициях: ${float(balance['in_positions']):.2f} "
+        f"({open_count} из {int(max_open)} слотов)",
+        f"Свободно: ${float(balance['free']):.2f}",
+        f"Накопленный итог: {_signed_usd(balance['realized_pnl'])}",
+        "<i>Прибыль не реинвестируется: слот всегда одного размера.</i>",
+        "",
+    ]
+
+
+def _signed_usd(value: Any) -> str:
+    """Сумма со ЗНАКОМ ВСЕГДА, включая ``+$0.00`` при нуле.
+
+    Отсутствие знака читается как «величина неизвестна», а ноль — это
+    измеренный ноль. Правило то же, что в src/positions/messages.py.
+    """
+    value = float(value)
+    sign = "+" if value >= 0 else "-"
+    return f"{sign}${abs(value):.2f}"
+
+
 def render_positions(
     open_rows: list[dict[str, Any]],
     summary: dict[str, Any],
     now: datetime,
     days: int = 7,
+    balance: dict[str, Any] | None = None,
+    max_open: int = 5,
 ) -> str:
     """/positions: открытые виртуальные позиции и итог за окно (§10 ТЗ 9.1).
 
@@ -638,6 +697,7 @@ def render_positions(
         "<i>Ордера на биржу не отправляются.</i>",
         "",
     ]
+    lines.extend(render_balance_block(balance, max_open))
 
     lines.append(f"<b>Открыто сейчас: {len(open_rows)}</b>")
     if not open_rows:
