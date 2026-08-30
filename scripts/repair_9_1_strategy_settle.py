@@ -23,46 +23,30 @@ DO UPDATE), и исход ``timeout``, берущий итог из её ``close
 вывод проекта «выбор момента входа не даёт ничего».
 
 ПРИЗНАК ИСПОРЧЕННОЙ СТРОКИ — расчёт раньше закрытия последнего бара окна, и
-запас берётся ПО ФАКТИЧЕСКОМУ РАЗРЕШЕНИЮ СТРОКИ (Этап 9.1.1, §3 ТЗ):
+ЗАПАС БЕРЁТСЯ ПО КОЛОНКЕ ``resolution`` САМОЙ СТРОКИ (Этап 9.1.1 §2):
 
     computed_at < entry_ts + make_interval(hours => horizon_h)
                            + make_interval(secs => CASE resolution
                                                      WHEN '1m' THEN 60
-                                                     ELSE 3600 END)
-                           + make_interval(mins => BARRIER_SETTLE_MINUTES)
+                                                     WHEN '1h' THEN 3600
+                                                     ELSE settle_seconds()
+                                                   END)
 
-ПОЧЕМУ НЕ ``settle_seconds()``, КАК БЫЛО В ПЕРВОЙ РЕДАКЦИИ. ``settle_seconds()``
-закладывает длину ГРУБОГО бара (час) всем строкам подряд, и для ОТБОРА
-кандидатов это верно: разрешение выясняется уже ПОСЛЕ отбора, по факту покрытия
-окна минутным рядом, а ждать надо до него — то есть по худшему случаю. Но у
-УЖЕ ПОСЧИТАННОЙ строки разрешение известно и записано в колонке ``resolution``.
-Проверять её худшим случаем — значит объявлять исправное подозрительным.
+ПОЧЕМУ НЕ ОДНО ЧИСЛО НА ВСЕХ, как было в первой редакции. ``settle_seconds()``
+Этапа 8.10.1 закладывает длину ГРУБОГО бара (час), и при ОТБОРЕ кандидатов это
+верно: разрешение выясняется уже ПОСЛЕ отбора, по факту покрытия окна минутным
+рядом, а ждать надо до него — то есть по худшему случаю. Но у УЖЕ ПОСЧИТАННОЙ
+строки разрешение известно и записано. Проверять её худшим случаем — значит
+объявлять исправное подозрительным: на 30.08.2026 так получилось 7618 ложных
+срабатываний при 0 настоящих, и проверочный скрипт печатал «ОТКАТ ОБЯЗАТЕЛЕН»
+на полностью здоровой системе.
 
-ФОРМУЛА ЛЕЖИТ В ОДНОМ МЕСТЕ: ``DB.STRATEGY_UNSETTLED_PREDICATE``
-(``src/core/db.py``). Оба режима этого скрипта — счёт и ``--apply`` — спрашивают
-её, а не свою копию: две копии одного правила разошлись бы при следующей правке,
-и разошлись бы молча.
+``settle_seconds()`` при этом НИКУДА НЕ ДЕЛСЯ и остаётся запасом для
+НЕИЗВЕСТНОГО разрешения (ветка ELSE): появись в проекте третье разрешение, его
+строки будут проверяться худшим случаем, а не проскочат молча.
 
-ЧТО ПОКАЗАЛ ПЕРВЫЙ ЗАПУСК НА БОЕВЫХ ДАННЫХ (30.08.2026, ШИРОКИЙ КРИТЕРИЙ)
-
-    всего строк strategy_outcomes:            449 764
-    подозрительных по ШИРОКОМУ критерию:        7 618
-    посчитанных по НЕЗАКРЫТОМУ бару:                0
-    минимальный запас, стратегии по сигналам:  15 мин 12 с
-    минимальный запас, сеточные:               25 мин 02 с
-
-Все 7618 строк измерены по МИНУТНОМУ ряду (``resolution = '1m'``), где последний
-бар окна закрывается через 60 секунд после срока, а не через час. Требуемый им
-запас — 60 с + BARRIER_SETTLE_MINUTES (5 мин) = 360 с; фактический минимум по
-всей базе — 912 с. То есть ДЕФЕКТ В КОДЕ БЫЛ (сеточные стратегии действительно
-не ждали закрытия последнего бара), а ИСПОРЧЕННЫХ ДАННЫХ ОН НЕ ОСТАВИЛ: ночная
-задача 04:25 UTC приходит к паре сильно позже её срока.
-
-СЛЕДСТВИЕ: НИ ОДНА СТРОКА ``strategy_outcomes`` НЕ УДАЛЯЕТСЯ. Удаление 7618
-исправных измерений было бы не починкой, а потерей данных — тем более что
-пересчёт понизил бы уже снятое МИНУТНОЕ разрешение до ЧАСОВОГО там, где
-минутные свечи успела удалить политика хранения (RETENTION_1M_DAYS = 30 суток).
-Ровно это и защищает ``--apply`` (см. :func:`_forbid_deleting_fine_rows`).
+ФОРМУЛА ЛЕЖИТ В ОДНОМ ЭКЗЕМПЛЯРЕ — ``DB.STRATEGY_UNSETTLED_PREDICATE``
+(``src/core/db.py``). Два места, считающие одно и то же, однажды разойдутся.
 
 ОЖИДАНИЕ, ЗАПИСАННОЕ ДО ЗАПУСКА (правило проекта: предсказание фиксируется
 раньше расчёта). Подозрительными окажутся ТОЛЬКО строки ``grid_buy`` и
@@ -79,6 +63,26 @@ DO UPDATE), и исход ``timeout``, берущий итог из её ``close
 Отдельный путь пересчёта означал бы второй код, считающий то же самое, и
 однажды он разошёлся бы со штатным.
 
+ТРИ ОГРАЖДЕНИЯ ПЕРЕД УДАЛЕНИЕМ (§2.2 ТЗ 9.1.1). Удаление безвозвратно, а
+пересчёт возможен ТОЛЬКО после удаления — обратного хода нет, и цена ошибки
+поэтому высока:
+
+ 1. ОБЯЗАТЕЛЬНЫЙ СНИМОК. ``DELETE`` выполняется только после УСПЕШНОЙ записи
+    снимка «до». Не записался снимок — не удаляется ничего, код возврата 3.
+    Снимок — единственное, по чему потом можно сказать, что именно изменилось.
+ 2. ПОДТВЕРЖДЕНИЕ ЧИСЛОМ. ``--confirm-count=N`` обязателен при ``--apply``.
+    Перед удалением скрипт считает подозрительные строки ЗАНОВО, и если счёт не
+    равен N — не удаляет ничего, печатает оба числа, код возврата 4. Удаление
+    возможно только тогда, когда оператор своими глазами видел отчёт и назвал
+    то же самое число; расхождение означает, что база изменилась между отчётом
+    и удалением, и молча удалять в этот момент нельзя.
+ 3. НОЛЬ — НЕ ПОВОД РАБОТАТЬ. Подозрительных строк нет — печатается «удалять
+    нечего», код возврата 0, и транзакция не открывается вовсе.
+
+КОДЫ ВОЗВРАТА: 0 — работа выполнена (в том числе «удалять нечего»);
+3 — не удалось снять снимок «до», ничего не удалено; 4 — ``--confirm-count`` не
+совпал с фактическим счётом, ничего не удалено.
+
 ЗАПУСК ВНУТРИ КОНТЕЙНЕРА (правило проекта: пакетов на хосте нет). В образ
 копируются только ``src/`` и ``backtest/`` (см. Dockerfile), поэтому каталог
 скриптов подключается томом только на чтение:
@@ -88,10 +92,12 @@ DO UPDATE), и исход ``timeout``, берущий итог из её ``close
         -v ./scripts:/app/scripts:ro -v ./reports:/app/reports \\
         barrier python -m scripts.repair_9_1_strategy_settle
 
-    # 2. снимок «до» + удаление подозрительных строк:
+    # 2. снимок «до» + удаление подозрительных строк. Число берётся ИЗ ОТЧЁТА
+    #    шага 1 и набирается руками — в этом весь смысл подтверждения:
     docker compose --profile tools run --rm --no-deps \\
         -v ./scripts:/app/scripts:ro -v ./reports:/app/reports \\
-        barrier python -m scripts.repair_9_1_strategy_settle --apply
+        barrier python -m scripts.repair_9_1_strategy_settle \\
+        --apply --confirm-count=7618
 
     # 3. после очередного прогона базовых стратегий — снимок «после»:
     docker compose --profile tools run --rm --no-deps \\
@@ -109,14 +115,8 @@ from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.core.config import settings  # noqa: E402
+from src.barrier.runner import settle_seconds  # noqa: E402
 from src.core.db import db  # noqa: E402
-
-# Длина последнего бара окна по разрешению строки, секунд. Те же числа, что в
-# ``src.barrier.outcomes.BAR_SECONDS`` и в SQL-предикате
-# ``DB.STRATEGY_UNSETTLED_PREDICATE``; здесь они нужны только защите ``--apply``,
-# которая обязана уметь объяснить своё решение человеку числом.
-BAR_SECONDS_BY_RESOLUTION = {"1m": 60, "1h": 3600}
 
 # Куда кладутся снимки. Каталог тот же, что у остальных отчётов проекта.
 _REPORTS_DIR = os.path.join(
@@ -143,24 +143,13 @@ def _fmt(value: Any, digits: int = 6) -> str:
     return f"{float(value):.{digits}f}"
 
 
-def _rule_text(settle_min: int) -> str:
-    """Критерий одной строкой — тем же текстом, каким он записан в SQL.
-
-    Печатается ВЕЗДЕ, где скрипт называет строку подозрительной: следующий
-    человек не должен полдня выяснять, врёт измеритель или измеряемое.
-    """
-    return (
-        "computed_at < entry_ts + horizon_h ч + (60 с для '1m' / 3600 с для "
-        f"'1h') + {settle_min} мин (BARRIER_SETTLE_MINUTES)"
-    )
-
-
-def _snapshot_text(rows: list[dict[str, Any]], settle_min: int, moment: str) -> str:
+def _snapshot_text(rows: list[dict[str, Any]], settle: int, moment: str) -> str:
     """Снимок «до/после» текстом: по паре (стратегия, горизонт) — три величины."""
     lines = [
         "Снимок strategy_outcomes (Этап 9.1, Задача Б)",
         f"Момент снятия (UTC): {moment}",
-        f"Критерий подозрительности: {_rule_text(settle_min)}",
+        f"Критерий: запас по колонке resolution (60 с для '1m', 3600 с для "
+        f"'1h', {settle} с для неизвестного)",
         "",
         "Строки без итога (no_data, ambiguous) входят в «строк», но не в среднее:",
         "среднее по неизвестному не определено.",
@@ -182,13 +171,19 @@ def _snapshot_text(rows: list[dict[str, Any]], settle_min: int, moment: str) -> 
     return "\n".join(lines) + "\n"
 
 
-async def _write_snapshot(path: str, settle_min: int) -> list[dict[str, Any]]:
-    """Снимает и сохраняет снимок. Возвращает строки — их же печатает вызвавший."""
+async def _write_snapshot(path: str, settle: int) -> list[dict[str, Any]]:
+    """Снимает и сохраняет снимок. Возвращает строки — их же печатает вызвавший.
+
+    ИСКЛЮЧЕНИЯ НЕ ГЛУШАТСЯ. Несостоявшийся снимок — это повод НЕ УДАЛЯТЬ, а не
+    повод продолжить без снимка: удаление безвозвратно, и без снимка «до» потом
+    нечем будет сказать, что именно исчезло. Ловит их вызывающий (:func:`main`)
+    и возвращает код 3.
+    """
     from datetime import UTC, datetime
 
     rows = await db.get_strategy_stats_snapshot()
     text = _snapshot_text(
-        rows, settle_min, datetime.now(UTC).isoformat(timespec="seconds")
+        rows, settle, datetime.now(UTC).isoformat(timespec="seconds")
     )
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as handle:
@@ -210,87 +205,15 @@ def _print_breakdown(title: str, counter: dict[Any, int], total: int) -> None:
         print(f"    {str(key):<28} {counter[key]:>8}  ({share:.2f}%)")
 
 
-def _required_margin_sec(resolution: str, settle_min: int) -> int | None:
-    """Сколько секунд строке этого разрешения полагалось ждать после срока.
-
-    ``None`` для разрешения, которого нет в перечне: выдумывать длину бара для
-    неизвестного ряда нельзя — это была бы точность, которой нет.
-    """
-    bar = BAR_SECONDS_BY_RESOLUTION.get(resolution)
-    return None if bar is None else bar + settle_min * 60
-
-
-def _fine_rows_with_enough_margin(
-    rows: list[dict[str, Any]], settle_min: int
-) -> list[dict[str, Any]]:
-    """Строки МИНУТНОГО ряда, чей запас БОЛЬШЕ положенных 60 с + settle.
-
-    Такая строка исправна: её последний бар закрылся за 60 секунд до расчёта, и
-    ещё BARRIER_SETTLE_MINUTES прошло сверх того. Попасть под удаление она может
-    только одним способом — если критерий подозрительности снова расширили до
-    худшего случая. Проверка стоит здесь именно как ловушка на этот случай.
-    """
-    guilty: list[dict[str, Any]] = []
-    for row in rows:
-        resolution = str(row["resolution"])
-        if resolution != "1m":
-            continue
-        need = _required_margin_sec(resolution, settle_min)
-        margin = row.get("margin_sec")
-        if need is None or margin is None:
-            continue
-        if float(margin) > float(need):
-            guilty.append(row)
-    return guilty
-
-
-def _forbid_deleting_fine_rows(
-    rows: list[dict[str, Any]], settle_min: int
-) -> int:
-    """Защита ``--apply`` (§3.2 ТЗ 9.1.1). 0 — можно продолжать, 1 — отказ.
-
-    ПОЧЕМУ ОТКАЗ ЦЕЛИКОМ, А НЕ ПРОПУСК ТАКИХ СТРОК. Удаление измерения
-    необратимо. Минутные свечи старше RETENTION_1M_DAYS уже удалены политикой
-    хранения, поэтому «удалим и пересчитаем» вернуло бы не то же самое число, а
-    ЧАСОВОЕ разрешение вместо минутного — незаметную подмену измерения. Скрипт,
-    который в такой ситуации сделал бы часть работы, оставил бы базу в
-    состоянии, про которое нельзя сказать, что в ней померено.
-    """
-    guilty = _fine_rows_with_enough_margin(rows, settle_min)
-    if not guilty:
-        return 0
-    need = _required_margin_sec("1m", settle_min)
-    margins = sorted(float(r["margin_sec"]) for r in guilty)
-    print()
-    print("=" * 78)
-    print(" ОТКАЗ: под удаление попали ИСПРАВНЫЕ строки минутного ряда")
-    print("=" * 78)
-    print(f"  Таких строк: {len(guilty)}")
-    print(f"  Запас у них: от {margins[0]:.0f} до {margins[-1]:.0f} с "
-          f"при требуемых {need} с (60 с бар + {settle_min} мин)")
-    print()
-    print("  ПОЧЕМУ ЭТО ОТКАЗ, А НЕ ПРЕДУПРЕЖДЕНИЕ. Строка с resolution='1m' и")
-    print("  запасом больше 60 с + BARRIER_SETTLE_MINUTES посчитана по ЗАКРЫТОМУ")
-    print("  бару — она исправна. Её удаление необратимо: минутные свечи старше")
-    print(f"  RETENTION_1M_DAYS ({settings.RETENTION_1M_DAYS} суток) уже удалены")
-    print("  политикой хранения, и пересчёт вернул бы ЧАСОВОЕ разрешение вместо")
-    print("  минутного — то есть другое измерение под тем же ключом.")
-    print()
-    print("  Появление таких строк здесь означает, что критерий подозрительности")
-    print("  снова расширен до худшего случая. Чинить надо критерий")
-    print("  (DB.STRATEGY_UNSETTLED_PREDICATE), а не данные.")
-    print()
-    print("  Ничего не удалено. Код возврата 1.")
-    return 1
-
-
-async def _report(settle_min: int) -> list[dict[str, Any]]:
+async def _report(settle: int) -> list[dict[str, Any]]:
     """Считает подозрительные строки и печатает всё, что требует §2.3 ТЗ."""
-    total = await db.count_strategy_outcomes_unsettled(settle_minutes=settle_min)
+    total = await db.count_strategy_outcomes_unsettled(settle_seconds=settle)
     print("=" * 78)
     print(" ПОДОЗРИТЕЛЬНЫЕ СТРОКИ strategy_outcomes (Этап 9.1, Задача Б)")
     print("=" * 78)
-    print(f"  Правило: {_rule_text(settle_min)}")
+    print("  Правило: computed_at < entry_ts + horizon_h ч + запас по колонке")
+    print(f"           resolution (60 с для '1m', 3600 с для '1h', {settle} с")
+    print("           для неизвестного разрешения)")
     print(f"  Всего подозрительных строк: {total}")
 
     if total == 0:
@@ -298,7 +221,7 @@ async def _report(settle_min: int) -> list[dict[str, Any]]:
         print("  Строк, посчитанных по незакрытому бару, нет.")
         return []
 
-    rows = await db.get_strategy_outcomes_unsettled(settle_minutes=settle_min)
+    rows = await db.get_strategy_outcomes_unsettled(settle_seconds=settle)
 
     by_pair: dict[Any, int] = {}
     by_outcome: dict[Any, int] = {}
@@ -317,28 +240,24 @@ async def _report(settle_min: int) -> list[dict[str, Any]]:
 
     _print_breakdown("По стратегии и горизонту:", by_pair, total)
     _print_breakdown("По исходу:", by_outcome, total)
-    # РАЗБИВКА ПО РАЗРЕШЕНИЮ ОБЯЗАТЕЛЬНА (§2 ТЗ 9.1.1): именно разрешение
-    # задаёт, сколько строке полагалось ждать, и без него разбор находки
-    # начинался бы с выяснения, чем эти строки вообще меряли.
+    # РАЗБИВКА ПО РАЗРЕШЕНИЮ ОБЯЗАТЕЛЬНА: именно оно задаёт, сколько строке
+    # полагалось ждать, и без него разбор находки начинается с выяснения, чем
+    # эти строки вообще меряли.
     _print_breakdown("По разрешению ряда:", by_resolution, total)
 
     print()
     print(f"  Примеры (до {_EXAMPLES} строк):")
     print(
         f"    {'стратегия':<11} {'инстр.':>6} {'entry_ts':<25} {'гор.':>4} "
-        f"{'computed_at':<25} {'разр.':>6} {'запас, с':>10} "
-        f"{'нужно, с':>10} {'исход':<10} {'net_pnl_pct':>12}"
+        f"{'computed_at':<25} {'разр.':>6} {'исход':<10} {'net_pnl_pct':>12}"
     )
     for row in rows[:_EXAMPLES]:
-        need = _required_margin_sec(str(row["resolution"]), settle_min)
         print(
             f"    {str(row['strategy']):<11} {int(row['instrument_id']):>6} "
             f"{row['entry_ts'].isoformat(timespec='seconds'):<25} "
             f"{int(row['horizon_h']):>4} "
             f"{row['computed_at'].isoformat(timespec='seconds'):<25} "
             f"{str(row['resolution']):>6} "
-            f"{_fmt(row['margin_sec'], 0):>10} "
-            f"{('—' if need is None else str(need)):>10} "
             f"{str(row['outcome']):<10} {_fmt(row['net_pnl_pct']):>12}"
         )
 
@@ -385,71 +304,112 @@ async def main() -> int:
         action="store_true",
         help="снять снимок «после» и выйти, ничего не удаляя",
     )
+    parser.add_argument(
+        "--confirm-count",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "ОБЯЗАТЕЛЕН при --apply: число подозрительных строк, увиденное в "
+            "отчёте. Перед удалением скрипт пересчитывает их заново и удаляет "
+            "только при совпадении."
+        ),
+    )
     args = parser.parse_args()
 
     if args.apply and args.snapshot_only:
         parser.error("--apply и --snapshot-only несовместимы: одно снимает "
                      "снимок «после», другое удаляет строки")
+    # ПОДТВЕРЖДЕНИЕ ОБЯЗАТЕЛЬНО И ПРОВЕРЯЕТСЯ ДО ПОДКЛЮЧЕНИЯ К БАЗЕ: забытый
+    # аргумент обязан останавливать на пороге, а не после того, как скрипт уже
+    # что-то сделал.
+    if args.apply and args.confirm_count is None:
+        parser.error(
+            "--apply требует --confirm-count=N, где N — число подозрительных "
+            "строк из отчёта (запустите скрипт без --apply и возьмите его "
+            "оттуда). Удаление безвозвратно, а пересчёт возможен только после "
+            "удаления: назвать число должен человек, а не скрипт сам себе"
+        )
+    if args.confirm_count is not None and not args.apply:
+        parser.error("--confirm-count имеет смысл только вместе с --apply")
 
-    settle_min = int(settings.BARRIER_SETTLE_MINUTES)
+    settle = settle_seconds()
     await db.connect()
     try:
         if args.snapshot_only:
             print("=" * 78)
             print(" СНИМОК «ПОСЛЕ» (Этап 9.1, Задача Б)")
             print("=" * 78)
-            await _write_snapshot(SNAPSHOT_AFTER, settle_min)
+            await _write_snapshot(SNAPSHOT_AFTER, settle)
             # Снимок «после» ценен ровно тем, что показывает: подозрительных
             # строк не осталось. Печатаем счёт рядом, иначе его пришлось бы
             # запрашивать отдельно.
-            left = await db.count_strategy_outcomes_unsettled(
-                settle_minutes=settle_min
-            )
+            left = await db.count_strategy_outcomes_unsettled(settle_seconds=settle)
             print()
             print(f"  Подозрительных строк осталось: {left} (ожидается 0)")
             return 0
 
-        rows = await _report(settle_min)
+        rows = await _report(settle)
 
         if not args.apply:
             print()
             print("  Ничего не изменено: без --apply скрипт только считает.")
             if rows:
-                # ПОДСКАЗКИ «УДАЛИТЬ ИХ КОМАНДОЙ …» ЗДЕСЬ БОЛЬШЕ НЕТ, и это не
-                # упущение. Первый запуск на боевых данных (см. шапку) показал,
-                # что прежняя подсказка предлагала снести 7618 ИСПРАВНЫХ строк.
-                # Скрипт, предлагающий необратимое действие раньше, чем находка
-                # разобрана, приучает выполнять его не глядя.
-                print("  Прежде чем удалять, разберите находку: под критерий")
-                print(f"  «{_rule_text(settle_min)}»")
-                print("  исправная строка попасть не может. Если строки есть —")
-                print("  это НАСТОЯЩАЯ находка, и её надо доложить с разбивкой")
-                print("  выше, а не удалять. Удаление необратимо и понижает")
-                print("  разрешение уже снятых измерений (см. шапку скрипта).")
+                print("  Чтобы удалить, назовите это же число своими руками:")
+                print(f"    ... --apply --confirm-count={len(rows)}")
             return 0
 
+        # ОГРАЖДЕНИЕ 3: НОЛЬ — НЕ ПОВОД РАБОТАТЬ. Транзакция не открывается
+        # вовсе: удаление нуля строк — это не «безобидная работа», а работа,
+        # которой не должно было быть, и снимок «до» при ней описывал бы
+        # состояние, ничем не отличающееся от текущего.
         if not rows:
             print()
-            print("  Удалять нечего — снимок «до» не снимается: он описывал бы")
-            print("  состояние, которое ничем не отличается от текущего.")
+            print("  Удалять нечего: подозрительных строк 0.")
+            print("  Снимок «до» не снимается, транзакция не открывается.")
             return 0
 
-        # ЗАЩИТА ИДЁТ ДО СНИМКА «ДО» И ДО УДАЛЕНИЯ. Снимок — уже действие: он
-        # переписывает файл в reports/, и делать его перед отказом значило бы
-        # оставить след работы, которая не состоялась.
-        refused = _forbid_deleting_fine_rows(rows, settle_min)
-        if refused:
-            return refused
+        # ОГРАЖДЕНИЕ 2: ПОДТВЕРЖДЕНИЕ ЧИСЛОМ. Счёт берётся ЗАНОВО, а не из
+        # отчёта выше: между отчётом и удалением база могла измениться, и
+        # именно это расхождение проверка обязана поймать.
+        actual = await db.count_strategy_outcomes_unsettled(settle_seconds=settle)
+        if int(actual) != int(args.confirm_count):
+            print()
+            print("=" * 78)
+            print(" ОТКАЗ: подтверждение не совпало с фактическим счётом")
+            print("=" * 78)
+            print(f"  Названо в --confirm-count: {int(args.confirm_count)}")
+            print(f"  Фактически подозрительных: {int(actual)}")
+            print()
+            print("  Расхождение означает, что база изменилась между отчётом и")
+            print("  удалением. Молча удалять в этот момент нельзя: удаляемое")
+            print("  множество уже не то, которое видел человек.")
+            print("  Ничего не удалено. Перечитайте отчёт и повторите команду с")
+            print(f"  --confirm-count={int(actual)}, если это по-прежнему то,")
+            print("  что вы хотите удалить.")
+            return 4
 
+        # ОГРАЖДЕНИЕ 1: ОБЯЗАТЕЛЬНЫЙ СНИМОК. Не записался — не удаляем.
         print()
         print("=" * 78)
         print(" СНИМОК «ДО» (Этап 9.1, Задача Б)")
         print("=" * 78)
-        await _write_snapshot(SNAPSHOT_BEFORE, settle_min)
+        try:
+            await _write_snapshot(SNAPSHOT_BEFORE, settle)
+        except Exception as exc:  # noqa: BLE001 — причина важнее трейсбека
+            print()
+            print("=" * 78)
+            print(" ОТКАЗ: не удалось записать снимок «до»")
+            print("=" * 78)
+            print(f"  Причина: {type(exc).__name__}: {exc}")
+            print(f"  Путь снимка: {SNAPSHOT_BEFORE}")
+            print()
+            print("  Удаление безвозвратно, а снимок «до» — единственное, по")
+            print("  чему потом можно сказать, что именно исчезло. Без него не")
+            print("  удаляем. Ничего не удалено.")
+            return 3
 
-        deleted = await db.delete_strategy_outcomes_unsettled(
-            settle_minutes=settle_min
-        )
+        deleted = await db.delete_strategy_outcomes_unsettled(settle_seconds=settle)
         print()
         print(f"  Удалено подозрительных строк: {deleted}")
         print()

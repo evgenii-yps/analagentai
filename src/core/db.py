@@ -1149,69 +1149,69 @@ class DB:
     # ON CONFLICT DO NOTHING, а ключи уже посчитанных строк отсеиваются до
     # чтения окна (get_strategy_pairs_done). Поэтому единственный способ
     # пересчитать — сначала удалить.
+
+    # ЗАПАС БЕРЁТСЯ ПО ФАКТИЧЕСКОМУ РАЗРЕШЕНИЮ СТРОКИ (Этап 9.1.1 §2).
     #
-    # ЗАПАС БЕРЁТСЯ ПО ФАКТИЧЕСКОМУ РАЗРЕШЕНИЮ СТРОКИ (Этап 9.1.1, §2 ТЗ), а не
-    # по худшему случаю. Прежняя редакция закладывала длину ГРУБОГО бара (час)
-    # всем строкам подряд — так же, как это делает barrier.runner.settle_seconds()
-    # при ОТБОРЕ кандидатов. Там это верно: разрешение выясняется ПОСЛЕ отбора,
-    # и ждать приходится по худшему случаю. Здесь — неверно: у УЖЕ ПОСЧИТАННОЙ
-    # строки разрешение известно и записано в колонке resolution, и мерить её
-    # худшим случаем значит объявлять исправное подозрительным. Замер на боевой
-    # базе 30.08.2026: широкий критерий давал 7618 «подозрительных» строк, из
-    # которых по незакрытому бару не была посчитана НИ ОДНА (минимальный запас
-    # 15 мин 12 с при требуемых 60 с + 5 мин).
+    # ПОЧЕМУ НЕ ОДНО ЧИСЛО НА ВСЕХ, как было раньше. Запас в 3900 секунд (час
+    # грубого бара плюс BARRIER_SETTLE_MINUTES) верен ПРИ ОТБОРЕ кандидатов:
+    # там разрешение ещё неизвестно, оно выяснится по факту покрытия окна
+    # минутным рядом, и ждать приходится по худшему случаю. Но у УЖЕ
+    # ПОСЧИТАННОЙ строки разрешение известно и записано в колонке resolution
+    # (ограничение strategy_outcomes_resolution_chk, миграция 016). Все
+    # 449 764 строки боевой базы посчитаны по МИНУТНОМУ ряду, где последний бар
+    # окна закрывается через 60 секунд после срока, — и проверка их запасом в
+    # 3900 секунд объявила подозрительными 7618 ИСПРАВНЫХ строк при 0
+    # настоящих (замер 30.08.2026).
     #
-    # ЕДИНСТВЕННОЕ МЕСТО ФОРМУЛЫ. Оба режима scripts/repair_9_1_strategy_settle.py
-    # (счёт и --apply) и deploy/verify_9_1.sh (пункт Б6) обязаны спрашивать одно
-    # и то же: две копии одного правила разошлись бы при следующей правке, и
-    # разошлись бы молча. Bash-копия в verify_9_1.sh повторена ТЕКСТУАЛЬНО и
-    # помечена ссылкой сюда — разделяемого кода между bash и Python нет.
+    # ВЕТКА ELSE — НЕ ФОРМАЛЬНОСТЬ. Появись в проекте третье разрешение, его
+    # строки будут проверяться ХУДШИМ случаем ($1, то есть settle_seconds()),
+    # а не проскочат молча: неизвестное разрешение обязано вызывать подозрение,
+    # а не доверие.
     STRATEGY_UNSETTLED_PREDICATE = (
         "computed_at < entry_ts "
         "+ make_interval(hours => horizon_h::int) "
         "+ make_interval(secs => CASE resolution "
-        "WHEN '1m' THEN 60 ELSE 3600 END) "
-        "+ make_interval(mins => $1::int)"
-    )
-
-    # Запас строки в СЕКУНДАХ: насколько расчёт отстал от срока окна. Величина
-    # печатается в примерах и по ней же работает защита --apply, поэтому она
-    # тоже считается базой, а не пересчитывается в питоне из двух таймстемпов.
-    STRATEGY_SETTLE_MARGIN_SEC = (
-        "EXTRACT(EPOCH FROM (computed_at - entry_ts "
-        "- make_interval(hours => horizon_h::int)))"
+        "                          WHEN '1m' THEN 60 "
+        "                          WHEN '1h' THEN 3600 "
+        "                          ELSE $1::int END)"
     )
 
     async def count_strategy_outcomes_unsettled(
-        self, *, settle_minutes: int
+        self, *, settle_seconds: int
     ) -> int:
-        """Сколько строк посчитано раньше, чем закрылся последний бар окна."""
+        """Сколько строк посчитано раньше, чем закрылся последний бар окна.
+
+        ``settle_seconds`` — запас для НЕИЗВЕСТНОГО разрешения (ветка ELSE
+        предиката). У строк с ``resolution`` из перечня 016 запас берётся по
+        самому разрешению, и этот параметр их не касается. Имя параметра
+        оставлено прежним намеренно: его значение по-прежнему приходит из
+        ``barrier.runner.settle_seconds()``, и переименование заставило бы
+        править вызовы ради того же самого числа.
+        """
         value = await self.pool.fetchval(
             "SELECT count(*) FROM strategy_outcomes "
             f"WHERE {self.STRATEGY_UNSETTLED_PREDICATE};",
-            int(settle_minutes),
+            int(settle_seconds),
         )
         return int(value or 0)
 
     async def get_strategy_outcomes_unsettled(
-        self, *, settle_minutes: int, limit: int | None = None
+        self, *, settle_seconds: int, limit: int | None = None
     ) -> list[dict[str, Any]]:
         """Подозрительные строки целиком — для разбивок и примеров в отчёте.
 
-        ``resolution`` и ``margin_sec`` возвращаются наравне с остальным: по
-        ним работает защита ``--apply`` (§3.2 ТЗ 9.1.1), и брать их отдельным
-        запросом значило бы читать ДРУГОЙ набор строк — база за это время
-        успела бы дописать новые.
+        ``resolution`` возвращается наравне с остальным: именно оно задаёт,
+        сколько строке полагалось ждать, и разбор находки без него начинался бы
+        с выяснения, чем эти строки вообще меряли.
         """
         query = (
             "SELECT strategy, instrument_id, entry_ts, horizon_h, computed_at, "
-            "       outcome, net_pnl_pct, logic_version, resolution, "
-            f"       {self.STRATEGY_SETTLE_MARGIN_SEC} AS margin_sec "
+            "       outcome, net_pnl_pct, logic_version, resolution "
             "FROM strategy_outcomes "
             f"WHERE {self.STRATEGY_UNSETTLED_PREDICATE} "
             "ORDER BY entry_ts DESC, strategy ASC"
         )
-        args: list[Any] = [int(settle_minutes)]
+        args: list[Any] = [int(settle_seconds)]
         if limit is not None:
             query += " LIMIT $2"
             args.append(int(limit))
@@ -1219,9 +1219,15 @@ class DB:
         return [dict(r) for r in rows]
 
     async def delete_strategy_outcomes_unsettled(
-        self, *, settle_minutes: int
+        self, *, settle_seconds: int
     ) -> int:
         """Удаляет ТОЛЬКО подозрительные строки. Возвращает число удалённых.
+
+        ЗВАТЬ ЕГО НАПРЯМУЮ НЕЛЬЗЯ. Единственный путь к нему —
+        ``scripts/repair_9_1_strategy_settle.py --apply``, и там перед вызовом
+        стоят три ограждения (§2.2 ТЗ 9.1.1): снятый снимок «до», совпавшее
+        подтверждение числом и ненулевой счёт. Удаление безвозвратно, а
+        пересчёт возможен ТОЛЬКО после удаления — обратного хода нет.
 
         Пересчёт этот метод НЕ выполняет и выполнять не должен: удалённые ключи
         исчезают из множества «уже посчитано», и очередной штатный прогон
@@ -1232,7 +1238,7 @@ class DB:
         status = await self.pool.execute(
             "DELETE FROM strategy_outcomes "
             f"WHERE {self.STRATEGY_UNSETTLED_PREDICATE};",
-            int(settle_minutes),
+            int(settle_seconds),
         )
         return int(status.rsplit(" ", 1)[-1]) if status else 0
 
@@ -1300,6 +1306,38 @@ class DB:
         await self.pool.execute(
             "CREATE INDEX IF NOT EXISTS ix_positions_status_opened "
             "ON positions (status, opened_at DESC);"
+        )
+        # ПЯТОЕ ЗНАЧЕНИЕ ПРИЧИНЫ ВЫХОДА (миграция 019) — на уже существующей
+        # таблице. Блок POSITIONS_CHECKS выше трогает ограничение только если
+        # его нет вовсе, а здесь оно есть и, возможно, ещё из четырёх значений:
+        # миграция 019 могла быть не применена на работающем томе.
+        #
+        # ЧЕМ ЭТО ГРОЗИТ, ЕСЛИ НЕ ЧИНИТЬ. Закрытие по пробелу в данных упало бы
+        # на нарушении ограничения, сервис (он не падает по построению) записал
+        # бы это предупреждением в журнал, и позиция осталась бы висеть вечно —
+        # ровно то, ради устранения чего §6 и написан.
+        #
+        # Ограничение пересоздаётся ТОЛЬКО если оно ещё не знает data_gap:
+        # безусловный DROP/ADD на каждом старте оставлял бы таблицу на доли
+        # секунды без закрытого перечня причин.
+        await self.pool.execute(
+            """
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname = 'positions_reason_chk'
+                      AND conrelid = 'positions'::regclass
+                      AND pg_get_constraintdef(oid) NOT LIKE '%data_gap%'
+                ) THEN
+                    ALTER TABLE positions DROP CONSTRAINT positions_reason_chk;
+                    ALTER TABLE positions ADD CONSTRAINT positions_reason_chk
+                        CHECK (exit_reason IS NULL OR exit_reason IN
+                               ('target', 'stop', 'timeout', 'ambiguous',
+                                'data_gap'));
+                END IF;
+            END $$;
+            """
         )
         # Роль только на чтение (сервис бота) должна видеть таблицу сразу:
         # её GRANT ON ALL TABLES отработал, когда таблицы ещё не было, и без
@@ -1528,9 +1566,13 @@ class DB:
     async def get_positions_summary(self, *, days: int = 7) -> dict[str, Any]:
         """Итог по закрытым позициям за окно — для бота (§10) и отчёта.
 
-        Средний ``net_pnl_pct`` и сумма ``net_pnl_usd`` считаются по ВСЕМ
-        закрытым позициям окна, включая ``ambiguous``: у тех итог определён (он
-        взят по пределу, пессимистично), просто менее достоверен. Их число
+        Средний ``net_pnl_pct`` и сумма ``net_pnl_usd`` считаются по закрытым
+        позициям окна, включая ``ambiguous``: у тех итог определён (он взят по
+        пределу, пессимистично), просто менее достоверен. ЗАКРЫТИЯ ПО ПРОБЕЛУ В
+        ДАННЫХ (``data_gap``, Этап 9.1.1 §6.7) в средние и суммы НЕ ВХОДЯТ: у
+        них цена выхода не наблюдалась, а восстановлена, и их итог описывает
+        длительность сбоя сбора данных, а не поведение рынка. Их число
+        возвращается отдельным полем. Их число
         печатается ОТДЕЛЬНОЙ строкой — так видно, велика ли их доля, и при этом
         средний итог не оказывается посчитанным по выборке, отличной от той,
         которую человек видит в разбивке по причинам.
@@ -1539,9 +1581,13 @@ class DB:
             """
             SELECT count(*) AS closed,
                    count(*) FILTER (WHERE outcome_certain = FALSE) AS uncertain,
-                   avg(net_pnl_pct) AS avg_net_pnl_pct,
-                   sum(net_pnl_usd) AS sum_net_pnl_usd,
-                   avg(entry_slippage_pct) AS avg_slippage_pct,
+                   count(*) FILTER (WHERE exit_reason = 'data_gap') AS data_gap,
+                   avg(net_pnl_pct) FILTER (WHERE exit_reason <> 'data_gap')
+                       AS avg_net_pnl_pct,
+                   sum(net_pnl_usd) FILTER (WHERE exit_reason <> 'data_gap')
+                       AS sum_net_pnl_usd,
+                   avg(entry_slippage_pct) FILTER (WHERE exit_reason <> 'data_gap')
+                       AS avg_slippage_pct,
                    avg(entry_lag_sec) AS avg_lag_sec
             FROM positions
             WHERE status = 'closed'
@@ -1565,130 +1611,6 @@ class DB:
             str(r["exit_reason"]): int(r["n"]) for r in reasons
         }
         return summary
-
-    # --- Учёт баланса (Этап 9.1.1 §6) ---
-
-    async def get_balance(
-        self, *, capital_start: float
-    ) -> dict[str, Any]:
-        """Пять величин счёта ОДНИМ запросом.
-
-        ОТДЕЛЬНОЙ ТАБЛИЦЫ ДЛЯ БАЛАНСА НЕТ И БЫТЬ НЕ ДОЛЖНО. Хранимый баланс —
-        это второй источник истины, который однажды разойдётся с первым:
-        итог сделки уже лежит в ``positions.net_pnl_usd``, и любое второе место
-        хранения пришлось бы держать в согласии с ним вручную. Величины
-        вычисляются запросом; расходиться нечему.
-
-        ОДНИМ ЗАПРОСОМ, А НЕ ПЯТЬЮ. Позиция может закрыться между двумя
-        запросами, и тогда ``free`` посчиталось бы по одному состоянию базы, а
-        ``in_positions`` — по другому: сумма не сошлась бы, и понять почему было
-        бы нечем.
-
-        ``capital_start`` приходит параметром из настроек, а не читается из
-        базы: это условие замера, а не измеренная величина.
-        """
-        row = await self.pool.fetchrow(BALANCE_SQL, float(capital_start))
-        return {
-            "capital_start": float(row["capital_start"]),
-            "realized_pnl": float(row["realized_pnl"]),
-            "in_positions": float(row["in_positions"]),
-            "free": float(row["free"]),
-            "open_count": int(row["open_count"]),
-        }
-
-    # --- Выгрузка закрытых позиций в Google Таблицу (Этап 9.1.1 §7) ---
-
-    async def ensure_positions_sheet_column(self) -> None:
-        """Идемпотентно добавляет ``sheet_exported_at`` (миграция 019).
-
-        Миграция 018 УЖЕ ПРИМЕНЕНА НА СЕРВЕРЕ и не редактируется: новая колонка
-        идёт отдельной миграцией, а сервис — как и с остальными таблицами —
-        гарантирует свою схему при старте, потому что миграция могла быть не
-        применена на уже работающем томе.
-        """
-        await self.pool.execute(
-            "ALTER TABLE positions "
-            "ADD COLUMN IF NOT EXISTS sheet_exported_at TIMESTAMPTZ;"
-        )
-        await self.pool.execute(
-            "CREATE INDEX IF NOT EXISTS ix_positions_sheet_pending "
-            "ON positions (closed_at ASC) "
-            "WHERE status = 'closed' AND sheet_exported_at IS NULL;"
-        )
-
-    async def get_positions_for_sheet(
-        self, *, instrument_symbol: str, limit: int | None = None
-    ) -> list[dict[str, Any]]:
-        """Закрытые позиции ОДНОГО инструмента, ещё не записанные в лист.
-
-        ПОРЯДОК — ПО ВРЕМЕНИ ЗАКРЫТИЯ, ПО ВОЗРАСТАНИЮ. Лист моделирует один
-        кошелёк цепочкой «объём следующей строки = объём предыдущей + прибыль
-        предыдущей», и строки, легшие не в том порядке, дали бы правдоподобную
-        и неверную цепочку.
-
-        ОТКРЫТЫЕ ПОЗИЦИИ НЕ ВОЗВРАЩАЮТСЯ: у них нет цены закрытия, и полустрока
-        сломала бы формулы листа.
-        """
-        # status и sheet_exported_at возвращаются наравне с остальным, хотя
-        # запрос по ним же и отбирает: правило «что годится в лист» живёт в
-        # src.positions.sheet.is_exportable, и вызывающий обязан иметь чем его
-        # применить — иначе правило существовало бы в двух видах, здесь и там.
-        query = """
-            SELECT p.id, i.symbol, p.status, p.opened_at, p.signal_ts,
-                   p.entry_price, p.closed_at, p.exit_price, p.net_pnl_usd,
-                   p.net_pnl_pct, p.sheet_exported_at
-            FROM positions p
-            JOIN instruments i ON i.id = p.instrument_id
-            WHERE p.status = 'closed'
-              AND p.sheet_exported_at IS NULL
-              AND i.symbol = $1
-            ORDER BY p.closed_at ASC, p.id ASC
-        """
-        args: list[Any] = [str(instrument_symbol)]
-        if limit is not None:
-            query += " LIMIT $2"
-            args.append(int(limit))
-        rows = await self.pool.fetch(query + ";", *args)
-        return [dict(r) for r in rows]
-
-    async def get_last_position_for_sheet(
-        self, *, instrument_symbol: str
-    ) -> dict[str, Any] | None:
-        """Последняя ЗАКРЫТАЯ позиция инструмента — для ``--dry-run`` (§7.8).
-
-        Отметка ``sheet_exported_at`` здесь НЕ учитывается намеренно: сверка
-        глазами выполняется до первой записи и после неё одинаково, и требовать
-        для неё незаписанную позицию значило бы сделать проверку недоступной
-        ровно тогда, когда она уже работает.
-        """
-        row = await self.pool.fetchrow(
-            """
-            SELECT p.id, i.symbol, p.status, p.opened_at, p.signal_ts,
-                   p.entry_price, p.closed_at, p.exit_price, p.net_pnl_usd,
-                   p.net_pnl_pct, p.sheet_exported_at
-            FROM positions p
-            JOIN instruments i ON i.id = p.instrument_id
-            WHERE p.status = 'closed' AND i.symbol = $1
-            ORDER BY p.closed_at DESC, p.id DESC
-            LIMIT 1;
-            """,
-            str(instrument_symbol),
-        )
-        return dict(row) if row is not None else None
-
-    async def mark_position_sheet_exported(self, position_id: int) -> bool:
-        """Ставит отметку ПОСЛЕ подтверждённой записи строки. Идемпотентна.
-
-        Условие ``sheet_exported_at IS NULL`` в запросе обязательно: без него
-        повторный прогон переписал бы момент первой записи вторым, и по колонке
-        уже нельзя было бы сказать, когда строка попала в лист.
-        """
-        status = await self.pool.execute(
-            "UPDATE positions SET sheet_exported_at = now(), updated_at = now() "
-            "WHERE id = $1 AND sheet_exported_at IS NULL;",
-            int(position_id),
-        )
-        return bool(status and status.rsplit(" ", 1)[-1] != "0")
 
     # --- Подвижный выход (Этап 8.10) ---
 
@@ -2924,38 +2846,6 @@ CREATE TABLE IF NOT EXISTS positions (
 );
 """
 
-# --- Этап 9.1.1 §6: учёт баланса ---
-#
-# ПЯТЬ ВЕЛИЧИН ОДНИМ ЗАПРОСОМ И БЕЗ ОТДЕЛЬНОЙ ТАБЛИЦЫ. Хранимый баланс — второй
-# источник истины, который однажды разойдётся с первым. Итог каждой сделки уже
-# лежит в positions.net_pnl_usd, занятые деньги — в notional_usd открытых строк;
-# всё остальное из них выводится.
-#
-# ПРИБЫЛЬ НЕ РЕИНВЕСТИРУЕТСЯ: in_positions считается по notional_usd, то есть по
-# размеру СЛОТА, а не по слоту плюс накопленный итог. Накопленный итог живёт
-# отдельной величиной realized_pnl и на размер следующей позиции не влияет —
-# иначе поздняя сделка весила бы больше ранней просто потому, что она поздняя.
-#
-# Запрос ОДИН, а не пять: позиция может закрыться между двумя запросами, и тогда
-# free посчиталось бы по одному состоянию базы, а in_positions — по другому.
-# ПАРАМЕТР ПРИНИМАЕТСЯ КАК float8 И КАСТУЕТСЯ В numeric ВНУТРИ ЗАПРОСА. Так у
-# обоих вызывающих — сервиса позиций и бота — один и тот же вид вызова с
-# обычным питоновским float: asyncpg для колонки numeric требует Decimal, и
-# два разных вида аргумента у одного запроса рано или поздно разошлись бы.
-BALANCE_SQL = """
-SELECT $1::float8::numeric AS capital_start,
-       COALESCE(sum(net_pnl_usd) FILTER (WHERE status = 'closed'), 0)
-           AS realized_pnl,
-       COALESCE(sum(notional_usd) FILTER (WHERE status = 'open'), 0)
-           AS in_positions,
-       $1::float8::numeric
-           + COALESCE(sum(net_pnl_usd) FILTER (WHERE status = 'closed'), 0)
-           - COALESCE(sum(notional_usd) FILTER (WHERE status = 'open'), 0)
-           AS free,
-       count(*) FILTER (WHERE status = 'open') AS open_count
-FROM positions;
-"""
-
 POSITIONS_CHECKS = """
 DO $$
 BEGIN
@@ -2970,12 +2860,17 @@ BEGIN
             ADD CONSTRAINT positions_status_chk
             CHECK (status IN ('open', 'closed'));
     END IF;
+    -- Этап 9.1.1 §6: пятое значение data_gap. Сервис гарантирует свою схему
+    -- при старте, и на ЧИСТОМ томе (где миграции 018 и 019 ещё не применялись)
+    -- перечень из четырёх значений отверг бы закрытие по пробелу в данных —
+    -- сервис падал бы на первой же такой позиции. На уже работающей базе этот
+    -- блок ничего не делает: ограничение там есть, и его правит миграция 019.
     IF NOT EXISTS (SELECT 1 FROM pg_constraint
                    WHERE conname = 'positions_reason_chk') THEN
         ALTER TABLE positions
             ADD CONSTRAINT positions_reason_chk
             CHECK (exit_reason IS NULL OR exit_reason IN
-                   ('target', 'stop', 'timeout', 'ambiguous'));
+                   ('target', 'stop', 'timeout', 'ambiguous', 'data_gap'));
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_constraint
                    WHERE conname = 'positions_resolution_chk') THEN

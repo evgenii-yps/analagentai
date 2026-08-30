@@ -31,6 +31,7 @@ EXIT_RU = {
     "stop": "сработал предел убытка",
     "timeout": "истёк срок",
     "ambiguous": "цель и предел в одной свече — итог по пределу",
+    "data_gap": "пробел в данных — исход не измерен",
 }
 
 
@@ -56,36 +57,22 @@ def _msk(ts: datetime) -> str:
     return ts.astimezone(_MSK).strftime("%d.%m %H:%M") + " MSK"
 
 
-def signed_usd(value: float) -> str:
-    """Сумма со ЗНАКОМ ВСЕГДА: ``+$0.03``, ``-$0.12``, и ``+$0.00`` при нуле.
+def bars_ru(count: int) -> str:
+    """Число баров по-русски: ``1 бар``, ``3 бара``, ``11 баров``.
 
-    Знак печатается и при нуле намеренно: отсутствие знака читается как
-    «величина неизвестна», а ноль — это измеренный ноль.
+    Склонение здесь не украшение: «увидели 3 баров» читается как опечатка, а
+    сообщение, выглядящее опечаткой, читают невнимательно.
     """
-    value = float(value)
-    sign = "+" if value >= 0 else "-"
-    return f"{sign}${abs(value):.2f}"
-
-
-def balance_line(balance: dict[str, Any] | None) -> str | None:
-    """Одна строка о состоянии счёта (Этап 9.1.1 §6.5).
-
-    ``None`` означает «величины не получены» — тогда строка не печатается
-    ВОВСЕ. Печатать вместо неё нули значило бы сообщить, что на счёте ничего
-    нет, тогда как на самом деле неизвестно, сколько там.
-
-    ПРИБЫЛЬ НЕ РЕИНВЕСТИРУЕТСЯ, и строка это показывает: «в позициях» считается
-    по размеру слотов, а накопленный итог стоит отдельной величиной и в слоты
-    не входит.
-    """
-    if not balance:
-        return None
-    return (
-        f"Счёт: ${float(balance['capital_start']):.2f} старт · "
-        f"${float(balance['in_positions']):.2f} в позициях · "
-        f"${float(balance['free']):.2f} свободно · "
-        f"итог {signed_usd(balance['realized_pnl'])}"
-    )
+    count = int(count)
+    tail = abs(count) % 100
+    last = abs(count) % 10
+    if 11 <= tail <= 14 or last == 0 or last >= 5:
+        word = "баров"
+    elif last == 1:
+        word = "бар"
+    else:
+        word = "бара"
+    return f"{count} {word}"
 
 
 def held_ru(seconds: float) -> str:
@@ -110,24 +97,19 @@ def opened_text(
     signal_id: int,
     probability: float | None,
     entry_lag_sec: int,
-    balance: dict[str, Any] | None = None,
 ) -> str:
     """Сообщение об открытии позиции."""
     prob = "—" if probability is None else f"{float(probability):.2f}"
-    lines = [
-        "🟢 <b>Открыта позиция (виртуально)</b>",
+    return (
+        "🟢 <b>Открыта позиция (виртуально)</b>\n"
         f"{_esc(symbol)} · вход {_price(entry_price)} · "
-        f"${float(notional_usd):.2f}",
+        f"${float(notional_usd):.2f}\n"
         f"Цель {_price(target_price)} (+{float(target_pct):.2f}%) · "
-        f"предел {_price(stop_price)} (−{float(stop_pct):.2f}%)",
-        f"Срок до {_msk(deadline_at)}",
+        f"предел {_price(stop_price)} (−{float(stop_pct):.2f}%)\n"
+        f"Срок до {_msk(deadline_at)}\n"
         f"Сигнал #{int(signal_id)}, вероятность {prob}, "
-        f"задержка входа {int(entry_lag_sec)} с",
-    ]
-    money = balance_line(balance)
-    if money is not None:
-        lines.append(money)
-    return "\n".join(lines)
+        f"задержка входа {int(entry_lag_sec)} с"
+    )
 
 
 def closed_text(
@@ -140,7 +122,6 @@ def closed_text(
     net_pnl_usd: float,
     cost_pct: float,
     held_sec: float,
-    balance: dict[str, Any] | None = None,
 ) -> str:
     """Сообщение о закрытии позиции.
 
@@ -149,15 +130,63 @@ def closed_text(
     раз обнаруживал бы недостачу и искал ошибку.
     """
     reason = EXIT_RU.get(exit_reason, exit_reason)
-    lines = [
-        "🔵 <b>Закрыта позиция (виртуально)</b>",
-        f"{_esc(symbol)} · {_esc(reason)}",
-        f"Вход {_price(entry_price)} → выход {_price(exit_price)}",
+    return (
+        "🔵 <b>Закрыта позиция (виртуально)</b>\n"
+        f"{_esc(symbol)} · {_esc(reason)}\n"
+        f"Вход {_price(entry_price)} → выход {_price(exit_price)}\n"
         f"Итог {float(net_pnl_pct):+.2f}% (${float(net_pnl_usd):+.3f}) "
-        f"с учётом издержек {float(cost_pct):.2f}%",
-        f"В позиции {held_ru(held_sec)}",
-    ]
-    money = balance_line(balance)
-    if money is not None:
-        lines.append(money)
-    return "\n".join(lines)
+        f"с учётом издержек {float(cost_pct):.2f}%\n"
+        f"В позиции {held_ru(held_sec)}"
+    )
+
+
+def data_gap_text(
+    *,
+    symbol: str,
+    entry_price: float,
+    exit_price: float,
+    last_bar_ts: datetime,
+    gap_sec: float,
+    net_pnl_pct: float,
+    net_pnl_usd: float,
+    bars_held: int,
+) -> str:
+    """Сообщение о закрытии позиции ПО ПРОБЕЛУ В ДАННЫХ (§6.6 ТЗ 9.1.1).
+
+    ОТДЕЛЬНЫЙ ТЕКСТ, А НЕ ПЕРЕИСПОЛЬЗОВАННЫЙ ``closed_text``, и это главное в
+    этой функции. Обычное сообщение о закрытии утверждало бы РЕЗУЛЬТАТ: «итог
+    −0.22%, цель не достигнута». Здесь результата нет — есть последняя
+    известная цена и признание того, что исход измерить не удалось. Человек,
+    читающий поток, обязан увидеть разницу с первой строки, а не вычислять её
+    из мелкого примечания.
+
+    Числа названы своими именами: сколько времени не было данных, от какого
+    момента взята цена и что итог в статистику не идёт.
+    """
+    # ДВА РАЗНЫХ СЛУЧАЯ, И ПУТАТЬ ИХ НЕЛЬЗЯ. Если хоть один бар видели, цена
+    # выхода — настоящая цена из прошлого, и назвать её момент обязательно.
+    # Если не видели ни одного, никакой «последней известной цены» не было
+    # вовсе: выход посчитан по цене ВХОДА, и написать «по последней известной
+    # цене от такого-то времени» значило бы сослаться на наблюдение, которого
+    # не существует.
+    if int(bars_held) > 0:
+        price_line = (
+            f"Вход {_price(entry_price)} → выход {_price(exit_price)} "
+            f"по последней известной цене от {_msk(last_bar_ts)}"
+        )
+        seen_line = f"Успели увидеть {bars_ru(bars_held)} движения"
+    else:
+        price_line = (
+            f"Вход {_price(entry_price)} → выход {_price(exit_price)}: "
+            "ни одной свечи после входа не пришло, выход посчитан по цене входа"
+        )
+        seen_line = "Движения не наблюдали вовсе — оценить сделку нечем"
+    return (
+        "🟠 <b>Позиция закрыта по пробелу в данных (виртуально)</b>\n"
+        f"{_esc(symbol)} · данных по инструменту не было {held_ru(gap_sec)}\n"
+        f"{price_line}\n"
+        f"Формальный итог {float(net_pnl_pct):+.2f}% "
+        f"(${float(net_pnl_usd):+.3f}) — В СТАТИСТИКУ НЕ ИДЁТ: цена выхода не "
+        "наблюдалась, а восстановлена\n"
+        f"{seen_line}"
+    )

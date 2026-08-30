@@ -43,12 +43,13 @@ HEARTBEATS: list[tuple[str, str, int, str]] = [
     ("decision:heartbeat", "DECISION_INTERVAL", 60, "decision"),
     ("notify:heartbeat", "NOTIFY_INTERVAL", 30, "notify"),
     ("evaluator:heartbeat", "EVAL_INTERVAL", 300, "evaluator"),
-    # Этап 9.1.1 §5: сервис ведения позиций — на общих основаниях. Умерев
-    # молча, он перестаёт ВЕСТИ уже открытые позиции: цель и предел, задетые за
-    # время простоя, не будут замечены никогда — бары уйдут за отметку
-    # last_checked_ts только вместе с их разбором.
-    ("positions:heartbeat", "POSITION_INTERVAL", 60, "positions"),
     ("bot:heartbeat", "BOT_POLL_TIMEOUT", 30, "bot"),
+    # Этап 9.1.1 §4. Перезапуск контейнера positions вотчдогом БЕЗОПАСЕН: всё
+    # состояние позиций лежит в базе, в памяти сервиса состояния нет, а
+    # повторный разбор уже разобранных баров идемпотентен — закрытие идёт одним
+    # UPDATE ... WHERE status = 'open', и отставшая итерация получает ноль
+    # изменённых строк вместо второго закрытия.
+    ("positions:heartbeat", "POSITION_INTERVAL", 60, "positions"),
 ]
 
 DISK_MIN_FREE_PCT = float(os.environ.get("WATCHDOG_DISK_MIN_FREE_PCT", "15"))

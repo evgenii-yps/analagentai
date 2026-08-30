@@ -16,7 +16,6 @@ from typing import Any
 import asyncpg
 import structlog
 
-from src.core.db import BALANCE_SQL
 from src.core.user_settings import USER_SETTINGS_DDL
 
 _log = structlog.get_logger().bind(component="bot-queries")
@@ -570,27 +569,38 @@ class BotQueries:
         )
         return [dict(r) for r in rows]
 
-    async def positions_balance(self, capital_start: float) -> dict[str, Any]:
-        """Пять величин счёта (Этап 9.1.1 §6.2).
+    async def positions_capital(self) -> dict[str, Any]:
+        """Занятый капитал и накопленный итог (Этап 9.1.1 §5.5).
 
-        Запрос — ТОТ ЖЕ САМЫЙ, что у сервиса позиций
-        (:data:`src.core.db.BALANCE_SQL`), а не его копия здесь. Копия
-        разошлась бы при первой правке, и тогда бот и сообщения показывали бы
-        два РАЗНЫХ баланса одного счёта — расхождение, которое нечем было бы
-        объяснить владельцу.
+        ДВЕ ВЕЛИЧИНЫ, И ОНИ РАЗНОЙ ПРИРОДЫ. ``committed_usd`` — деньги, которые
+        прямо сейчас лежат в открытых позициях; из бюджета вычитается именно
+        она. ``realized_usd`` — накопленный итог закрытых позиций, и он
+        НИКОГДА не прибавляется к бюджету: прибыль не реинвестируется, слот
+        всегда одного размера. Показываются они поэтому отдельными строками, а
+        не одной суммой: сложенные вместе, они означали бы счёт, которого нет.
 
-        Бот остаётся ТОЛЬКО НА ЧТЕНИЕ: это SELECT, ничего не открывающий и не
-        закрывающий.
+        ЗАКРЫТИЯ ПО ПРОБЕЛУ В ДАННЫХ ИСКЛЮЧЕНЫ из накопленного итога (§6.7): у
+        них цена выхода не наблюдалась, а восстановлена, и их «итог» равен
+        примерно минус издержкам — то есть описывает не рынок, а сбой сбора
+        данных. Включив их, мы бы вычитали стоимость собственных перебоев из
+        результата системы.
         """
-        row = await self._pool.fetchrow(BALANCE_SQL, float(capital_start))
+        row = await self._pool.fetchrow(
+            """
+            SELECT COALESCE(sum(notional_usd)
+                       FILTER (WHERE status = 'open'), 0) AS committed_usd,
+                   COALESCE(sum(net_pnl_usd)
+                       FILTER (WHERE status = 'closed'
+                               AND exit_reason <> 'data_gap'), 0)
+                       AS realized_usd
+            FROM positions;
+            """
+        )
         if row is None:
-            return {}
+            return {"committed_usd": 0.0, "realized_usd": 0.0}
         return {
-            "capital_start": float(row["capital_start"]),
-            "realized_pnl": float(row["realized_pnl"]),
-            "in_positions": float(row["in_positions"]),
-            "free": float(row["free"]),
-            "open_count": int(row["open_count"]),
+            "committed_usd": float(row["committed_usd"]),
+            "realized_usd": float(row["realized_usd"]),
         }
 
     async def positions_summary(self, days: int = 7) -> dict[str, Any]:
@@ -602,13 +612,25 @@ class BotQueries:
         и знать их долю нужно, иначе средний итог читался бы как измеренный,
         а он частично оценочный.
         """
+        # СРЕДНИЕ И СУММЫ СЧИТАЮТСЯ БЕЗ ЗАКРЫТИЙ ПО ПРОБЕЛУ (§6.7 ТЗ 9.1.1).
+        # У них цена выхода не наблюдалась, а восстановлена: их итог описывает
+        # длительность сбоя сбора данных, а не поведение рынка. Само их число
+        # при этом считается и печатается ОТДЕЛЬНОЙ строкой — пять таких
+        # закрытий означают, что встал коллектор, и молчать об этом нельзя.
         row = await self._pool.fetchrow(
             """
             SELECT count(*) AS closed,
                    count(*) FILTER (WHERE outcome_certain = FALSE) AS uncertain,
-                   avg(net_pnl_pct) AS avg_net_pnl_pct,
-                   sum(net_pnl_usd) AS sum_net_pnl_usd,
-                   avg(entry_slippage_pct) AS avg_slippage_pct
+                   count(*) FILTER (WHERE exit_reason = 'data_gap') AS data_gap,
+                   avg(net_pnl_pct)
+                       FILTER (WHERE exit_reason <> 'data_gap')
+                       AS avg_net_pnl_pct,
+                   sum(net_pnl_usd)
+                       FILTER (WHERE exit_reason <> 'data_gap')
+                       AS sum_net_pnl_usd,
+                   avg(entry_slippage_pct)
+                       FILTER (WHERE exit_reason <> 'data_gap')
+                       AS avg_slippage_pct
             FROM positions
             WHERE status = 'closed'
               AND closed_at >= now() - make_interval(days => $1::int);

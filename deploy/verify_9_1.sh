@@ -221,63 +221,79 @@ fi
 # ---------------------------------------------------------------------------
 echo
 echo "── 6. ЗАДАЧА Б: подозрительных строк не осталось (Б6) ────────────────────"
-# ЗАПАС БЕРЁТСЯ ПО ФАКТИЧЕСКОМУ РАЗРЕШЕНИЮ СТРОКИ (Этап 9.1.1, §2 ТЗ).
-#
-# Прежняя редакция закладывала длину ГРУБОГО бара (час) ВСЕМ строкам подряд —
-# так же, как это делает barrier.runner.settle_seconds() при ОТБОРЕ кандидатов.
-# Там это верно: разрешение выясняется уже ПОСЛЕ отбора, и ждать приходится по
-# худшему случаю. Здесь — неверно: у УЖЕ ПОСЧИТАННОЙ строки разрешение известно
-# и записано в колонке resolution. На боевых данных 30.08.2026 широкий критерий
-# объявил подозрительными 7618 ИСПРАВНЫХ строк, и пункт печатал «ОТКАТ
-# ОБЯЗАТЕЛЕН» на полностью здоровой системе.
-#
-# Формула повторяет DB.STRATEGY_UNSETTLED_PREDICATE (src/core/db.py) ТЕКСТУАЛЬНО:
-# разделяемого кода между bash и Python нет, поэтому копии обязаны меняться
-# вместе. Запас берётся из .env, а не зашит числом: зашитая пятёрка однажды
-# начала бы врать молча.
+# Запас берётся из настроек, а не зашит числом: разойдись он с кодом — проверка
+# отвечала бы на вопрос о другом правиле.
+coarse_tf="$(env_value "${ENV_FILE}" BARRIER_COARSE_TIMEFRAME)"; coarse_tf="${coarse_tf:-1h}"
 settle_min="$(env_value "${ENV_FILE}" BARRIER_SETTLE_MINUTES)"; settle_min="${settle_min:-5}"
-if ! [[ "${settle_min}" =~ ^[0-9]+$ ]]; then
-  note_unk "BARRIER_SETTLE_MINUTES=${settle_min} — не число, критерий не вычислить"
+case "${coarse_tf}" in
+  1h) coarse_sec=3600 ;;
+  1m) coarse_sec=60 ;;
+  *)  coarse_sec="" ;;
+esac
+if [[ -z "${coarse_sec}" ]]; then
+  note_unk "BARRIER_COARSE_TIMEFRAME=${coarse_tf} неизвестен — запас не вычислить"
 else
-  # Критерий одной строкой. Держится в переменной, чтобы счёт, разбивка и текст
-  # находки спрашивали ОДНО И ТО ЖЕ: три копии разошлись бы при первой правке.
+  settle_sec=$(( coarse_sec + settle_min * 60 ))
+  # ЗАПАС БЕРЁТСЯ ПО ФАКТИЧЕСКОМУ РАЗРЕШЕНИЮ СТРОКИ (Этап 9.1.1 §1).
+  #
+  # Прежняя редакция закладывала ${settle_sec} секунд ВСЕМ строкам подряд. Это
+  # верно ПРИ ОТБОРЕ кандидатов — там разрешение ещё неизвестно и приходится
+  # брать худший случай, — но у УЖЕ ПОСЧИТАННОЙ строки разрешение известно и
+  # записано в колонке resolution. Все строки боевой базы посчитаны по
+  # МИНУТНОМУ ряду, где последний бар окна закрывается через 60 секунд после
+  # срока: проверка их часовым запасом дала 7618 ложных срабатываний при 0
+  # настоящих (замер 30.08.2026) и печатала «ОТКАТ ОБЯЗАТЕЛЕН» на здоровой
+  # системе.
+  #
+  # ВЕТКА ELSE ОСТАВЛЕНА НАМЕРЕННО: появись третье разрешение, его строки
+  # будут проверяться ХУДШИМ случаем, а не проскочат молча.
+  #
+  # Формула повторяет DB.STRATEGY_UNSETTLED_PREDICATE (src/core/db.py)
+  # текстуально: разделяемого кода между bash и Python нет, поэтому копии
+  # обязаны меняться вместе.
   unsettled_where="computed_at < entry_ts
                      + make_interval(hours => horizon_h::int)
                      + make_interval(secs => CASE resolution
                                                WHEN '1m' THEN 60
-                                               ELSE 3600 END)
-                     + make_interval(mins => ${settle_min})"
-  unsettled_ru="computed_at < entry_ts + horizon_h ч + (60 с для '1m' / 3600 с для '1h') + ${settle_min} мин"
-  echo "    критерий подозрительности: ${unsettled_ru}"
-  echo "    (${settle_min} мин — BARRIER_SETTLE_MINUTES из .env)"
+                                               WHEN '1h' THEN 3600
+                                               ELSE ${settle_sec}
+                                             END)"
+  echo "    запас берётся ПО КОЛОНКЕ resolution строки:"
+  echo "      60 с для '1m', 3600 с для '1h', ${settle_sec} с для неизвестного"
+  echo "      (${settle_sec} с = ${coarse_tf} + ${settle_min} мин из .env — только для неизвестного)"
   so_exists="$(psql_val "SELECT to_regclass('strategy_outcomes') IS NOT NULL;")"
   if [[ "${so_exists}" != "t" ]]; then
     note_unk "таблицы strategy_outcomes нет — Задачу Б проверять не на чем"
   else
-    bad="$(psql_val "SELECT count(*) FROM strategy_outcomes WHERE ${unsettled_where};")"
+    # К ЧЕМУ ПРИМЕНЁН КРИТЕРИЙ — печатается всегда, а не только при находке:
+    # без этого числа «подозрительных 0» не отличить от «строк нет вовсе».
+    echo "    строк по разрешениям:"
+    psql_tbl "SELECT resolution, count(*) FROM strategy_outcomes
+              GROUP BY resolution ORDER BY 2 DESC;" | sed 's/^/      /'
+    bad="$(psql_val "SELECT count(*) FROM strategy_outcomes
+                     WHERE ${unsettled_where};")"
     echo "    подозрительных строк: ${bad:-·} (ожидается 0)"
     if [[ -z "${bad}" ]]; then
       note_unk "запрос не выполнен — база не ответила"
     elif [[ "${bad}" == "0" ]]; then
       note_ok "строк, посчитанных по незакрытому бару, не осталось"
     else
-      # ТЕКСТ НАХОДКИ НАЗЫВАЕТ КРИТЕРИЙ ЦЕЛИКОМ. Без этого следующий человек
-      # снова полдня выясняет, врёт измеритель или измеряемое.
-      note_block "в strategy_outcomes ${bad} строк по критерию «${unsettled_ru}»"
+      note_block "в strategy_outcomes осталось ${bad} строк, посчитанных по незакрытому бару"
       echo "    по стратегии, горизонту и разрешению:"
-      psql_tbl "SELECT strategy, horizon_h, resolution, count(*),
-                       min(EXTRACT(EPOCH FROM (computed_at - entry_ts
-                           - make_interval(hours => horizon_h::int))))::bigint
-                           AS min_margin_sec
+      psql_tbl "SELECT strategy, horizon_h, resolution, count(*)
                 FROM strategy_outcomes
                 WHERE ${unsettled_where}
-                GROUP BY strategy, horizon_h, resolution
-                ORDER BY 4 DESC;" | sed 's/^/      /'
-      info "НИЧЕГО НЕ УДАЛЯТЬ. Это настоящая находка: разобрать её и доложить."
-      info "разбор — тем же критерием, режимом подсчёта (ничего не меняет):"
+                GROUP BY strategy, horizon_h, resolution ORDER BY 4 DESC;" \
+        | sed 's/^/      /'
+      info "СНАЧАЛА посмотреть отчёт (ничего не меняет):"
       info "  docker compose --profile tools run --rm --no-deps \\"
       info "      -v ./scripts:/app/scripts:ro -v ./reports:/app/reports \\"
       info "      barrier python -m scripts.repair_9_1_strategy_settle"
+      info "и только потом удалить, назвав то же число своими руками:"
+      info "  docker compose --profile tools run --rm --no-deps \\"
+      info "      -v ./scripts:/app/scripts:ro -v ./reports:/app/reports \\"
+      info "      barrier python -m scripts.repair_9_1_strategy_settle \\"
+      info "      --apply --confirm-count=${bad}"
     fi
   fi
 fi
@@ -328,16 +344,24 @@ else
     echo "    по причинам выхода:"
     psql_tbl "SELECT exit_reason, count(*) FROM positions WHERE status='closed'
               GROUP BY exit_reason ORDER BY 2 DESC;" | sed 's/^/      /'
-    stat_line="$(psql_tbl "SELECT round(avg(net_pnl_pct), 4),
-                                  round(sum(net_pnl_usd), 4),
+    # СРЕДНИЕ И СУММЫ — БЕЗ ЗАКРЫТИЙ ПО ПРОБЕЛУ В ДАННЫХ (Этап 9.1.1 §6.7).
+    # У них цена выхода не наблюдалась, а восстановлена; их «итог» описывает
+    # длительность сбоя сбора данных, а не поведение рынка. Те же FILTER стоят
+    # в src/bot/queries.positions_summary: разойдись они — бот и проверка
+    # показывали бы разные средние по одной и той же таблице.
+    stat_line="$(psql_tbl "SELECT round(avg(net_pnl_pct)
+                                    FILTER (WHERE exit_reason <> 'data_gap'), 4),
+                                  round(sum(net_pnl_usd)
+                                    FILTER (WHERE exit_reason <> 'data_gap'), 4),
                                   round(avg(entry_lag_sec), 1),
-                                  round(avg(entry_slippage_pct), 5),
+                                  round(avg(entry_slippage_pct)
+                                    FILTER (WHERE exit_reason <> 'data_gap'), 5),
                                   count(*) FILTER (WHERE outcome_certain = FALSE)
                            FROM positions WHERE status='closed';")"
-    echo "    средний net_pnl_pct:        $(echo "${stat_line}" | cut -d'|' -f1)"
-    echo "    сумма net_pnl_usd:          $(echo "${stat_line}" | cut -d'|' -f2)"
+    echo "    средний net_pnl_pct:        $(echo "${stat_line}" | cut -d'|' -f1) (без data_gap)"
+    echo "    сумма net_pnl_usd:          $(echo "${stat_line}" | cut -d'|' -f2) (без data_gap)"
     echo "    средний entry_lag_sec:      $(echo "${stat_line}" | cut -d'|' -f3)"
-    echo "    средний entry_slippage_pct: $(echo "${stat_line}" | cut -d'|' -f4)"
+    echo "    средний entry_slippage_pct: $(echo "${stat_line}" | cut -d'|' -f4) (без data_gap)"
     uncertain="$(echo "${stat_line}" | cut -d'|' -f5 | tr -d '[:space:]')"
     slip="$(echo "${stat_line}" | cut -d'|' -f4 | tr -d '[:space:]')"
 
@@ -359,6 +383,22 @@ else
         note_ok "средний entry_slippage_pct — ${slip}%"
       fi
     fi
+  fi
+
+  # ЗАКРЫТИЯ ПО ПРОБЕЛУ В ДАННЫХ ЗА СУТКИ (Этап 9.1.1 §6.7). Печатается всегда,
+  # включая ноль: здесь ноль — это ответ «сбор данных не подводил», и он
+  # содержателен ровно настолько же, насколько ненулевое число.
+  gap_24h="$(psql_val "SELECT count(*) FROM positions
+                       WHERE status = 'closed' AND exit_reason = 'data_gap'
+                         AND closed_at >= now() - interval '24 hours';")"
+  echo "    закрыто по пробелу в данных за сутки: ${gap_24h:-·}"
+  if [[ -n "${gap_24h}" && "${gap_24h}" != "0" ]]; then
+    note_warn "за сутки ${gap_24h} позиций закрыто по пробелу в данных (exit_reason='data_gap'): ряд свечей по инструменту прерывался дольше POSITION_GAP_GRACE_SEC. Это состояние СБОРА ДАННЫХ, а не рынка — их итоги в средние выше не входят"
+    psql_tbl "SELECT i.symbol, count(*), max(p.closed_at)
+              FROM positions p JOIN instruments i ON i.id = p.instrument_id
+              WHERE p.status = 'closed' AND p.exit_reason = 'data_gap'
+                AND p.closed_at >= now() - interval '24 hours'
+              GROUP BY i.symbol ORDER BY 2 DESC;" | sed 's/^/      /'
   fi
 
   # В1. Открытых позиций ноль дольше суток.
@@ -398,42 +438,21 @@ else
   else
     note_ok "упавших итераций за сутки нет"
   fi
-  # ПРИЧИНА БЕРЁТСЯ ТОЛЬКО ИЗ СТРОК ОТКАЗА (Этап 9.1.1, §4 ТЗ). Прежняя
-  # редакция искала поле reason по ВСЕМУ журналу за сутки, а заголовок обещал
-  # причины отказа: на боевом сервере это дало два счётчика с ПУСТОЙ причиной
-  # при трёх настоящих отказах, хотя в журнале все три названы поимённо.
-  # Сначала отбор строк, потом извлечение причины — тогда пустая причина
-  # невозможна по построению: перечень причин закрыт, и каждая ветка правил
-  # возвращает константу. Если пустая всё-таки появится — это НАСТОЯЩАЯ находка.
-  echo "    причины отказа во входе (positions_skipped=1), за сутки:"
-  # >>> reason-block: этот блок целиком извлекает и ПРОГОНЯЕТ tests/
-  # test_stage_9_1_1.py. Разбор журнала проверяется на настоящем коде проверки,
-  # а не на его пересказе в тесте: пересказ разошёлся бы с оригиналом молча.
-  # Границы блока — эти две пометки; между ними не должно быть ничего, что
-  # нельзя выполнить без запущенного docker.
-  # ПОЛЕ reason ЧИТАЕТСЯ В ОБОИХ ФОРМАТАХ ЖУРНАЛА. В контейнере stdout не TTY,
-  # и structlog пишет JSON ("reason": "no_fresh_bar"); при ручном запуске в
-  # терминале — ConsoleRenderer (reason=no_fresh_bar). Один шаблон на оба
-  # случая: иначе проверка молча печатала бы пусто там, где формат другой.
-  reason_re='"reason"[[:space:]]*:[[:space:]]*"[a-z_]+"|reason=[a-z_]+'
-  skipped_lines="$(printf '%s\n' "${logs}" | grep 'positions_skipped=1')"
-  if [[ -z "${skipped_lines}" ]]; then
-    echo "      (отказов за сутки нет)"
+  # ПРИЧИНА БЕРЁТСЯ ТОЛЬКО ИЗ СТРОК ОТКАЗА (Этап 9.1.1 §3). Прежняя редакция
+  # искала поле reason= по ВСЕМУ журналу за сутки, хотя заголовок обещал
+  # причины отказа во входе: при трёх настоящих отказах (все три —
+  # no_fresh_bar) вывод показал два счётчика с ПУСТОЙ причиной.
+  #
+  # И пустой вывод обязан читаться как «отказов не было», а не как пустое
+  # место: пустое место читатель толкует как поломку скрипта.
+  skipped="$(printf '%s' "${logs}" | grep 'positions_skipped=1' || true)"
+  if [[ -z "${skipped}" ]]; then
+    echo "    причины отказа во входе (positions_skipped=1) за сутки: отказов не было"
   else
-    skipped_total="$(printf '%s\n' "${skipped_lines}" | grep -c .)"
-    printf '%s\n' "${skipped_lines}" | grep -oE "${reason_re}" \
-      | sed -e 's/"$//' -e 's/^.*[^a-z_]//' \
-      | sort | uniq -c | sort -rn | head -10 | sed 's/^/      /'
-    # Строка отказа без поля reason в счётчики не попадает вовсе — и молчать об
-    # этом нельзя: пропавшая причина и есть та самая находка. Перечень причин
-    # закрыт, каждая ветка правил возвращает константу, поэтому отказ без
-    # причины невозможен по построению.
-    with_reason="$(printf '%s\n' "${skipped_lines}" | grep -cE "${reason_re}")"
-    if [[ "${with_reason}" -ne "${skipped_total}" ]]; then
-      note_warn "строк positions_skipped=1 за сутки ${skipped_total}, из них с распознанной причиной ${with_reason} — разница НАСТОЯЩАЯ находка: перечень причин закрыт, отказ без причины невозможен"
-    fi
+    echo "    причины отказа во входе (positions_skipped=1), за сутки:"
+    printf '%s' "${skipped}" | grep -o 'reason=[a-z_]*' | sort | uniq -c \
+      | sort -rn | head -10 | sed 's/^/      /'
   fi
-  # <<< reason-block
 fi
 
 # ---------------------------------------------------------------------------
