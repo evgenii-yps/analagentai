@@ -33,6 +33,7 @@ from __future__ import annotations
 import os
 import pathlib
 import re
+import subprocess
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -443,6 +444,209 @@ def test_the_positions_service_is_watched_in_all_three_places() -> None:
 
 
 # =============================================================================
+# §3-бис. Разбор причин отказа понимает ОБА формата боевого журнала
+# =============================================================================
+
+_VERIFY_SH = _ROOT / "deploy" / "verify_9_1.sh"
+
+
+def _run_reason_block(lines: list[str]) -> str:
+    """Прогоняет БЛОК РАЗБОРА из настоящего ``deploy/verify_9_1.sh``.
+
+    Блок берётся из файла между пометками ``reason-block`` и выполняется в bash
+    на подсунутом журнале. Пересказать его в тесте было бы проще, но пересказ
+    разошёлся бы с оригиналом молча — и тест доказывал бы исправность пересказа,
+    а не проверки. Ровно так §3 и остался сломанным: в наборе не было ничего,
+    что запускало бы сам разбор.
+
+    ``note_warn`` подменяется печатью ``WARN:`` — вне скрипта его нет, а его
+    вызов и есть то, что проверяется в сверке суммы.
+    """
+    text = _VERIFY_SH.read_text(encoding="utf-8")
+    block = text.split("# >>> reason-block", 1)[1]
+    block = block.split("\n", 1)[1].split("# <<< reason-block", 1)[0]
+    script = (
+        "set -uo pipefail\n"
+        'note_warn() { echo "WARN: $*"; }\n'
+        "logs=\"$(cat)\"\n"
+        + block
+    )
+    done = subprocess.run(
+        ["bash", "-c", script], input="\n".join(lines),
+        capture_output=True, text=True, check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    return done.stdout
+
+
+def _counters(output: str) -> dict[str, int]:
+    """Счётчики из вывода ``uniq -c``: ``{причина: число}``."""
+    found: dict[str, int] = {}
+    for line in output.splitlines():
+        match = re.match(r"^\s+(\d+) (.+)$", line)
+        if match:
+            found[match.group(2).strip()] = int(match.group(1))
+    return found
+
+
+def test_json_journal_is_understood_because_production_writes_json() -> None:
+    """§3-бис.1: три строки JSON дают один счётчик ``no_fresh_bar = 3``.
+
+    ЭТО ГЛАВНЫЙ СЛУЧАЙ, а не экзотика. ``src/core/logging.py`` выбирает рендер
+    по ``sys.stdout.isatty()``; в контейнере stdout не терминал (``tty`` в
+    ``docker-compose.yml`` не задан ни у одного сервиса), значит в проде
+    работает ``JSONRenderer``, и причина лежит в поле ``"reason": "..."`` —
+    БЕЗ знака равенства. Прежний шаблон ``reason=`` печатал бы заголовок и ни
+    одной строки под ним.
+
+    Строка закрытия с ``"exit_reason"`` в набор не попадает: причины берутся
+    только из строк отказа, и ``"exit_reason"`` не должен читаться как
+    ``"reason"``.
+    """
+    out = _run_reason_block([
+        '{"signal_id": 5, "symbol": "BTC/USDT", "reason": "no_fresh_bar",'
+        ' "event": "positions_skipped=1", "level": "info"}',
+        '{"signal_id": 6, "symbol": "ETH/USDT", "reason": "no_fresh_bar",'
+        ' "event": "positions_skipped=1", "level": "info"}',
+        '{"signal_id": 7, "symbol": "SOL/USDT", "reason": "no_fresh_bar",'
+        ' "event": "positions_skipped=1", "level": "info"}',
+        '{"exit_reason": "target", "event": "positions_closed=1"}',
+    ])
+    assert _counters(out) == {"no_fresh_bar": 3}
+    assert "всего 3" in out
+    assert "target" not in out
+    assert "WARN:" not in out
+
+
+def test_json_journal_without_spaces_after_the_colon_is_understood() -> None:
+    """Пробелы после двоеточия — любые, включая ноль.
+
+    Компактный JSON (``{"reason":"slots_full"}``) — законный вывод сериализатора
+    и однажды может прийти вместо нынешнего. Разбор, привязанный к одному
+    пробелу, сломался бы на нём молча.
+    """
+    out = _run_reason_block([
+        '{"reason":"slots_full","event":"positions_skipped=1"}',
+        '{"reason"  :   "slots_full", "event": "positions_skipped=1"}',
+    ])
+    assert _counters(out) == {"slots_full": 2}
+
+
+def test_the_console_render_is_understood_too() -> None:
+    """§3-бис.2: читаемый рендер (``reason=slots_full``) разбирается так же.
+
+    Он появляется при ручном запуске сервиса в терминале — том самом случае,
+    когда за журналом смотрят глазами и проверку запускают чаще всего.
+    """
+    out = _run_reason_block([
+        "2026-08-30 10:00:00 [info ] positions_skipped=1 reason=slots_full signal_id=1",
+        "2026-08-30 10:01:00 [info ] positions_skipped=1 reason=slots_full signal_id=2",
+        "2026-08-30 10:02:00 [info ] positions_skipped=1 reason=degraded signal_id=3",
+    ])
+    assert _counters(out) == {"slots_full": 2, "degraded": 1}
+    assert "WARN:" not in out
+
+
+def test_an_unparsed_line_is_named_not_dropped() -> None:
+    """§3-бис.3: строка без причины идёт в свой счётчик, сумма сходится.
+
+    ПОТЕРЯННАЯ СТРОКА ВЫГЛЯДИТ КАК ОТСУТСТВИЕ ОТКАЗА — это и есть та ошибка,
+    из-за которой §3 пришлось переписывать дважды. Пустая причина (``""``)
+    причиной не считается: перечень причин закрыт, и пустая строка в нём не
+    значится.
+    """
+    out = _run_reason_block([
+        '{"reason": "degraded", "event": "positions_skipped=1"}',
+        '{"event": "positions_skipped=1"}',
+        '{"reason": "", "event": "positions_skipped=1"}',
+    ])
+    counters = _counters(out)
+    assert counters == {"degraded": 1, "(причина не распознана)": 2}
+    # Сумма счётчиков равна числу строк отказа — и сверка молчит.
+    assert sum(counters.values()) == 3
+    assert "всего 3" in out
+    assert "WARN:" not in out
+
+
+def test_no_refusals_at_all_is_said_in_words() -> None:
+    """§3-бис.4: отказов нет — так и печатается, а не пустотой под заголовком.
+
+    Пустое место читатель толкует как поломку скрипта.
+    """
+    out = _run_reason_block(['{"event": "positions_opened=1"}'])
+    assert "отказов не было" in out
+    assert _counters(out) == {}
+
+
+def test_the_head_limit_does_not_touch_the_sum_check() -> None:
+    """Обрезка ``head -10`` — свойство ПОКАЗА, а не разбора.
+
+    Различных причин больше десяти — счётчиков показано десять, но сумма
+    считается ДО обрезки и потому сходится. Сверка, посчитанная после обрезки,
+    сходилась бы «почти» всегда и не поймала бы ничего.
+    """
+    reasons = [
+        "not_buy", "wrong_logic_version", "degraded", "low_probability",
+        "instrument_busy", "slots_full", "signal_too_old", "no_fresh_bar",
+        "no_frozen_target", "no_free_capital", "extra_one", "extra_two",
+    ]
+    out = _run_reason_block([
+        f'{{"reason": "{name}", "event": "positions_skipped=1"}}'
+        for name in reasons
+    ])
+    assert "всего 12" in out
+    assert len(_counters(out)) == 10
+    assert "показаны первые 10 из 12" in out
+    # И сверка молчит: разбор ничего не потерял, обрезан только показ.
+    assert "WARN:" not in out
+
+
+def test_the_sum_check_speaks_up_when_the_parser_loses_a_line() -> None:
+    """Разбор, который не умеет себя проверить, однажды соврёт незаметно.
+
+    Проверяется САМА СВЕРКА: разбор намеренно ломается (последняя подстановка
+    sed заменяется на удаление строки), и сверка обязана это заметить. Без
+    такого теста «сверка суммы» была бы строкой кода, про которую никто не
+    знает, срабатывает ли она вообще.
+    """
+    text = _VERIFY_SH.read_text(encoding="utf-8")
+    block = text.split("# >>> reason-block", 1)[1]
+    block = block.split("\n", 1)[1].split("# <<< reason-block", 1)[0]
+    broken = block.replace(
+        "-e 's/.*/(причина не распознана)/'", '-e "/positions_skipped/d"'
+    )
+    assert broken != block, "не удалось сломать разбор — тест проверял бы не то"
+    script = (
+        "set -uo pipefail\n"
+        'note_warn() { echo "WARN: $*"; }\n'
+        "logs=\"$(cat)\"\n"
+        + broken
+    )
+    done = subprocess.run(
+        ["bash", "-c", script],
+        input='{"event": "positions_skipped=1"}\n'
+              '{"reason": "degraded", "event": "positions_skipped=1"}',
+        capture_output=True, text=True, check=False,
+    )
+    assert "WARN:" in done.stdout
+    assert "1 против 2" in done.stdout
+
+
+def test_the_old_bare_pattern_is_gone_from_the_script() -> None:
+    """Прежний шаблон ``grep -o 'reason=[a-z_]*'`` в файле не остался.
+
+    Он находил ноль строк на JSON-журнале и пустые счётчики на читаемом. Оставь
+    его рядом «на всякий случай» — и однажды кто-нибудь вернёт разбор к нему,
+    потому что он короче.
+    """
+    text = _VERIFY_SH.read_text(encoding="utf-8")
+    assert "grep -o 'reason=[a-z_]*'" not in text
+    # А новый разбор на месте и знает оба вида записи.
+    assert '"reason"[[:space:]]*:[[:space:]]*"([a-z_]+)"' in text
+    assert "s/.*reason=([a-z_]+).*/" in text
+
+
+# =============================================================================
 # §7.7. Критерий подозрительности — по фактическому разрешению строки
 # =============================================================================
 
@@ -555,11 +759,30 @@ def _suspicious_row(strategy: str = "grid_buy") -> dict:
     }
 
 
-async def _run_repair(monkeypatch, argv: list[str], fake: _FakeDB) -> int:
-    """Прогоняет НАСТОЯЩИЙ ``main()`` скрипта на подменённой базе."""
+async def _run_repair(
+    monkeypatch, argv: list[str], fake: _FakeDB, snapshot_dir=None
+) -> int:
+    """Прогоняет НАСТОЯЩИЙ ``main()`` скрипта на подменённой базе.
+
+    ПУТЬ СНИМКА УВОДИТСЯ ВО ВРЕМЕННЫЙ КАТАЛОГ. Скрипт пишет снимок «до» в
+    ``reports/`` репозитория, и тест, оставляющий там файл, меняет рабочее
+    дерево — а тест, меняющий дерево, однажды попадёт в коммит вместе со своим
+    следом. Подменяется именно константа модуля, а не сама запись: проверять
+    надо настоящую запись файла, иначе ограждение «снимок обязателен» осталось
+    бы непроверенным.
+    """
     import scripts.repair_9_1_strategy_settle as repair
 
     monkeypatch.setattr(repair, "db", fake)
+    if snapshot_dir is not None:
+        monkeypatch.setattr(
+            repair, "SNAPSHOT_BEFORE",
+            str(snapshot_dir / "strategy_stats_before_9_1.txt"),
+        )
+        monkeypatch.setattr(
+            repair, "SNAPSHOT_AFTER",
+            str(snapshot_dir / "strategy_stats_after_9_1.txt"),
+        )
     monkeypatch.setattr(
         repair.sys, "argv", ["repair_9_1_strategy_settle", *argv]
     )
@@ -586,7 +809,7 @@ async def test_apply_with_a_mismatched_confirm_count_deletes_nothing(
 
 
 async def test_apply_with_a_matching_confirm_count_does_delete(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
 ) -> None:
     """Обратная сторона: при совпавшем числе удаление ПРОИСХОДИТ.
 
@@ -595,11 +818,17 @@ async def test_apply_with_a_matching_confirm_count_does_delete(
     """
     fake = _FakeDB([_suspicious_row(), _suspicious_row("grid_sell")])
     code = await _run_repair(
-        monkeypatch, ["--apply", "--confirm-count=2"], fake
+        monkeypatch, ["--apply", "--confirm-count=2"], fake,
+        snapshot_dir=tmp_path,
     )
     assert code == 0
     assert fake.deleted_calls == 1
     assert fake.snapshot_calls == 1
+    # Снимок «до» действительно ЗАПИСАН на диск, а не только «посчитан»:
+    # ограждение обещает файл, и обещание проверяется файлом.
+    snapshot = tmp_path / "strategy_stats_before_9_1.txt"
+    assert snapshot.exists()
+    assert "Критерий" in snapshot.read_text(encoding="utf-8")
 
 
 async def test_a_failed_snapshot_stops_the_deletion(
