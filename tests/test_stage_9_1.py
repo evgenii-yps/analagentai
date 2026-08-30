@@ -388,6 +388,12 @@ def _open_kwargs(**overrides):
         bar_age_sec=45.0,
         max_bar_age_sec=300,
         has_frozen_target=True,
+        # Этап 9.1.1 §5: проверка свободного капитала. Здесь его заведомо
+        # хватает — тесты этого набора проверяют ДРУГИЕ условия, и нехватка
+        # денег в отправной точке сделала бы каждый из них отказом не по своей
+        # причине. Сама проверка денег живёт в tests/test_stage_9_1_1.py.
+        free_capital_usd=10.0,
+        slot_usd=2.0,
     )
     base.update(overrides)
     return base
@@ -474,6 +480,10 @@ def test_every_refusal_reason_belongs_to_the_closed_list() -> None:
         dict(has_open_position=True), dict(open_count=5),
         dict(signal_age_sec=10_000.0), dict(bar_age_sec=10_000.0),
         dict(bar_age_sec=None), dict(has_frozen_target=False),
+        # Этап 9.1.1 §5: перечень расширен одним значением, и оно тоже обязано
+        # быть достижимым — ключ, который не может случиться, ничего не
+        # объясняет, но выглядит объяснением.
+        dict(free_capital_usd=1.0),
     ]
     seen = set()
     for override in broken:
@@ -549,12 +559,19 @@ def test_exit_reasons_match_the_database_constraint() -> None:
     """Перечень причин выхода в коде и в схеме — один и тот же.
 
     Расхождение проявилось бы отказом вставки в проде, а не здесь.
+
+    ЧИТАЮТСЯ ОБЕ МИГРАЦИИ. Ограничение ``positions_reason_chk`` завела 018, а
+    Этап 9.1.1 §6 пересоздал его миграцией 019 с пятым значением ``data_gap``:
+    искать все причины в одной 018 значило бы искать их там, где их уже нет.
+    Строгую сверку СОСТАВА (ровно те значения и ни одним больше) делает
+    ``tests/test_stage_9_1_1.py``.
     """
-    migration = (_ROOT / "db" / "migrations" / "018_positions.sql").read_text(
-        encoding="utf-8"
+    migrations = "".join(
+        (_ROOT / "db" / "migrations" / name).read_text(encoding="utf-8")
+        for name in ("018_positions.sql", "019_positions_data_gap.sql")
     )
     for reason in EXIT_REASONS:
-        assert f"'{reason}'" in migration, reason
+        assert f"'{reason}'" in migrations, reason
 
 
 # =============================================================================
@@ -883,7 +900,13 @@ async def test_the_unsettled_query_finds_a_planted_row_and_spares_a_correct_one(
 
     from src.core.db import db as database
 
-    settle = settle_seconds()
+    # ЗАПАС БЕРЁТСЯ ПО РАЗРЕШЕНИЮ ПОДКЛАДЫВАЕМЫХ СТРОК (Этап 9.1.1 §2). Обе
+    # строки ниже — минутного ряда, и последний бар их окна закрывается через
+    # 60 секунд после срока, а не через ``settle_seconds()`` (час грубого бара
+    # плюс пять минут). Прежняя редакция теста мерила минутные строки часовым
+    # запасом — ровно та ошибка, которую §1–§2 и исправляют: на боевой базе она
+    # объявила подозрительными 7618 исправных строк.
+    settle = 60
     entry_ts = datetime(2026, 8, 20, 0, 0, tzinfo=UTC)
     horizon_h = 1
     closes_at = entry_ts + timedelta(hours=horizon_h, seconds=settle)
@@ -917,8 +940,11 @@ async def test_the_unsettled_query_finds_a_planted_row_and_spares_a_correct_one(
         database._pool = await asyncpg.create_pool(
             dsn=TEST_DSN, min_size=1, max_size=2
         )
+        # settle_seconds здесь — запас для НЕИЗВЕСТНОГО разрешения (ветка
+        # ELSE предиката). Подложенные строки минутные, и на них он не влияет:
+        # передаём настоящее значение из 8.10.1, чтобы это было видно.
         rows = await database.get_strategy_outcomes_unsettled(
-            settle_seconds=settle
+            settle_seconds=settle_seconds()
         )
         planted = [
             r for r in rows

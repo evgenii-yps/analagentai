@@ -48,10 +48,20 @@ HEARTBEATS: list[tuple[str, str, int]] = [
     ("decision:heartbeat", "DECISION_INTERVAL", 60),
     ("notify:heartbeat", "NOTIFY_INTERVAL", 30),
     ("evaluator:heartbeat", "EVAL_INTERVAL", 300),
-    ("bot:heartbeat", "BOT_POLL_TIMEOUT", 30),
+    # Этап 9.1.1 §4. Сервис ведения позиций пишет свой heartbeat с Этапа 9.1, но
+    # ключ не читал никто: остановившийся сервис ничем себя не проявлял, а его
+    # остановка означает, что уже открытые позиции повиснут — задетые за время
+    # простоя цель и предел не будут замечены никогда, потому что бары уйдут за
+    # отметку last_checked_ts только вместе с их разбором.
+    ("positions:heartbeat", "POSITION_INTERVAL", 60),
 ]
 
-CONTAINERS = ["postgres", "redis", "collector", "agents", "decision", "notify", "evaluator", "bot"]
+# Этап 9.1.1 §4: контейнер positions добавлен вместе со своим heartbeat.
+# Перечень контейнеров и перечень heartbeat-ключей обязаны описывать ОДИН И ТОТ
+# ЖЕ стек: сервис, чей heartbeat в отчёте есть, а контейнер не назван, читается
+# как «ключ протух сам по себе».
+CONTAINERS = ["postgres", "redis", "collector", "agents", "decision", "notify", "evaluator",
+              "bot", "positions"]
 
 # Потоки данных для проверки «тихой» поломки: (подпись, таблица).
 DATA_STREAMS = [

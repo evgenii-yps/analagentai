@@ -1150,16 +1150,44 @@ class DB:
     # чтения окна (get_strategy_pairs_done). Поэтому единственный способ
     # пересчитать — сначала удалить.
 
+    # ЗАПАС БЕРЁТСЯ ПО ФАКТИЧЕСКОМУ РАЗРЕШЕНИЮ СТРОКИ (Этап 9.1.1 §2).
+    #
+    # ПОЧЕМУ НЕ ОДНО ЧИСЛО НА ВСЕХ, как было раньше. Запас в 3900 секунд (час
+    # грубого бара плюс BARRIER_SETTLE_MINUTES) верен ПРИ ОТБОРЕ кандидатов:
+    # там разрешение ещё неизвестно, оно выяснится по факту покрытия окна
+    # минутным рядом, и ждать приходится по худшему случаю. Но у УЖЕ
+    # ПОСЧИТАННОЙ строки разрешение известно и записано в колонке resolution
+    # (ограничение strategy_outcomes_resolution_chk, миграция 016). Все
+    # 449 764 строки боевой базы посчитаны по МИНУТНОМУ ряду, где последний бар
+    # окна закрывается через 60 секунд после срока, — и проверка их запасом в
+    # 3900 секунд объявила подозрительными 7618 ИСПРАВНЫХ строк при 0
+    # настоящих (замер 30.08.2026).
+    #
+    # ВЕТКА ELSE — НЕ ФОРМАЛЬНОСТЬ. Появись в проекте третье разрешение, его
+    # строки будут проверяться ХУДШИМ случаем ($1, то есть settle_seconds()),
+    # а не проскочат молча: неизвестное разрешение обязано вызывать подозрение,
+    # а не доверие.
     STRATEGY_UNSETTLED_PREDICATE = (
         "computed_at < entry_ts "
         "+ make_interval(hours => horizon_h::int) "
-        "+ make_interval(secs => $1::int)"
+        "+ make_interval(secs => CASE resolution "
+        "                          WHEN '1m' THEN 60 "
+        "                          WHEN '1h' THEN 3600 "
+        "                          ELSE $1::int END)"
     )
 
     async def count_strategy_outcomes_unsettled(
         self, *, settle_seconds: int
     ) -> int:
-        """Сколько строк посчитано раньше, чем закрылся последний бар окна."""
+        """Сколько строк посчитано раньше, чем закрылся последний бар окна.
+
+        ``settle_seconds`` — запас для НЕИЗВЕСТНОГО разрешения (ветка ELSE
+        предиката). У строк с ``resolution`` из перечня 016 запас берётся по
+        самому разрешению, и этот параметр их не касается. Имя параметра
+        оставлено прежним намеренно: его значение по-прежнему приходит из
+        ``barrier.runner.settle_seconds()``, и переименование заставило бы
+        править вызовы ради того же самого числа.
+        """
         value = await self.pool.fetchval(
             "SELECT count(*) FROM strategy_outcomes "
             f"WHERE {self.STRATEGY_UNSETTLED_PREDICATE};",
@@ -1170,10 +1198,15 @@ class DB:
     async def get_strategy_outcomes_unsettled(
         self, *, settle_seconds: int, limit: int | None = None
     ) -> list[dict[str, Any]]:
-        """Подозрительные строки целиком — для разбивок и примеров в отчёте."""
+        """Подозрительные строки целиком — для разбивок и примеров в отчёте.
+
+        ``resolution`` возвращается наравне с остальным: именно оно задаёт,
+        сколько строке полагалось ждать, и разбор находки без него начинался бы
+        с выяснения, чем эти строки вообще меряли.
+        """
         query = (
             "SELECT strategy, instrument_id, entry_ts, horizon_h, computed_at, "
-            "       outcome, net_pnl_pct, logic_version "
+            "       outcome, net_pnl_pct, logic_version, resolution "
             "FROM strategy_outcomes "
             f"WHERE {self.STRATEGY_UNSETTLED_PREDICATE} "
             "ORDER BY entry_ts DESC, strategy ASC"
@@ -1189,6 +1222,12 @@ class DB:
         self, *, settle_seconds: int
     ) -> int:
         """Удаляет ТОЛЬКО подозрительные строки. Возвращает число удалённых.
+
+        ЗВАТЬ ЕГО НАПРЯМУЮ НЕЛЬЗЯ. Единственный путь к нему —
+        ``scripts/repair_9_1_strategy_settle.py --apply``, и там перед вызовом
+        стоят три ограждения (§2.2 ТЗ 9.1.1): снятый снимок «до», совпавшее
+        подтверждение числом и ненулевой счёт. Удаление безвозвратно, а
+        пересчёт возможен ТОЛЬКО после удаления — обратного хода нет.
 
         Пересчёт этот метод НЕ выполняет и выполнять не должен: удалённые ключи
         исчезают из множества «уже посчитано», и очередной штатный прогон
@@ -1267,6 +1306,38 @@ class DB:
         await self.pool.execute(
             "CREATE INDEX IF NOT EXISTS ix_positions_status_opened "
             "ON positions (status, opened_at DESC);"
+        )
+        # ПЯТОЕ ЗНАЧЕНИЕ ПРИЧИНЫ ВЫХОДА (миграция 019) — на уже существующей
+        # таблице. Блок POSITIONS_CHECKS выше трогает ограничение только если
+        # его нет вовсе, а здесь оно есть и, возможно, ещё из четырёх значений:
+        # миграция 019 могла быть не применена на работающем томе.
+        #
+        # ЧЕМ ЭТО ГРОЗИТ, ЕСЛИ НЕ ЧИНИТЬ. Закрытие по пробелу в данных упало бы
+        # на нарушении ограничения, сервис (он не падает по построению) записал
+        # бы это предупреждением в журнал, и позиция осталась бы висеть вечно —
+        # ровно то, ради устранения чего §6 и написан.
+        #
+        # Ограничение пересоздаётся ТОЛЬКО если оно ещё не знает data_gap:
+        # безусловный DROP/ADD на каждом старте оставлял бы таблицу на доли
+        # секунды без закрытого перечня причин.
+        await self.pool.execute(
+            """
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname = 'positions_reason_chk'
+                      AND conrelid = 'positions'::regclass
+                      AND pg_get_constraintdef(oid) NOT LIKE '%data_gap%'
+                ) THEN
+                    ALTER TABLE positions DROP CONSTRAINT positions_reason_chk;
+                    ALTER TABLE positions ADD CONSTRAINT positions_reason_chk
+                        CHECK (exit_reason IS NULL OR exit_reason IN
+                               ('target', 'stop', 'timeout', 'ambiguous',
+                                'data_gap'));
+                END IF;
+            END $$;
+            """
         )
         # Роль только на чтение (сервис бота) должна видеть таблицу сразу:
         # её GRANT ON ALL TABLES отработал, когда таблицы ещё не было, и без
@@ -1495,9 +1566,13 @@ class DB:
     async def get_positions_summary(self, *, days: int = 7) -> dict[str, Any]:
         """Итог по закрытым позициям за окно — для бота (§10) и отчёта.
 
-        Средний ``net_pnl_pct`` и сумма ``net_pnl_usd`` считаются по ВСЕМ
-        закрытым позициям окна, включая ``ambiguous``: у тех итог определён (он
-        взят по пределу, пессимистично), просто менее достоверен. Их число
+        Средний ``net_pnl_pct`` и сумма ``net_pnl_usd`` считаются по закрытым
+        позициям окна, включая ``ambiguous``: у тех итог определён (он взят по
+        пределу, пессимистично), просто менее достоверен. ЗАКРЫТИЯ ПО ПРОБЕЛУ В
+        ДАННЫХ (``data_gap``, Этап 9.1.1 §6.7) в средние и суммы НЕ ВХОДЯТ: у
+        них цена выхода не наблюдалась, а восстановлена, и их итог описывает
+        длительность сбоя сбора данных, а не поведение рынка. Их число
+        возвращается отдельным полем. Их число
         печатается ОТДЕЛЬНОЙ строкой — так видно, велика ли их доля, и при этом
         средний итог не оказывается посчитанным по выборке, отличной от той,
         которую человек видит в разбивке по причинам.
@@ -1506,9 +1581,13 @@ class DB:
             """
             SELECT count(*) AS closed,
                    count(*) FILTER (WHERE outcome_certain = FALSE) AS uncertain,
-                   avg(net_pnl_pct) AS avg_net_pnl_pct,
-                   sum(net_pnl_usd) AS sum_net_pnl_usd,
-                   avg(entry_slippage_pct) AS avg_slippage_pct,
+                   count(*) FILTER (WHERE exit_reason = 'data_gap') AS data_gap,
+                   avg(net_pnl_pct) FILTER (WHERE exit_reason <> 'data_gap')
+                       AS avg_net_pnl_pct,
+                   sum(net_pnl_usd) FILTER (WHERE exit_reason <> 'data_gap')
+                       AS sum_net_pnl_usd,
+                   avg(entry_slippage_pct) FILTER (WHERE exit_reason <> 'data_gap')
+                       AS avg_slippage_pct,
                    avg(entry_lag_sec) AS avg_lag_sec
             FROM positions
             WHERE status = 'closed'
@@ -2781,12 +2860,17 @@ BEGIN
             ADD CONSTRAINT positions_status_chk
             CHECK (status IN ('open', 'closed'));
     END IF;
+    -- Этап 9.1.1 §6: пятое значение data_gap. Сервис гарантирует свою схему
+    -- при старте, и на ЧИСТОМ томе (где миграции 018 и 019 ещё не применялись)
+    -- перечень из четырёх значений отверг бы закрытие по пробелу в данных —
+    -- сервис падал бы на первой же такой позиции. На уже работающей базе этот
+    -- блок ничего не делает: ограничение там есть, и его правит миграция 019.
     IF NOT EXISTS (SELECT 1 FROM pg_constraint
                    WHERE conname = 'positions_reason_chk') THEN
         ALTER TABLE positions
             ADD CONSTRAINT positions_reason_chk
             CHECK (exit_reason IS NULL OR exit_reason IN
-                   ('target', 'stop', 'timeout', 'ambiguous'));
+                   ('target', 'stop', 'timeout', 'ambiguous', 'data_gap'));
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_constraint
                    WHERE conname = 'positions_resolution_chk') THEN

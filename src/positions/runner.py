@@ -42,9 +42,11 @@ from src.core.redis_client import get_redis
 from src.notify.telegram import send_message
 from src.positions import messages
 from src.positions.rules import (
+    EXIT_DATA_GAP,
     SIDE_BUY,
     Bar,
     check_exit,
+    check_gap_exit,
     levels,
     net_pnl,
     qty_for_slot,
@@ -148,8 +150,16 @@ async def sync_open_positions(now: datetime) -> ClosedStats:
         deadline_at = row["deadline_at"]
         last_checked = row["last_checked_ts"] or opened_at
 
-        # Новых закрытых баров нет — позицию не трогаем вовсе.
-        if settle_edge <= last_checked:
+        # ДВА УСЛОВИЯ ПРОПУСКА, А НЕ ОДНО (Этап 9.1.1 §6.5). Прежнее «нет
+        # новых закрытых баров — не трогаем вовсе» само по себе верно и бережёт
+        # базу, но оно закрывало путь ровно к тому случаю, ради которого
+        # написан data_gap: позиция без единого нового бара — это и есть
+        # позиция, по инструменту которой пропали данные. Пропускаем её теперь
+        # только пока ЕЩЁ НЕ ПОРА закрывать её по пробелу.
+        gap_deadline = deadline_at + timedelta(
+            seconds=settings.POSITION_GAP_GRACE_SEC
+        )
+        if settle_edge <= last_checked and now < gap_deadline:
             continue
 
         stats.checked += 1
@@ -171,30 +181,56 @@ async def sync_open_positions(now: datetime) -> ClosedStats:
                 low=float(item["low"]), close=float(item["close"]))
             for item in raw
         ]
-        if not bars:
-            continue
 
-        decision = check_exit(
-            bars=bars,
-            target_price=float(row["target_price"]),
-            stop_price=float(row["stop_price"]),
-            entry_price=entry_price,
-            deadline_at=deadline_at,
-            cost_pct=float(row["cost_pct"]),
+        # ПУСТОЙ РЯД БОЛЬШЕ НЕ ОЗНАЧАЕТ «идём дальше»: именно он и бывает при
+        # пропаже данных. Правило выхода на пустом ряде исхода не даёт (и не
+        # должно), поэтому спрашиваем его только когда есть о чём спрашивать.
+        decision = (
+            check_exit(
+                bars=bars,
+                target_price=float(row["target_price"]),
+                stop_price=float(row["stop_price"]),
+                entry_price=entry_price,
+                deadline_at=deadline_at,
+                cost_pct=float(row["cost_pct"]),
+            )
+            if bars else None
         )
-        seen_until = bars[-1].ts
+        # «Докуда разобрано»: при пустом ряде отметка остаётся на месте — ничего
+        # нового мы не видели, и двигать её вперёд значило бы соврать.
+        seen_until = bars[-1].ts if bars else last_checked
 
         if decision is None:
-            await db.touch_position(position_id, seen_until)
-            stats.touched += 1
+            # ИСХОДА НЕТ. Либо окно ещё не кончилось, либо данных нет. Разницу
+            # между «ещё рано» и «данных не будет» знает только правило
+            # ``check_gap_exit`` — и решает её ОДНИМ способом: по времени.
+            decision = check_gap_exit(
+                bars=bars,
+                entry_price=entry_price,
+                deadline_at=deadline_at,
+                now=now,
+                grace_sec=settings.POSITION_GAP_GRACE_SEC,
+            )
+        if decision is None:
+            if bars:
+                await db.touch_position(position_id, seen_until)
+                stats.touched += 1
             continue
 
+        by_gap = decision.exit_reason == EXIT_DATA_GAP
         pnl_pct = net_pnl(entry_price, decision.exit_price, float(row["cost_pct"]))
         pnl_usd = float(row["notional_usd"]) * pnl_pct / 100.0
         # Момент закрытия — время ЗАКРЫТИЯ бара выхода: бар прожит целиком, и
         # относить выход к его открытию значило бы закрывать позицию раньше,
         # чем случилось событие, по которому она закрыта.
-        closed_at = decision.exit_bar_ts + timedelta(seconds=60)
+        #
+        # У ЗАКРЫТИЯ ПО ПРОБЕЛУ МОМЕНТ ДРУГОЙ — ``now``. Такая позиция закрыта
+        # не событием на графике, а истечением ожидания, и отнести её закрытие
+        # к бару, случившемуся часы назад, значило бы записать в журнал момент,
+        # в который ничего не происходило.
+        closed_at = (
+            now if by_gap else decision.exit_bar_ts + timedelta(seconds=60)
+        )
         changed = await db.close_position(
             position_id,
             closed_at=closed_at,
@@ -216,6 +252,17 @@ async def sync_open_positions(now: datetime) -> ClosedStats:
 
         stats.closed += 1
         stats.count(decision.exit_reason)
+        if by_gap:
+            # ПРЕДУПРЕЖДЕНИЕ, А НЕ info: закрытие по пробелу означает, что сбор
+            # данных по инструменту встал, и это событие про СИСТЕМУ, а не про
+            # рынок. Пять таких закрытий подряд — повод идти чинить коллектор.
+            _log.warning(
+                "positions_data_gap=1",
+                position_id=position_id, symbol=row["symbol"],
+                last_bar_ts=decision.exit_bar_ts.isoformat(),
+                gap_sec=int((now - decision.exit_bar_ts).total_seconds()),
+                grace_sec=settings.POSITION_GAP_GRACE_SEC,
+            )
         _log.info(
             "positions_closed=1",
             position_id=position_id, symbol=row["symbol"],
@@ -224,16 +271,30 @@ async def sync_open_positions(now: datetime) -> ClosedStats:
             net_pnl_pct=round(pnl_pct, 6), net_pnl_usd=round(pnl_usd, 6),
             bars_held=decision.bars_held,
         )
-        await _send(messages.closed_text(
-            symbol=str(row["symbol"]),
-            exit_reason=decision.exit_reason,
-            entry_price=entry_price,
-            exit_price=decision.exit_price,
-            net_pnl_pct=pnl_pct,
-            net_pnl_usd=pnl_usd,
-            cost_pct=float(row["cost_pct"]),
-            held_sec=(closed_at - opened_at).total_seconds(),
-        ))
+        # ДЛЯ ПРОБЕЛА — СВОЙ ТЕКСТ. Обычное сообщение о закрытии утверждало бы
+        # результат, которого не измеряли.
+        if by_gap:
+            await _send(messages.data_gap_text(
+                symbol=str(row["symbol"]),
+                entry_price=entry_price,
+                exit_price=decision.exit_price,
+                last_bar_ts=decision.exit_bar_ts,
+                gap_sec=(now - decision.exit_bar_ts).total_seconds(),
+                net_pnl_pct=pnl_pct,
+                net_pnl_usd=pnl_usd,
+                bars_held=decision.bars_held,
+            ))
+        else:
+            await _send(messages.closed_text(
+                symbol=str(row["symbol"]),
+                exit_reason=decision.exit_reason,
+                entry_price=entry_price,
+                exit_price=decision.exit_price,
+                net_pnl_pct=pnl_pct,
+                net_pnl_usd=pnl_usd,
+                cost_pct=float(row["cost_pct"]),
+                held_sec=(closed_at - opened_at).total_seconds(),
+            ))
     return stats
 
 
@@ -245,6 +306,16 @@ async def open_new_positions(now: datetime) -> OpenedStats:
     open_rows = await db.get_open_positions()
     busy = {int(row["instrument_id"]) for row in open_rows}
     open_count = len(open_rows)
+    # ЗАНЯТЫЙ КАПИТАЛ — ИЗ ТОГО ЖЕ ЕДИНСТВЕННОГО ЧТЕНИЯ, что и занятые
+    # инструменты. Отдельный запрос «сколько денег в позициях» мог бы разойтись
+    # с этим списком, закройся позиция между двумя запросами, — и тогда слоты
+    # считались бы по одному состоянию базы, а деньги по другому.
+    committed = sum(float(row["notional_usd"]) for row in open_rows)
+    # ПРИБЫЛЬ НЕ РЕИНВЕСТИРУЕТСЯ: бюджет — постоянная величина из настройки, и
+    # накопленный итог закрытых позиций к нему НЕ ПРИБАВЛЯЕТСЯ ни при каких
+    # условиях. Иначе поздняя сделка весила бы больше ранней просто потому, что
+    # она поздняя, и замер перестал бы быть замером.
+    free_capital = float(settings.POSITION_BUDGET_USD) - committed
 
     candidates = await db.get_position_candidates(
         logic_version=settings.LOGIC_VERSION,
@@ -308,6 +379,8 @@ async def open_new_positions(now: datetime) -> OpenedStats:
             bar_age_sec=bar_age_sec,
             max_bar_age_sec=settings.POSITION_MAX_BAR_AGE_SEC,
             has_frozen_target=row["target_pct"] is not None,
+            free_capital_usd=free_capital,
+            slot_usd=settings.POSITION_SLOT_USD,
         )
         if not verdict.allowed:
             stats.refuse(verdict.reason)
@@ -359,6 +432,9 @@ async def open_new_positions(now: datetime) -> OpenedStats:
 
         open_count += 1
         busy.add(instrument_id)
+        # Свободный капитал уменьшается ровно на РАЗМЕР СЛОТА — ту же величину,
+        # что ушла в notional_usd, — так же, как здесь же растёт open_count.
+        free_capital -= float(settings.POSITION_SLOT_USD)
         stats.opened += 1
         lag = int((opened_at - signal_ts).total_seconds())
         slip = slippage_pct(signal_price, entry_price)
@@ -409,6 +485,8 @@ async def run() -> None:
         min_probability=settings.POSITION_MIN_PROBABILITY,
         max_open=settings.POSITION_MAX_OPEN,
         slot_usd=settings.POSITION_SLOT_USD,
+        budget_usd=settings.POSITION_BUDGET_USD,
+        gap_grace_sec=settings.POSITION_GAP_GRACE_SEC,
         settle_sec=settings.POSITION_SETTLE_SEC,
     )
     while True:
