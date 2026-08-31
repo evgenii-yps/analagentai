@@ -128,7 +128,20 @@ function makeSheet(name) {
               // Источник шириной в одну строку размножается вниз — так же,
               // как это делает Google при copyTo на диапазон большей высоты.
               const text = self.getFormulaAt(row + (r % numRows), col + c);
-              if (!text) continue;
+              if (!text) {
+                // ЭТАП 9.1.2.2. PASTE_FORMULA ПЕРЕНОСИТ И ЛИТЕРАЛЫ. Ячейка
+                // без формулы копируется своим ЗНАЧЕНИЕМ — так делает Google,
+                // и прежний двойник этого НЕ делал: он молча пропускал такие
+                // ячейки. Из-за этого стенд Этапа 9.1.2 не увидел дефекта,
+                // ради которого написан Этап 9.1.2.2 — протяжка формул из
+                // строки выше затирала заметку в столбце T, лежащем ВНУТРИ
+                // копируемого диапазона K..последний. Двойник, который мягче
+                // настоящего Google, доказывает не работоспособность кода, а
+                // собственную снисходительность.
+                self.setCell(to.row + r, to.col + c,
+                             self.getCell(row + (r % numRows), col + c));
+                continue;
+              }
               // Относительные ссылки сдвигаются на разницу строк. Без сдвига
               // протянутая формула повторяла бы чужую строку, и проверка
               // протяжки ничего не проверяла бы.
@@ -515,7 +528,7 @@ check('version: приёмник называет версию и НИЧЕГО �
   const before = JSON.stringify(sheet.grid);
   const res = post(ctx, { secret: ctx.SECRET, sheet: TRADES, mode: 'version' });
   assert(res.ok === true, `ok=false: ${res.error}`);
-  assert(res.version === '9.1.2', `version=${res.version}`);
+  assert(res.version === '9.1.2.2', `version=${res.version}`);
   assert(JSON.stringify(sheet.grid) === before, 'вопрос о версии изменил лист');
   assert(res.inserted === undefined && res.updated === undefined,
          'вопрос о версии отчитался о записи');
@@ -583,6 +596,201 @@ check('table_update: повторный тот же хвост не удваив
          `причина выхода встречается больше одного раза: «${twice}»`);
 });
 
+// --- Этап 9.1.2.2: заметка не затирается, неоднозначная метка не пишется ----
+
+check('9.1.2.2: заметка НОВОЙ строки своя, а не унаследованная от строки выше', () => {
+  // Тот самый дефект, найденный на боевом листе 31.08.2026: строка выше несёт
+  // заметку [поз. 10], протяжка формул тянет вниз ВЕСЬ диапазон K..последний
+  // столбец — а столбец заметок T лежит внутри него.
+  const ctx = makeContext();
+  const sheet = makeTradesSheet(ctx, { blank: 4, filled: 1 });
+  sheet.setCell(2, NOTE_COL, '[поз. 10] цель 2535.33 · сигнал #73875');
+  const res = post(ctx, {
+    secret: ctx.SECRET, sheet: TRADES, mode: 'table_append',
+    rows: [openRow('ETH', 2472.8)], notes: ['[поз. 11] цель 2535.33 · сигнал #73999'],
+    noteColumn: NOTE_COL, totalsMarker: 'итого:', formulaFromColumn: FORMULA_FROM,
+  });
+  assert(res.ok === true, `ok=false: ${res.error}`);
+  assert(res.startRow === 3, `строка ${res.startRow}, ожидалась 3`);
+  assert(sheet.getCell(3, NOTE_COL) === '[поз. 11] цель 2535.33 · сигнал #73999',
+         `заметка чужая: «${sheet.getCell(3, NOTE_COL)}»`);
+  // Формулы при этом протянуты: исправление не отменило протяжку.
+  assert(sheet.getFormulaAt(3, FORMULA_FROM) === '=F3*2',
+         `формула K3 «${sheet.getFormulaAt(3, FORMULA_FROM)}»`);
+});
+
+check('9.1.2.2: литерал в столбце БЕЗ формулы вниз не переносится', () => {
+  // Заметка — самый заметный случай, но не единственный: любой набранный
+  // руками комментарий или число переехало бы в новую строку точно так же.
+  const ctx = makeContext();
+  const sheet = makeTradesSheet(ctx, { blank: 4, filled: 1 });
+  sheet.setFormulaAt(2, 12, '');            // столбец L формулы лишён
+  sheet.setCell(2, 12, 'пометка владельца'); // и содержит литерал
+  const res = post(ctx, {
+    secret: ctx.SECRET, sheet: TRADES, mode: 'table_append',
+    rows: [openRow('SOL', 105.35)], notes: ['[поз. 12]'],
+    noteColumn: NOTE_COL, totalsMarker: 'итого:', formulaFromColumn: FORMULA_FROM,
+  });
+  assert(res.ok === true, `ok=false: ${res.error}`);
+  assert(sheet.getCell(3, 12) === '',
+         `литерал перенесён вниз: «${sheet.getCell(3, 12)}»`);
+  assert(sheet.getFormulaAt(3, FORMULA_FROM) === '=F3*2', 'формула не протянута');
+});
+
+check('9.1.2.2: формула в столбце заметок вниз НЕ протягивается', () => {
+  // Второе ограждение поверх первого: заметка — ключ поиска строки, и её
+  // потеря стоит дороже потери формулы.
+  const ctx = makeContext();
+  const sheet = makeTradesSheet(ctx, { blank: 4, filled: 1 });
+  sheet.setFormulaAt(2, NOTE_COL, '=A2');
+  const res = post(ctx, {
+    secret: ctx.SECRET, sheet: TRADES, mode: 'table_append',
+    rows: [openRow('BTC', 78080.6)], notes: ['[поз. 13] цель'],
+    noteColumn: NOTE_COL, totalsMarker: 'итого:', formulaFromColumn: FORMULA_FROM,
+  });
+  assert(res.ok === true, `ok=false: ${res.error}`);
+  assert(sheet.getFormulaAt(3, NOTE_COL) === '',
+         `в столбец заметок протянута формула «${sheet.getFormulaAt(3, NOTE_COL)}»`);
+  assert(sheet.getCell(3, NOTE_COL) === '[поз. 13] цель', 'заметка не записана');
+});
+
+check('9.1.2.2: table_update при ДВУХ строках с меткой не пишет ничего', () => {
+  const ctx = makeContext();
+  const sheet = makeTradesSheet(ctx, { blank: 5, filled: 0 });
+  // Две строки с одной и той же меткой — ровно то, что вышло на боевом листе.
+  sheet.setCell(2, 3, 'ETH'); sheet.setCell(2, NOTE_COL, '[поз. 10] цель');
+  sheet.setCell(3, 3, 'ETH'); sheet.setCell(3, NOTE_COL, '[поз. 10] цель');
+  const res = post(ctx, {
+    secret: ctx.SECRET, sheet: TRADES, mode: 'table_update', noteColumn: NOTE_COL,
+    updates: [{ marker: '[поз. 10]', startColumn: 8,
+                values: ['31.08.2026', '2:24:00', 2448.07],
+                noteAppend: ' · сработал предел убытка' }],
+  });
+  assert(res.ok === true, `ok=false: ${res.error}`);
+  assert(res.updated === 0, `updated=${res.updated}, ожидался 0`);
+  assert(res.notFound === undefined, 'неоднозначная метка попала в notFound');
+  assert(JSON.stringify(res.ambiguous) === JSON.stringify([{ marker: '[поз. 10]', rows: [2, 3] }]),
+         `ambiguous=${JSON.stringify(res.ambiguous)}`);
+  assert(sheet.getCell(2, 8) === '' && sheet.getCell(3, 8) === '',
+         'дозапись всё-таки состоялась');
+  assert(String(sheet.getCell(2, NOTE_COL)).indexOf('предел') < 0,
+         'заметка всё-таки дописана');
+});
+
+check('9.1.2.2: одна метка неоднозначна — остальные пачки дозаписываются', () => {
+  const ctx = makeContext();
+  const sheet = makeTradesSheet(ctx, { blank: 5, filled: 0 });
+  sheet.setCell(2, 3, 'ETH'); sheet.setCell(2, NOTE_COL, '[поз. 10] цель');
+  sheet.setCell(3, 3, 'ETH'); sheet.setCell(3, NOTE_COL, '[поз. 10] цель');
+  sheet.setCell(4, 3, 'XRP'); sheet.setCell(4, NOTE_COL, '[поз. 11] цель');
+  const res = post(ctx, {
+    secret: ctx.SECRET, sheet: TRADES, mode: 'table_update', noteColumn: NOTE_COL,
+    updates: [
+      { marker: '[поз. 10]', startColumn: 8, values: ['a', 'b', 1] },
+      { marker: '[поз. 11]', startColumn: 8, values: ['31.08.2026', '21:31:00', 1.43] },
+    ],
+  });
+  assert(res.ok === true, `ok=false: ${res.error}`);
+  assert(res.updated === 1, `updated=${res.updated}, ожидался 1`);
+  assert(res.ambiguous.length === 1, `ambiguous=${JSON.stringify(res.ambiguous)}`);
+  assert(sheet.getCell(4, 10) === 1.43, 'однозначная метка не дозаписана');
+  assert(sheet.getCell(2, 8) === '' && sheet.getCell(3, 8) === '',
+         'неоднозначная метка всё-таки записана');
+});
+
+check('9.1.2.2: [поз. 1] не совпадает со строкой, несущей [поз. 12]', () => {
+  const ctx = makeContext();
+  const sheet = makeTradesSheet(ctx, { blank: 5, filled: 0 });
+  sheet.setCell(2, 3, 'BTC'); sheet.setCell(2, NOTE_COL, '[поз. 12] цель');
+  const res = post(ctx, {
+    secret: ctx.SECRET, sheet: TRADES, mode: 'table_update', noteColumn: NOTE_COL,
+    updates: [{ marker: '[поз. 1]', startColumn: 8, values: ['a', 'b', 1] }],
+  });
+  assert(res.ok === true, `ok=false: ${res.error}`);
+  assert(JSON.stringify(res.notFound) === JSON.stringify(['[поз. 1]']),
+         `notFound=${JSON.stringify(res.notFound)}`);
+  assert(sheet.getCell(2, 8) === '', 'запись ушла в строку с меткой [поз. 12]');
+});
+
+check('9.1.2.2: table_append не создаёт вторую строку с уже занятой меткой', () => {
+  const ctx = makeContext();
+  const sheet = makeTradesSheet(ctx, { blank: 5, filled: 0 });
+  // Строка 2 ЗАНЯТА: столбец A заполнен, иначе она считалась бы свободной.
+  openRow('ETH', 2472.8).forEach((v, i) => sheet.setCell(2, i + 1, v));
+  sheet.setCell(2, NOTE_COL, '[поз. 20] цель');
+  const res = post(ctx, {
+    secret: ctx.SECRET, sheet: TRADES, mode: 'table_append',
+    rows: [openRow('ETH', 2472.8), openRow('XRP', 1.4161)],
+    notes: ['[поз. 20] цель', '[поз. 21] цель'],
+    noteColumn: NOTE_COL, totalsMarker: 'итого:', formulaFromColumn: FORMULA_FROM,
+  });
+  assert(res.ok === true, `ok=false: ${res.error}`);
+  assert(res.inserted === 1, `inserted=${res.inserted}, ожидался 1`);
+  assert(JSON.stringify(res.ambiguous) === JSON.stringify([{ marker: '[поз. 20]', rows: [2] }]),
+         `ambiguous=${JSON.stringify(res.ambiguous)}`);
+  assert(sheet.getCell(3, 3) === 'XRP', 'создана не та строка');
+  assert(sheet.getCell(3, NOTE_COL) === '[поз. 21] цель', 'заметка не та');
+  assert(sheet.getCell(4, 3) === '', 'создана лишняя строка');
+});
+
+check('9.1.2.2: вся пачка занята — лист не трогается вовсе', () => {
+  const ctx = makeContext();
+  const sheet = makeTradesSheet(ctx, { blank: 5, filled: 0 });
+  openRow('ETH', 2472.8).forEach((v, i) => sheet.setCell(2, i + 1, v));
+  sheet.setCell(2, NOTE_COL, '[поз. 30] цель');
+  const before = JSON.stringify(sheet.grid);
+  const res = post(ctx, {
+    secret: ctx.SECRET, sheet: TRADES, mode: 'table_append',
+    rows: [openRow('ETH', 2472.8)], notes: ['[поз. 30] цель'],
+    noteColumn: NOTE_COL, totalsMarker: 'итого:', formulaFromColumn: FORMULA_FROM,
+  });
+  assert(res.ok === true, `ok=false: ${res.error}`);
+  assert(res.inserted === 0, `inserted=${res.inserted}`);
+  assert(res.startRow === undefined, 'назван номер строки, которой нет');
+  assert(JSON.stringify(sheet.grid) === before, 'лист изменён');
+});
+
+check('9.1.2.2: заметка без метки создаётся как прежде (проверка не мешает)', () => {
+  // Заметка потерянной строки начинается не с метки, а со слов «строка
+  // открытия не найдена» — такие строки создаются по-прежнему.
+  const ctx = makeContext();
+  const sheet = makeTradesSheet(ctx, { blank: 4, filled: 1 });
+  const note = 'строка открытия не найдена — сделка записана целиком новой '
+             + 'строкой; [поз. 40] цель 1.43';
+  const res = post(ctx, {
+    secret: ctx.SECRET, sheet: TRADES, mode: 'table_append',
+    rows: [openRow('XRP', 1.4161)], notes: [note],
+    noteColumn: NOTE_COL, totalsMarker: 'итого:', formulaFromColumn: FORMULA_FROM,
+  });
+  assert(res.ok === true, `ok=false: ${res.error}`);
+  assert(res.inserted === 1, `inserted=${res.inserted}`);
+  assert(res.ambiguous === undefined, `ambiguous=${JSON.stringify(res.ambiguous)}`);
+  assert(sheet.getCell(3, NOTE_COL) === note, 'заметка не записана');
+});
+
+check('9.1.2.2: markerRows считает совпадения — 1, 2 и 0', () => {
+  // Логика поиска вынесена в отдельную функцию именно затем, чтобы её можно
+  // было проверить без Google и без листа.
+  const ctx = makeContext();
+  const notes = [['[поз. 5] цель'], ['[поз. 12] цель'], ['[поз. 12] и ещё раз']];
+  assert(JSON.stringify(ctx.markerRows(notes, '[поз. 5]')) === '[1]', 'одна метка');
+  assert(JSON.stringify(ctx.markerRows(notes, '[поз. 12]')) === '[2,3]', 'две метки');
+  assert(JSON.stringify(ctx.markerRows(notes, '[поз. 99]')) === '[]', 'нет метки');
+  assert(JSON.stringify(ctx.markerRows(notes, '[поз. 1]')) === '[]',
+         '[поз. 1] совпало с [поз. 12]');
+});
+
+check('9.1.2.2: formulaColumnsToCopy не отдаёт ни литералов, ни столбца заметок', () => {
+  const ctx = makeContext();
+  // Столбцы 11..20; формулы в 11, 13 и 20 (столбец заметок).
+  const formulas = ['=A1', '', '=B1', '', '', '', '', '', '', '=C1'];
+  const got = ctx.formulaColumnsToCopy(formulas, 11, 20);
+  assert(JSON.stringify(got) === '[11,13]', `отобрано ${JSON.stringify(got)}`);
+  assert(got.indexOf(20) < 0, 'столбец заметок отобран');
+  assert(JSON.stringify(ctx.formulaColumnsToCopy(['', '', ''], 11, 20)) === '[]',
+         'формул нет, а столбцы отобраны');
+});
+
 check('выгрузка Этапа 6.6 работает по-прежнему (режимы append/replace)', () => {
   const ctx = makeContext();
   const res = post(ctx, {
@@ -591,7 +799,7 @@ check('выгрузка Этапа 6.6 работает по-прежнему (�
   });
   assert(res.ok === true, `ok=false: ${res.error}`);
   assert(res.inserted === 1, `inserted=${res.inserted}`);
-  assert(res.version === '9.1.2', `version=${res.version}`);
+  assert(res.version === '9.1.2.2', `version=${res.version}`);
 });
 
 console.log(failed === 0 ? '\nВсе сценарии стенда прошли'

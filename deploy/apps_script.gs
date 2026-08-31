@@ -14,7 +14,7 @@
  *      трогать не нужно.
  *
  * ПРОВЕРКА ПОСЛЕ ОБНОВЛЕНИЯ: в журнале выгрузки обязана появиться строка с
- * receiver_version=9.1.2. Старая версия ответит на table_append ошибкой — и
+ * receiver_version=9.1.2.2. Старая версия ответит на table_append ошибкой — и
  * это правильно: видимый отказ лучше тихой записи не туда.
  *
  * Защита — секрет ниже (проверяется на каждом запросе). URL и секрет не публиковать.
@@ -45,6 +45,27 @@
  *     дописать выход не в ту строку хуже, чем не дописать вовсе. Такие метки
  *     возвращаются в notFound, и клиент кладёт сделку отдельной полной строкой.
  *
+ * ЭТАП 9.1.2.2. Две правки, обе — о ЧУЖИХ ДАННЫХ В СВОЕЙ СТРОКЕ.
+ *
+ *   1. ПРОТЯЖКА ФОРМУЛ БОЛЬШЕ НЕ ТАЩИТ ЛИТЕРАЛЫ. Прежняя редакция копировала
+ *      диапазон K..последний столбец целиком, вызовом copyTo с PASTE_FORMULA.
+ *      PASTE_FORMULA переносит не только формулы: ячейка без формулы приходит
+ *      своим ЗНАЧЕНИЕМ. Столбец заметок T лежит ВНУТРИ этого диапазона, и
+ *      каждая созданная строка получала заметку строки выше — вместе с чужой
+ *      целью, чужим пределом и чужим номером сигнала. На боевом листе
+ *      31.08.2026 так вышли три строки подряд с меткой [поз. 10]. Теперь
+ *      копируются ТОЛЬКО ячейки с непустой формулой, столбец заметок исключён
+ *      безусловно, а сама заметка пишется ПОСЛЕ протяжки, а не до.
+ *
+ *   2. ДОЗАПИСЬ ПО НЕОДНОЗНАЧНОЙ МЕТКЕ ЗАПРЕЩЕНА. Прежняя редакция писала в
+ *      ПЕРВУЮ строку, содержащую метку. При трёх строках с [поз. 10] цена
+ *      выхода одной сделки ушла бы в строку другой — лист остался бы
+ *      правдоподобным и стал бы неверным. Теперь считаются ВСЕ совпадения:
+ *      одно — пишем, ноль — notFound (как прежде), два и больше — не пишем
+ *      НИЧЕГО и возвращаем метку в ambiguous с номерами строк. Симметрично и
+ *      в table_append: метка, которая в листе уже есть, второй строки не
+ *      получает — дубль строки открытия та же порча, только с другой стороны.
+ *
  * ФОРМУЛЫ ВЛАДЕЛЬЦА НЕ ПЕРЕПИСЫВАЮТСЯ НИ ОДНОЙ ЯЧЕЙКОЙ. Открытие пишет A–G,
  * закрытие — H..J, а столбцы K и правее только ПРОТЯГИВАЮТСЯ копированием из
  * строки выше. Если протянуть неоткуда — формулы не выдумываются: ответ
@@ -56,7 +77,7 @@ const SECRET = 'ВСТАВЬ_СЮДА_СЕКРЕТ';
 
 // Версия приёмника. Возвращается в ответе и попадает в журнал выгрузки —
 // по ней видно, что развёрнутая версия действительно обновилась.
-const RECEIVER_VERSION = '9.1.2';
+const RECEIVER_VERSION = '9.1.2.2';
 
 // Сколько строк листа просматривать в поисках строки итогов и свободного места
 // (Этап 9.1.2). Торговый журнал на тысячу сделок не рассчитан по другим
@@ -177,34 +198,82 @@ function tableAppend(body) {
     return json({ ok: true, inserted: 0, updated: 0, sheet: body.sheet,
                   version: RECEIVER_VERSION });
   }
-  const width = maxWidth(rows, null);
   const noteColumn = body.noteColumn || 20;
   const formulaFrom = body.formulaFromColumn || 11;
-  ensureColumns(sheet, Math.max(width, noteColumn));
+  ensureColumns(sheet, Math.max(maxWidth(rows, null), noteColumn));
 
+  // МЕТКА, КОТОРАЯ В ЛИСТЕ УЖЕ ЕСТЬ, ВТОРОЙ СТРОКИ НЕ ПОЛУЧАЕТ (§2 ТЗ 9.1.2.2).
+  // Дубль строки открытия — та же порча, что и дозапись по неоднозначной метке,
+  // только с другой стороны: после него дозапись становится невозможной уже для
+  // ОБЕИХ строк, и сделка застревает в листе навсегда незакрытой.
+  const existingNotes = readNoteColumn(sheet, noteColumn);
+  const ambiguous = [];
+  const keptRows = [];
+  const keptNotes = [];
+  // Object.create(null), а не {}: у обычного объекта унаследованы ключи вроде
+  // «constructor», и проверка занятости срабатывала бы на них ложно. Метка
+  // всегда начинается со скобки и столкнуться с ними не может, но полагаться
+  // на это незачем — словарь без прототипа стоит тех же двух слов.
+  const seenInBatch = Object.create(null);
+  for (var k = 0; k < rows.length; k += 1) {
+    var marker = markerOfNote(notes[k]);
+    if (marker.length > 0) {
+      var clash = markerRows(existingNotes, marker);
+      if (clash.length > 0) {
+        ambiguous.push({ marker: marker, rows: clash });
+        continue;
+      }
+      // Повтор ВНУТРИ одной пачки: строк в листе ещё нет, поэтому и номеров
+      // нет — но создавать вторую строку нельзя ровно по той же причине.
+      if (seenInBatch[marker]) {
+        ambiguous.push({ marker: marker, rows: [] });
+        continue;
+      }
+      seenInBatch[marker] = true;
+    }
+    keptRows.push(rows[k]);
+    keptNotes.push(notes[k]);
+  }
+
+  if (keptRows.length === 0) {
+    // Создавать нечего — лист не трогаем вовсе: ни вставки строк, ни записи.
+    var refused = { ok: true, inserted: 0, updated: 0, sheet: body.sheet,
+                    version: RECEIVER_VERSION };
+    if (ambiguous.length > 0) refused.ambiguous = ambiguous;
+    return json(refused);
+  }
+
+  const width = maxWidth(keptRows, null);
   const totalsRow = findTotalsRow(sheet, body.totalsMarker || 'итого:');
   let startRow = firstFreeTableRow(sheet, totalsRow);
   // МЕСТА МОЖЕТ НЕ ХВАТИТЬ, и это штатный случай: строк с формулами в бланке
   // конечное число. Вставка ПЕРЕД строкой итогов растягивает диапазоны их
   // формул сама и уводит блок «баланс / начало» вниз целиком.
   const free = totalsRow - startRow;
-  if (free < rows.length) {
-    sheet.insertRowsBefore(totalsRow, rows.length - free);
+  if (free < keptRows.length) {
+    sheet.insertRowsBefore(totalsRow, keptRows.length - free);
   }
 
-  const padded = rows.map(function (row) { return pad(row, width); });
+  const padded = keptRows.map(function (row) { return pad(row, width); });
   sheet.getRange(startRow, 1, padded.length, width).setValues(padded);
+
+  // ПОРЯДОК ЗДЕСЬ — ЧАСТЬ ИСПРАВЛЕНИЯ, А НЕ ОФОРМЛЕНИЕ (§1 ТЗ 9.1.2.2). Сначала
+  // протяжка формул, и только потом заметки: пока заметка писалась ПЕРВОЙ, любая
+  // ошибка в отборе копируемых ячеек стирала её молча. Теперь заметка ложится
+  // последней и не зависит от того, что делает протяжка.
+  var warning = pullFormulasDown(sheet, startRow, padded.length, formulaFrom,
+                                 noteColumn);
   for (var i = 0; i < padded.length; i += 1) {
-    if (notes[i] !== undefined && notes[i] !== null) {
-      sheet.getRange(startRow + i, noteColumn).setValue(notes[i]);
+    if (keptNotes[i] !== undefined && keptNotes[i] !== null) {
+      sheet.getRange(startRow + i, noteColumn).setValue(keptNotes[i]);
     }
   }
 
-  var warning = pullFormulasDown(sheet, startRow, padded.length, formulaFrom);
   var answer = { ok: true, inserted: padded.length, updated: 0,
                  sheet: body.sheet, startRow: startRow,
                  version: RECEIVER_VERSION };
   if (warning) answer.warning = warning;
+  if (ambiguous.length > 0) answer.ambiguous = ambiguous;
   return json(answer);
 }
 
@@ -216,6 +285,19 @@ function tableAppend(body) {
  * МЕТКУ НЕ НАШЛИ — СТРОКУ НЕ УГАДЫВАТЬ. Дописать выход не в ту строку хуже, чем
  * не дописать вовсе: числа выглядели бы настоящими. Ненайденные метки уходят в
  * notFound, и клиент кладёт такие сделки отдельными полными строками.
+ *
+ * МЕТКА НАШЛАСЬ ДВАЖДЫ — ТОЖЕ НЕ УГАДЫВАТЬ (§2 ТЗ 9.1.2.2). Прежняя редакция
+ * писала в ПЕРВУЮ найденную строку. При трёх строках с меткой [поз. 10] цена
+ * выхода одной сделки ушла бы в строку другой: лист остался бы правдоподобным и
+ * стал бы неверным — это тихая порча данных, худший из возможных исходов.
+ * Теперь считаются ВСЕ совпадения, и при двух и более не пишется НИЧЕГО: ни
+ * столбцы H..J, ни заметка. Метка уходит в ambiguous вместе с номерами строк,
+ * чтобы владелец знал, какие именно строки листа надо разобрать руками.
+ *
+ * ОТЛИЧИЕ ambiguous ОТ notFound СОДЕРЖАТЕЛЬНО, а не техническое: при notFound
+ * строки НЕТ, и лишняя строка лучше потерянной сделки; при ambiguous строк уже
+ * СЛИШКОМ МНОГО, и добавлять к ним ещё одну — усугублять. Поэтому клиент по
+ * ambiguous новой строки не создаёт никогда.
  *
  * ЗАМЕТКА ДОПИСЫВАЕТСЯ, А НЕ ПЕРЕЗАПИСЫВАЕТСЯ (§16 ТЗ). Столбец заметок —
  * ЕДИНСТВЕННОЕ место строки, куда человек пишет руками: пока сделка шла,
@@ -237,6 +319,7 @@ function tableUpdate(body) {
   const updates = body.updates || [];
   const noteColumn = body.noteColumn || 20;
   const notFound = [];
+  const ambiguous = [];
   var updated = 0;
   if (updates.length === 0) {
     return json({ ok: true, inserted: 0, updated: 0, sheet: body.sheet,
@@ -246,18 +329,22 @@ function tableUpdate(body) {
   // Столбец заметок читается ОДИН РАЗ на весь запрос: чтение ячейки в Apps
   // Script стоит сетевого обращения, и поиск по одной ячейке на метку
   // превратил бы дозапись десяти сделок в тысячи обращений.
-  const lastRow = Math.min(sheet.getLastRow(), TABLE_SCAN_LIMIT);
-  const noteValues = lastRow > 0
-    ? sheet.getRange(1, noteColumn, lastRow, 1).getDisplayValues()
-    : [];
+  const noteValues = readNoteColumn(sheet, noteColumn);
 
   for (var i = 0; i < updates.length; i += 1) {
     var item = updates[i];
-    var row = findRowByMarker(noteValues, item.marker);
-    if (row === 0) {
+    var found = markerRows(noteValues, item.marker);
+    if (found.length === 0) {
       notFound.push(item.marker);
       continue;
     }
+    if (found.length > 1) {
+      // НЕ ПИШЕТСЯ НИЧЕГО. Выбрать «первую подходящую» здесь — значит записать
+      // цену выхода одной сделки в строку другой.
+      ambiguous.push({ marker: String(item.marker), rows: found });
+      continue;
+    }
+    var row = found[0];
     var values = item.values || [];
     var startColumn = item.startColumn || 8;
     if (values.length > 0) {
@@ -280,6 +367,7 @@ function tableUpdate(body) {
   var answer = { ok: true, inserted: 0, updated: updated, sheet: body.sheet,
                  version: RECEIVER_VERSION };
   if (notFound.length > 0) answer.notFound = notFound;
+  if (ambiguous.length > 0) answer.ambiguous = ambiguous;
   return json(answer);
 }
 
@@ -325,15 +413,88 @@ function firstFreeTableRow(sheet, totalsRow) {
   return totalsRow;
 }
 
-/** Номер строки, в заметке которой встречается метка. 0 — не найдена. */
-function findRowByMarker(noteValues, marker) {
-  var needle = String(marker);
-  if (needle.length === 0) return 0;
+/**
+ * Столбец заметок целиком, ОДНИМ обращением. Пустой лист даёт пустой массив.
+ *
+ * Читается один раз на запрос и в table_append, и в table_update: чтение ячейки
+ * в Apps Script стоит сетевого обращения, и поиск по одной ячейке на метку
+ * превратил бы работу с десятком сделок в тысячи обращений.
+ */
+function readNoteColumn(sheet, noteColumn) {
+  var lastRow = Math.min(sheet.getLastRow(), TABLE_SCAN_LIMIT);
+  if (lastRow <= 0) return [];
+  return sheet.getRange(1, noteColumn, lastRow, 1).getDisplayValues();
+}
+
+/**
+ * Метка в начале заметки — «[...]» первым, что стоит в тексте. '' — метки нет.
+ *
+ * ФОРМАТ МЕТКИ ЗДЕСЬ НЕ ЗАШИТ. Приёмнику незачем знать слово «поз.»: метка — это
+ * то, что клиент поставил в НАЧАЛО заметки в квадратных скобках, и таков её
+ * договор с самого Этапа 9.1.2. Зашитый здесь русский текст пришлось бы держать
+ * согласованным с POSITION_MARKER_TEMPLATE на другой стороне провода — два
+ * места, знающих одно и то же, однажды разойдутся.
+ */
+function markerOfNote(note) {
+  var text = String(note === null || note === undefined ? '' : note);
+  var match = /^\s*(\[[^\]]*\])/.exec(text);
+  return match ? match[1] : '';
+}
+
+/**
+ * ВСЕ номера строк, в заметке которых встречается метка. Пусто — не найдена.
+ *
+ * СЧИТАЮТСЯ ИМЕННО ВСЕ, а не первая (§2 ТЗ 9.1.2.2): вызывающий обязан отличить
+ * «одна строка» от «две и больше», и вернуть ему первую попавшуюся значило бы
+ * скрыть от него ровно ту разницу, ради которой он спрашивает.
+ *
+ * Совпадением считается вхождение метки ЦЕЛИКОМ, вместе с обеими скобками.
+ * Закрывающая скобка здесь не украшение: без неё «[поз. 1]» совпало бы с
+ * «[поз. 12]», и закрытие первой позиции ушло бы в строку двенадцатой. Владелец
+ * волен дописывать вокруг метки свой текст — сама метка должна остаться цела.
+ */
+function markerRows(noteValues, marker) {
+  var needle = String(marker === null || marker === undefined ? '' : marker);
+  var found = [];
+  if (needle.length === 0) return found;
   for (var i = 0; i < noteValues.length; i += 1) {
     var text = String(noteValues[i][0] === null ? '' : noteValues[i][0]);
-    if (text.indexOf(needle) >= 0) return i + 1;
+    if (text.indexOf(needle) >= 0) found.push(i + 1);
   }
-  return 0;
+  return found;
+}
+
+/**
+ * Какие столбцы ПРОТЯГИВАТЬ вниз: номера, с единицы (§1 ТЗ 9.1.2.2).
+ *
+ * ``formulas`` — одна строка из getFormulas() диапазона, начинающегося со
+ * столбца ``fromColumn``. Ячейка без формулы отдаёт оттуда пустую строку.
+ *
+ * ДВА ОГРАЖДЕНИЯ, И ВТОРОЕ ПОВЕРХ ПЕРВОГО:
+ *
+ *  1. КОПИРУЕТСЯ ТОЛЬКО ЯЧЕЙКА С НЕПУСТОЙ ФОРМУЛОЙ. Копирование литерала — это
+ *     перенос ЧУЖИХ ДАННЫХ в новую строку, а не продолжение расчёта, и заметка
+ *     лишь самый заметный его случай: точно так же переехали бы вниз любой
+ *     комментарий, пометка и число, набранное руками. Прежняя редакция звала
+ *     copyTo на весь диапазон разом, а PASTE_FORMULA переносит и литералы —
+ *     отсюда три строки подряд с чужой меткой на боевом листе 31.08.2026.
+ *  2. СТОЛБЕЦ ЗАМЕТОК ИСКЛЮЧЁН БЕЗУСЛОВНО — даже если в нём вдруг окажется
+ *     формула. Заметка — ЕДИНСТВЕННЫЙ ключ поиска строки при дозаписи, и её
+ *     потеря стоит дороже потери формулы: формулу владелец протянет заново,
+ *     а потерянную привязку сделки к строке — уже ничем.
+ */
+function formulaColumnsToCopy(formulas, fromColumn, noteColumn) {
+  var columns = [];
+  for (var i = 0; i < formulas.length; i += 1) {
+    var column = fromColumn + i;
+    if (column === noteColumn) continue;
+    var text = formulas[i];
+    if (String(text === null || text === undefined ? '' : text).length === 0) {
+      continue;
+    }
+    columns.push(column);
+  }
+  return columns;
 }
 
 /**
@@ -344,9 +505,17 @@ function findRowByMarker(noteValues, marker) {
  * его в журнал. Сочинённая формула — это чужая модель денег, написанная за
  * владельца, и заметить подмену по виду листа было бы невозможно.
  *
+ * КОПИРУЮТСЯ ТОЛЬКО ЯЧЕЙКИ С ФОРМУЛАМИ, И КАЖДАЯ ОТДЕЛЬНО (§1 ТЗ 9.1.2.2).
+ * Прежняя редакция звала copyTo ОДИН раз на весь диапазон K..последний столбец.
+ * Это дешевле — одно обращение вместо десятка, — но PASTE_FORMULA переносит и
+ * ячейки БЕЗ формул, своим значением, а столбец заметок лежит внутри диапазона.
+ * Размен сделан осознанно: десяток обращений на пачку против переноса чужих
+ * данных в новую строку. Отбор столбцов вынесен в
+ * :func:`formulaColumnsToCopy` — его можно проверить отдельно от Google.
+ *
  * Возвращает '' при успехе либо текст предупреждения.
  */
-function pullFormulasDown(sheet, startRow, count, fromColumn) {
+function pullFormulasDown(sheet, startRow, count, fromColumn, noteColumn) {
   var lastCol = sheet.getLastColumn();
   if (lastCol < fromColumn) {
     return 'в листе нет столбцов с формулами правее ' + fromColumn;
@@ -357,17 +526,16 @@ function pullFormulasDown(sheet, startRow, count, fromColumn) {
            + ' нет строки с формулами (это заголовок)';
   }
   var width = lastCol - fromColumn + 1;
-  var source = sheet.getRange(sourceRow, fromColumn, 1, width);
-  var formulas = source.getFormulas()[0];
-  var hasAny = false;
-  for (var i = 0; i < formulas.length; i += 1) {
-    if (String(formulas[i]).length > 0) { hasAny = true; break; }
-  }
-  if (!hasAny) {
+  var formulas = sheet.getRange(sourceRow, fromColumn, 1, width).getFormulas()[0];
+  var columns = formulaColumnsToCopy(formulas, fromColumn, noteColumn);
+  if (columns.length === 0) {
     return 'формулы не протянуты: в строке ' + sourceRow
            + ' столбцы ' + fromColumn + '..' + lastCol + ' без формул';
   }
-  source.copyTo(sheet.getRange(startRow, fromColumn, count, width),
-                SpreadsheetApp.CopyPasteType.PASTE_FORMULA, false);
+  for (var i = 0; i < columns.length; i += 1) {
+    sheet.getRange(sourceRow, columns[i], 1, 1).copyTo(
+      sheet.getRange(startRow, columns[i], count, 1),
+      SpreadsheetApp.CopyPasteType.PASTE_FORMULA, false);
+  }
   return '';
 }
