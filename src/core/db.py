@@ -1563,6 +1563,172 @@ class DB:
         )
         return bool(status and status.rsplit(" ", 1)[-1] != "0")
 
+    # --- Этап 9.1.3: теневой подвижный выход на фактических позициях ---
+    #
+    # ЧИТАЮЩИЕ МЕТОДЫ НЕ ТРОГАЮТ НИ ОДНОЙ ТАБЛИЦЫ ФАКТА. Пишет этап только в
+    # position_trailing_shadow; positions, signals, signal_evaluations,
+    # signal_targets, risk_targets, signal_outcomes_barrier, strategy_outcomes и
+    # trailing_outcomes этим этапом не изменяются ни одной строкой (§6.5 ТЗ).
+
+    async def position_trailing_shadow_exists(self) -> bool:
+        """Есть ли таблица теневого замера (миграция 021 могла быть не применена).
+
+        СХЕМА ЗДЕСЬ НЕ ДУБЛИРУЕТСЯ, в отличие от ``ensure_trailing_schema``
+        Этапа 8.10. Второй экземпляр той же схемы — это два места, знающих одно
+        и то же, и они однажды разойдутся; в этом проекте так уже было. Пусть
+        лучше скрипт скажет «примените миграцию 021», чем заведёт таблицу,
+        которая чуть-чуть не такая, как в файле миграции.
+        """
+        return bool(
+            await self.pool.fetchval(
+                "SELECT to_regclass('position_trailing_shadow') IS NOT NULL;"
+            )
+        )
+
+    async def get_positions_for_shadow(
+        self, *, since: datetime | None = None
+    ) -> list[dict[str, Any]]:
+        """Закрытые позиции для теневого замера, БЕЗ ``data_gap`` (§3.1 ТЗ).
+
+        ``data_gap`` ИСКЛЮЧАЕТСЯ, а не помечается: цена выхода у таких позиций
+        не наблюдалась, а восстановлена по последней известной свече, и в
+        статистику они по решению владельца от 30.08.2026 не идут. Открытые
+        позиции не берутся вовсе — их исход ещё не наступил, и теневая цифра по
+        ним была бы прогнозом, а не замером.
+
+        Токен берётся СОЕДИНЕНИЕМ с ``instruments``: колонки ``symbol`` в
+        ``positions`` нет, есть ``instrument_id`` с внешним ключом.
+        """
+        rows = await self.pool.fetch(
+            """
+            SELECT p.id, p.instrument_id, i.symbol, i.base,
+                   p.logic_version, p.horizon_h, p.side, p.status,
+                   p.opened_at, p.deadline_at, p.closed_at,
+                   p.entry_price, p.notional_usd,
+                   p.target_pct, p.target_price, p.stop_pct, p.stop_price,
+                   p.cost_pct, p.resolution,
+                   p.exit_price, p.exit_reason, p.net_pnl_pct, p.net_pnl_usd,
+                   p.bars_held, p.outcome_certain
+            FROM positions p
+            JOIN instruments i ON i.id = p.instrument_id
+            WHERE p.status = 'closed'
+              AND p.exit_reason IS DISTINCT FROM 'data_gap'
+              AND ($1::timestamptz IS NULL OR p.opened_at >= $1)
+            ORDER BY p.id;
+            """,
+            since,
+        )
+        return [dict(row) for row in rows]
+
+    async def count_positions_for_shadow(
+        self, *, since: datetime | None = None
+    ) -> dict[str, int]:
+        """Справочные счётчики выборки: всего закрытых, из них ``data_gap``, открытых.
+
+        Число исключённых печатается отдельной строкой (§3.1 ТЗ): выборка, из
+        которой что-то молча выпало, неотличима от выборки, в которой этого не
+        было.
+        """
+        row = await self.pool.fetchrow(
+            """
+            SELECT
+                count(*) FILTER (WHERE status = 'closed') AS closed_total,
+                count(*) FILTER (WHERE status = 'closed'
+                                   AND exit_reason = 'data_gap') AS data_gap,
+                count(*) FILTER (WHERE status = 'open') AS still_open
+            FROM positions
+            WHERE ($1::timestamptz IS NULL OR opened_at >= $1);
+            """,
+            since,
+        )
+        return {
+            "closed_total": int(row["closed_total"] or 0),
+            "data_gap": int(row["data_gap"] or 0),
+            "still_open": int(row["still_open"] or 0),
+        }
+
+    async def save_position_trailing_shadow(
+        self, rows: list[dict[str, Any]]
+    ) -> int:
+        """Пачка строк теневого замера. Возвращает число отправленных строк.
+
+        ``ON CONFLICT DO UPDATE`` — это и есть идемпотентность §5.1 ТЗ: повторный
+        прогон на тех же данных перезаписывает строку теми же числами и не
+        создаёт дублей. Здесь выбрано DO UPDATE, а не DO NOTHING Этапа 8.10,
+        по прямому требованию ТЗ; смысл тот же — «повторный прогон не меняет
+        числа, если не изменились данные».
+        """
+        if not rows:
+            return 0
+        await self.pool.executemany(
+            """
+            INSERT INTO position_trailing_shadow (
+                position_id, variant, activation_frac, pullback_frac,
+                armed, armed_at, exit_reason, exit_bar_ts, exit_price,
+                net_pnl_pct, net_pnl_usd, bars_used, resolution, logic_version
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            ON CONFLICT (position_id, variant) DO UPDATE SET
+                activation_frac = EXCLUDED.activation_frac,
+                pullback_frac   = EXCLUDED.pullback_frac,
+                armed           = EXCLUDED.armed,
+                armed_at        = EXCLUDED.armed_at,
+                exit_reason     = EXCLUDED.exit_reason,
+                exit_bar_ts     = EXCLUDED.exit_bar_ts,
+                exit_price      = EXCLUDED.exit_price,
+                net_pnl_pct     = EXCLUDED.net_pnl_pct,
+                net_pnl_usd     = EXCLUDED.net_pnl_usd,
+                bars_used       = EXCLUDED.bars_used,
+                resolution      = EXCLUDED.resolution,
+                logic_version   = EXCLUDED.logic_version,
+                computed_at     = now();
+            """,
+            [
+                (
+                    int(r["position_id"]), str(r["variant"]),
+                    _num(r.get("activation_frac")), _num(r.get("pullback_frac")),
+                    bool(r["armed"]), r.get("armed_at"),
+                    str(r["exit_reason"]), r.get("exit_bar_ts"),
+                    _num(r.get("exit_price")),
+                    _num(r.get("net_pnl_pct")), _num(r.get("net_pnl_usd")),
+                    int(r["bars_used"]), str(r["resolution"]),
+                    int(r["logic_version"]),
+                )
+                for r in rows
+            ],
+        )
+        return len(rows)
+
+    async def get_trailing_resample_rows(self) -> list[dict[str, Any]]:
+        """Строки ``trailing_outcomes`` для пересчёта части А. ТОЛЬКО ЧТЕНИЕ.
+
+        Инструмент и момент сигнала берутся соединением с ``signals`` и
+        ``instruments``: в самой таблице замера их нет — она хранит исход, а не
+        обстоятельства сигнала.
+
+        ИМЯ ``ts`` ОСТАВЛЕНО КАК ЕСТЬ, а не переименовано в ``signal_ts``:
+        строки уходят в ``scripts.trailing_stats.collect`` — ту самую функцию
+        Этапа 8.10, которая отбирает полные пары, — и она читает поле ``ts``.
+        Своё имя здесь означало бы переписать ``collect`` под себя, то есть
+        завести второй экземпляр отбора.
+
+        ``computed_at`` нужен для разделения выборки на старую и новую часть.
+        Запись 8.10 идёт с ``ON CONFLICT DO NOTHING``, поэтому у уже посчитанной
+        строки это время НЕ сдвигается повторным прогоном — по нему видно, была
+        ли строка в выборке, на которой закономерность 8.10 обнаружена.
+        """
+        rows = await self.pool.fetch(
+            """
+            SELECT t.signal_id, t.horizon_h, t.activation_ratio, t.retrace_ratio,
+                   t.logic_version, t.exit_reason, t.net_pnl_pct, t.computed_at,
+                   s.ts, i.base AS token
+            FROM trailing_outcomes t
+            JOIN signals s ON s.id = t.signal_id
+            JOIN instruments i ON i.id = s.instrument_id
+            ORDER BY t.signal_id, t.horizon_h;
+            """
+        )
+        return [dict(row) for row in rows]
+
     async def get_positions_sheet_marks(
         self, position_ids: list[int]
     ) -> list[dict[str, Any]]:
