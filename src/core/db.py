@@ -1572,14 +1572,28 @@ class DB:
         идентификаторы вызывающий обязан заметить сам, сравнив длину ответа с
         длиной запроса. Молча вернуть меньше строк, чем спросили, и продолжить
         значило бы сбрасывать отметки не тому набору, который назвал человек.
+
+        ТОКЕН БЕРЁТСЯ ИЗ ``instruments``, А НЕ ИЗ ``positions``. В самой таблице
+        позиций названия инструмента нет вовсе — есть ``instrument_id`` и внешний
+        ключ; ``symbol`` (``ETH/USDT``) лежит в ``instruments``. Первая редакция
+        этого метода спрашивала ``symbol`` прямо у ``positions`` и падала на
+        боевой базе с ``UndefinedColumnError``. Все остальные запросы к позициям
+        в проекте соединяются с ``instruments`` именно так — этот выбился из
+        общего строя, и ровно в нём и была ошибка.
+
+        КОЛОНКИ КВАЛИФИЦИРОВАНЫ ПСЕВДОНИМАМИ (``p.``/``i.``) намеренно: по
+        неквалифицированному имени не видно, из какой оно таблицы, и опечатка
+        вроде той же ``symbol`` выглядит совершенно правдоподобно до самого
+        запуска на настоящей базе.
         """
         rows = await self.pool.fetch(
             """
-            SELECT id, symbol, status, opened_at, closed_at, exit_reason,
-                   sheet_opened_at, sheet_closed_at
-            FROM positions
-            WHERE id = ANY($1::bigint[])
-            ORDER BY id;
+            SELECT p.id, i.symbol, p.status, p.opened_at, p.closed_at,
+                   p.exit_reason, p.sheet_opened_at, p.sheet_closed_at
+            FROM positions p
+            JOIN instruments i ON i.id = p.instrument_id
+            WHERE p.id = ANY($1::bigint[])
+            ORDER BY p.id;
             """,
             [int(i) for i in position_ids],
         )
