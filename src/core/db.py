@@ -1698,6 +1698,129 @@ class DB:
         )
         return len(rows)
 
+    # --- Этап 9.1.4: пересчёт исхода при других уровнях предела убытка ---
+    #
+    # ВЫБОРКА ПОЗИЦИЙ ЗДЕСЬ НЕ ЗАВОДИТСЯ ЗАНОВО. Она та же, что у Этапа 9.1.3:
+    # ``get_positions_for_shadow`` и ``count_positions_for_shadow`` отбирают
+    # закрытые позиции без ``data_gap`` — ровно тот состав, который требует §2
+    # ТЗ 9.1.4. Второй запрос с тем же смыслом однажды разошёлся бы с первым,
+    # и разошёлся бы молча: два замера на «одной и той же» выборке дали бы
+    # несравнимые числа, и заметить это было бы нечем.
+    #
+    # ПИШЕТ ЭТАП ТОЛЬКО В ``position_stop_shadow``. ``positions``, ``signals``,
+    # ``signal_evaluations``, ``signal_targets``, ``risk_targets``,
+    # ``trailing_outcomes`` и ``position_trailing_shadow`` не изменяются ни
+    # одной строкой (§7.8 ТЗ).
+
+    async def position_stop_shadow_exists(self) -> bool:
+        """Есть ли таблица замера (миграция 022 могла быть не применена).
+
+        СХЕМА ЗДЕСЬ НЕ ДУБЛИРУЕТСЯ, как и в 9.1.3. Второй экземпляр той же
+        схемы — это два места, знающих одно и то же, и они однажды разойдутся.
+        Пусть лучше скрипт скажет «примените миграцию 022», чем заведёт
+        таблицу, которая чуть-чуть не такая, как в файле миграции.
+        """
+        return bool(
+            await self.pool.fetchval(
+                "SELECT to_regclass('position_stop_shadow') IS NOT NULL;"
+            )
+        )
+
+    async def count_blocked_signals(
+        self,
+        *,
+        instrument_id: int,
+        min_probability: float,
+        ts_from: datetime,
+        ts_to: datetime,
+    ) -> int:
+        """ЧИСЛО 3 §3 ТЗ: годные входы, попавшие в окно ЛИШНЕГО удержания слота.
+
+        ГОДНЫЙ ВХОД — ЭТО ТО, ЧТО ПЕРЕЧИСЛЕНО В §3 ТЗ, И РОВНО ОНО: тот же
+        инструмент, ``decision = 'buy'``, вероятность не ниже порога открытия
+        позиций (``POSITION_MIN_PROBABILITY``), ``degraded = FALSE``, момент
+        внутри окна. Живой отбор (``get_position_candidates``) проверяет сверх
+        этого ещё четыре условия — версию логики, наличие замороженной цели,
+        свежесть свечи и свободный слот, — и НЕ ПРОВЕРЯТЬ их здесь означает
+        считать ВЕРХНЮЮ ГРАНИЦУ числа заблокированных входов. Это сказано
+        прямо и в выводе скрипта: сузить перечень по своему усмотрению значило
+        бы ответить на вопрос, которого §3 ТЗ не задавал.
+
+        ОКНО ПОЛУОТКРЫТОЕ: ``[ts_from, ts_to)``. Границы содержательны, а не
+        удобны. В момент ФАКТИЧЕСКОГО закрытия слот уже свободен, и сигнал,
+        пришедший ровно тогда, вошёл бы в позицию — а при более широком пределе
+        не вошёл бы, потому что позиция ещё висит. В момент ПЕРЕСЧЁТНОГО
+        закрытия слот освобождается и там, поэтому правый конец не включается.
+
+        Пустое или вывернутое окно — ноль без обращения к базе: при пределе уже
+        фактического позиция закрылась бы РАНЬШЕ, лишнего удержания нет вовсе,
+        и запрос с ``ts_from >= ts_to`` вернул бы ноль, но заодно скрыл бы, что
+        случай этот разобран намеренно.
+        """
+        if ts_to <= ts_from:
+            return 0
+        value = await self.pool.fetchval(
+            """
+            SELECT count(*)
+            FROM signals
+            WHERE instrument_id = $1
+              AND decision = 'buy'
+              AND degraded = FALSE
+              AND probability IS NOT NULL
+              AND probability >= $2
+              AND ts >= $3
+              AND ts < $4;
+            """,
+            int(instrument_id), float(min_probability), ts_from, ts_to,
+        )
+        return int(value or 0)
+
+    async def save_position_stop_shadow(self, rows: list[dict[str, Any]]) -> int:
+        """Пачка строк замера. Возвращает число отправленных строк.
+
+        ``ON CONFLICT DO UPDATE`` — это и есть идемпотентность §5 ТЗ: повторный
+        прогон на тех же данных перезаписывает строку теми же числами и не
+        создаёт дублей.
+        """
+        if not rows:
+            return 0
+        await self.pool.executemany(
+            """
+            INSERT INTO position_stop_shadow (
+                position_id, variant, stop_pct, exit_reason, exit_bar_ts,
+                exit_price, net_pnl_pct, net_pnl_usd, held_sec, extra_held_sec,
+                blocked_signals, bars_used, resolution, logic_version
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            ON CONFLICT (position_id, variant) DO UPDATE SET
+                stop_pct        = EXCLUDED.stop_pct,
+                exit_reason     = EXCLUDED.exit_reason,
+                exit_bar_ts     = EXCLUDED.exit_bar_ts,
+                exit_price      = EXCLUDED.exit_price,
+                net_pnl_pct     = EXCLUDED.net_pnl_pct,
+                net_pnl_usd     = EXCLUDED.net_pnl_usd,
+                held_sec        = EXCLUDED.held_sec,
+                extra_held_sec  = EXCLUDED.extra_held_sec,
+                blocked_signals = EXCLUDED.blocked_signals,
+                bars_used       = EXCLUDED.bars_used,
+                resolution      = EXCLUDED.resolution,
+                logic_version   = EXCLUDED.logic_version,
+                computed_at     = now();
+            """,
+            [
+                (
+                    int(r["position_id"]), str(r["variant"]),
+                    _num(r.get("stop_pct")), str(r["exit_reason"]),
+                    r.get("exit_bar_ts"), _num(r.get("exit_price")),
+                    _num(r.get("net_pnl_pct")), _num(r.get("net_pnl_usd")),
+                    int(r["held_sec"]), int(r["extra_held_sec"]),
+                    int(r["blocked_signals"]), int(r["bars_used"]),
+                    str(r["resolution"]), int(r["logic_version"]),
+                )
+                for r in rows
+            ],
+        )
+        return len(rows)
+
     # Порция чтения ``trailing_outcomes`` — в СТРОКАХ, не в парах. Тринадцать
     # тысяч строк это примерно тысяча пар и около 13 МБ Python-объектов: мало,
     # чтобы поместиться в любой разумный лимит, и много, чтобы обращений к базе

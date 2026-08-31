@@ -113,6 +113,10 @@ def schema() -> dict[str, set[str]]:
         ),
         "position_trailing_shadow",
     )
+    out["position_stop_shadow"] = table_columns(
+        (migrations / "022_position_stop_shadow.sql").read_text(encoding="utf-8"),
+        "position_stop_shadow",
+    )
 
     # Колонки, добавленные к signals миграциями и кодом выгрузки, — иначе
     # двойник объявил бы исправные запросы неверными.
