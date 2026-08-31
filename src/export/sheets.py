@@ -55,6 +55,17 @@ class SheetsResult:
     # Метки, для которых строка в листе не нашлась. Приёмник не угадывает
     # строку, а возвращает метку сюда; что с ней делать, решает вызывающий.
     not_found: list[str] = field(default_factory=list)
+    # Метки, по которым строк в листе НЕСКОЛЬКО (Этап 9.1.2.2). Каждый элемент —
+    # ``{"marker": "[поз. 12]", "rows": [12, 13]}``. Приёмник по такой метке НЕ
+    # ПИШЕТ НИЧЕГО, а в table_append — не создаёт строку, метка которой в листе
+    # уже есть.
+    #
+    # ЭТО НЕ РАЗНОВИДНОСТЬ ``not_found``, И СМЕШИВАТЬ ИХ НЕЛЬЗЯ. При
+    # ``not_found`` строки НЕТ, и лишняя строка лучше потерянной сделки — клиент
+    # кладёт сделку новой полной строкой. При ``ambiguous`` строк уже СЛИШКОМ
+    # МНОГО, и добавить к ним ещё одну значит усугубить: разбирать лист всё
+    # равно придётся руками, но разбирать станет на строку больше.
+    ambiguous: list[dict[str, Any]] = field(default_factory=list)
 
 
 def normalize_batch(
@@ -82,6 +93,32 @@ def normalize_batch(
         None if header is None else list(header) + [""] * (width - len(header))
     )
     return padded, padded_header
+
+
+def _parse_ambiguous(raw: Any) -> list[dict[str, Any]]:
+    """Разбор поля ``ambiguous`` ответа приёмника (Этап 9.1.2.2).
+
+    Каждый элемент приводится к ``{"marker": str, "rows": list[int]}``. Ответ
+    приходит из-за сети, и форма его не гарантирована ничем, кроме нашего же
+    кода на другом конце: неразобранный элемент ПРОПУСКАЕТСЯ, а не роняет
+    выгрузку — но и не превращается в пустую метку, которую потом никто не
+    сопоставит с позицией.
+    """
+    out: list[dict[str, Any]] = []
+    for item in raw or []:
+        if not isinstance(item, dict):
+            continue
+        marker = str(item.get("marker", ""))
+        if not marker:
+            continue
+        rows: list[int] = []
+        for row in item.get("rows") or []:
+            try:
+                rows.append(int(row))
+            except (TypeError, ValueError):
+                continue
+        out.append({"marker": marker, "rows": rows})
+    return out
 
 
 def _verify() -> str | bool:
@@ -190,6 +227,7 @@ async def post_rows(
             version = body.get("version")
             warning = body.get("warning")
             not_found = [str(item) for item in (body.get("notFound") or [])]
+            ambiguous = _parse_ambiguous(body.get("ambiguous"))
             # Версию печатаем всегда: по ней владелец видит в журнале, что
             # развёрнутая на стороне Google версия приёмника действительно
             # обновилась. Её отсутствие — признак версии до 8.4.1.
@@ -201,6 +239,15 @@ async def post_rows(
                 updated=int(body.get("updated", 0)),
                 receiver_version=version or "до 8.4.1 (версию не сообщает)",
             )
+            if ambiguous:
+                # ОТКАЗ ПРИЁМНИКА ПИСАТЬ — НЕ МЕЛОЧЬ, И ЭТО ВИДНО СРАЗУ. Разбор
+                # по позициям (какая именно сделка не записана) делает
+                # ``export_main``: только там метка сопоставима с ``positions.id``.
+                _log.warning(
+                    "Sheets: приёмник отказался писать по неоднозначным меткам",
+                    sheet=sheet, mode=mode,
+                    markers=[str(item.get("marker", "")) for item in ambiguous],
+                )
             if warning:
                 # ПРЕДУПРЕЖДЕНИЕ ПРИ ok=true ПЕЧАТАЕТСЯ УРОВНЕМ warning, а не
                 # тонет в info: сегодня оно означает «строки записаны, но
@@ -221,6 +268,7 @@ async def post_rows(
                 ),
                 warning=None if warning is None else str(warning),
                 not_found=not_found,
+                ambiguous=ambiguous,
             )
         last_error = f"ok=false: {body.get('error', 'без описания')}"
         _log.warning("Sheets: ответ ok=false", attempt=attempt + 1, error=last_error)

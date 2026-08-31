@@ -1563,6 +1563,52 @@ class DB:
         )
         return bool(status and status.rsplit(" ", 1)[-1] != "0")
 
+    async def get_positions_sheet_marks(
+        self, position_ids: list[int]
+    ) -> list[dict[str, Any]]:
+        """Отметки выгрузки в лист по перечню позиций — для отчёта репарации.
+
+        Возвращает ТОЛЬКО существующие строки и в порядке ``id``: несуществующие
+        идентификаторы вызывающий обязан заметить сам, сравнив длину ответа с
+        длиной запроса. Молча вернуть меньше строк, чем спросили, и продолжить
+        значило бы сбрасывать отметки не тому набору, который назвал человек.
+        """
+        rows = await self.pool.fetch(
+            """
+            SELECT id, symbol, status, opened_at, closed_at, exit_reason,
+                   sheet_opened_at, sheet_closed_at
+            FROM positions
+            WHERE id = ANY($1::bigint[])
+            ORDER BY id;
+            """,
+            [int(i) for i in position_ids],
+        )
+        return [dict(row) for row in rows]
+
+    async def reset_positions_sheet_marks(self, position_ids: list[int]) -> int:
+        """Снимает ОБЕ отметки выгрузки в лист. Возвращает число строк.
+
+        ЗВАТЬ НАПРЯМУЮ НЕЛЬЗЯ. Единственный путь сюда —
+        ``scripts/repair_9_1_2_2_marks.py --apply``, и там перед вызовом стоит
+        подтверждение числом: сброс возможен только тогда, когда оператор своими
+        глазами видел отчёт и назвал то же самое число.
+
+        МЕНЯЮТСЯ РОВНО ДВЕ КОЛОНКИ, И НИ ОДНОЙ БОЛЬШЕ. Ни строк не удаляется, ни
+        решений не пересчитывается: снятая отметка означает лишь «эту позицию
+        выгрузка увидит снова», и всю работу дальше делает штатный прогон.
+
+        ``updated_at`` НЕ ТРОГАЕТСЯ НАМЕРЕННО, в отличие от остальных методов
+        этого класса. Здесь чинится не сама позиция, а состояние её ВЫГРУЗКИ;
+        сдвинутое время правки говорило бы, что решение по сделке пересматривали,
+        а его не пересматривали.
+        """
+        status = await self.pool.execute(
+            "UPDATE positions SET sheet_opened_at = NULL, sheet_closed_at = NULL "
+            "WHERE id = ANY($1::bigint[]);",
+            [int(i) for i in position_ids],
+        )
+        return int(status.rsplit(" ", 1)[-1]) if status else 0
+
     async def get_positions_summary(self, *, days: int = 7) -> dict[str, Any]:
         """Итог по закрытым позициям за окно — для бота (§10) и отчёта.
 

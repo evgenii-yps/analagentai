@@ -103,7 +103,13 @@ _SHEET_TRADES = "торговля тест апи окх чтение"
 # СРАВНЕНИЕ — ТОЧНОЕ РАВЕНСТВО, а не «не меньше». Сравнение версий по частям —
 # отдельный код с собственными краевыми случаями, который здесь не нужен и
 # однажды ошибётся; «ровно эта строка» ошибиться не может.
-_TRADES_RECEIVER_VERSION = "9.1.2"
+#
+# ЭТАП 9.1.2.2 ПОДНЯЛ ТРЕБОВАНИЕ ДО 9.1.2.2, и версия 9.1.2 теперь тоже
+# отвергается. Это не формальность: 9.1.2 затирает заметку созданной строки
+# содержимым строки выше и дозаписывает закрытие в ПЕРВУЮ строку с меткой, не
+# замечая, что таких строк несколько. Оба исхода тихие, и оба уже случились на
+# боевом листе 31.08.2026.
+_TRADES_RECEIVER_VERSION = "9.1.2.2"
 
 
 class ExportError(Exception):
@@ -120,6 +126,50 @@ async def _alert(text: str, log: structlog.types.WrappedLogger) -> None:
     ok = await send_message(f"⚠️ <b>Выгрузка сигналов</b>\n{safe}")
     if not ok:
         log.warning("Не удалось отправить алерт в Telegram", alert=text)
+
+
+def _report_ambiguous(
+    result: sheets.SheetsResult,
+    rows: list[dict[str, Any]],
+    log: structlog.types.WrappedLogger,
+    *,
+    stage: str,
+) -> set[str]:
+    """Печатает неоднозначные метки в журнал и возвращает их множество (§3 ТЗ).
+
+    СТРОКА ЖУРНАЛА — УРОВНЯ ``error`` И С МАШИНОЧИТАЕМЫМИ КЛЮЧАМИ
+    (``sheets_ambiguous_marker=1``, ``position_id``, ``rows``). Уровень выбран не
+    по громкости, а по смыслу: сделка НЕ ЗАПИСАНА в лист и записана не будет,
+    пока человек не разберёт строки руками. Ключ-признак стоит отдельным полем,
+    чтобы такие случаи можно было посчитать по журналу одной командой, не
+    разбирая текст сообщения.
+
+    ``position_id`` берётся из пачки по метке, а не разбирается из её текста:
+    формат метки — договор двух сторон провода, и второй разборщик того же
+    формата однажды разошёлся бы с первым.
+
+    Возвращает МНОЖЕСТВО МЕТОК, а не список позиций: вызывающему нужно ровно
+    одно — исключить их из тех, кому ставится отметка экспорта.
+    """
+    if not result.ambiguous:
+        return set()
+    by_marker = {position_marker(row["id"]): row for row in rows}
+    markers: set[str] = set()
+    for item in result.ambiguous:
+        marker = str(item.get("marker", ""))
+        if not marker:
+            continue
+        markers.add(marker)
+        row = by_marker.get(marker)
+        log.error(
+            "Торговый журнал: метка неоднозначна — не записано ничего",
+            sheets_ambiguous_marker=1,
+            position_id=None if row is None else int(row["id"]),
+            marker=marker,
+            rows=list(item.get("rows") or []),
+            stage=stage,
+        )
+    return markers
 
 
 async def _export_sheets(
@@ -311,14 +361,26 @@ async def _export_trades(
         )
         if not result.ok:
             raise ExportError(f"торговый журнал, открытия: {result.error}")
-        await queries.mark_positions_sheet_opened(
-            conn, [int(row["id"]) for row in pending_open]
-        )
-        created = len(rows)
+
+        # МЕТКА УЖЕ ЗАНЯТА — СТРОКА НЕ СОЗДАНА, И ОТМЕТКА НЕ СТАВИТСЯ (§3 ТЗ
+        # 9.1.2.2). Отметка необратима: поставив её здесь, мы объявили бы
+        # позицию выгруженной, тогда как строки в листе у неё нет — а есть
+        # чужая строка с её меткой. Позиция останется в очереди и будет
+        # выгружаться каждым следующим прогоном, пока лист не приведут в
+        # порядок. Повторяющаяся ошибка в журнале — это цена, которую платит
+        # владелец за то, чтобы сделка не потерялась молча.
+        skipped = _report_ambiguous(result, pending_open, log, stage="открытие")
+        opened_ids = [
+            int(row["id"]) for row in pending_open
+            if position_marker(row["id"]) not in skipped
+        ]
+        await queries.mark_positions_sheet_opened(conn, opened_ids)
+        created = len(opened_ids)
         log.info(
             "Торговый журнал: строки открытия созданы",
             created=created, start_row=result.start_row,
             receiver_version=result.receiver_version,
+            skipped_ambiguous=len(skipped),
         )
 
     # --- 2. ЗАКРЫТИЯ: дозапись H, I, J в СУЩЕСТВУЮЩУЮ строку по метке ------
@@ -347,9 +409,16 @@ async def _export_trades(
         if not result.ok:
             raise ExportError(f"торговый журнал, закрытия: {result.error}")
 
+        # НЕОДНОЗНАЧНАЯ МЕТКА: НИ ОТМЕТКИ, НИ НОВОЙ СТРОКИ (§3 ТЗ 9.1.2.2).
+        # Приёмник по такой метке не записал НИЧЕГО, и создавать взамен новую
+        # строку нельзя: строк с этой меткой в листе и без того больше одной.
+        ambiguous_markers = _report_ambiguous(
+            result, pending_close, log, stage="закрытие"
+        )
         done_ids = [
             int(row["id"]) for marker, row in by_marker.items()
             if marker not in set(result.not_found)
+            and marker not in ambiguous_markers
         ]
         updated = len(done_ids)
 
@@ -379,9 +448,18 @@ async def _export_trades(
                     raise ExportError(
                         f"торговый журнал, потерянные строки: {rescue.error}"
                     )
-                done_ids.extend(int(row["id"]) for row in orphans)
-                created += len(orphans)
-                updated += len(orphans)
+                # Спасательная строка тоже может упереться в занятую метку —
+                # тогда она не создана, и отметка по ней не ставится.
+                rescue_skipped = _report_ambiguous(
+                    rescue, orphans, log, stage="потерянная строка"
+                )
+                saved = [
+                    row for row in orphans
+                    if position_marker(row["id"]) not in rescue_skipped
+                ]
+                done_ids.extend(int(row["id"]) for row in saved)
+                created += len(saved)
+                updated += len(saved)
 
         await queries.mark_positions_sheet_closed(conn, done_ids)
         log.info("Торговый журнал: закрытия дописаны", updated=updated)
