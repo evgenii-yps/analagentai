@@ -33,6 +33,7 @@
 from __future__ import annotations
 
 import pathlib
+import re
 import subprocess
 from datetime import UTC, datetime
 from typing import Any
@@ -399,18 +400,274 @@ def test_the_orphan_note_still_names_what_happened() -> None:
 
 
 # =============================================================================
+# ПРАВКА К ЭТАПУ. Двойник базы знает НАСТОЯЩУЮ схему, а не упрощённую
+# =============================================================================
+#
+# ЧТО СЛУЧИЛОСЬ. Первая редакция ``get_positions_sheet_marks`` спрашивала
+# ``symbol`` прямо у таблицы ``positions``. Такой колонки там нет: есть
+# ``instrument_id`` и внешний ключ, а ``symbol`` лежит в ``instruments``. На
+# боевой базе скрипт репарации падал с ``UndefinedColumnError``.
+#
+# ПОЧЕМУ ЭТОГО НЕ ПОЙМАЛИ ПРОВЕРКИ. Двойник базы подменял МЕТОД целиком и
+# возвращал заранее сложенные словари — SQL не выполнялся вообще, и любая
+# колонка в нём была одинаково «правильной». Это ровно та же ошибка, что была на
+# этом же этапе с двойником Google Таблицы: двойник, который прощает больше
+# настоящей системы, доказывает не работоспособность кода, а собственную
+# снисходительность.
+#
+# КАК ПОЧИНЕНО. Двойник ниже разбирает SQL и сверяет КАЖДУЮ упомянутую колонку с
+# составом таблиц, вычитанным ИЗ МИГРАЦИЙ проекта. Скрипт репарации теперь
+# работает через НАСТОЯЩИЕ методы ``DB``, а не через их пересказ.
+
+_SQL_KEYWORDS = frozenset(
+    word.lower() for word in (
+        "SELECT", "FROM", "WHERE", "ORDER", "BY", "GROUP", "HAVING", "JOIN",
+        "LEFT", "RIGHT", "INNER", "OUTER", "ON", "AND", "OR", "NOT", "IS",
+        "NULL", "TRUE", "FALSE", "AS", "ANY", "ALL", "IN", "SET", "UPDATE",
+        "INSERT", "INTO", "VALUES", "DELETE", "ASC", "DESC", "LIMIT", "OFFSET",
+        "DISTINCT", "CASE", "WHEN", "THEN", "ELSE", "END", "FILTER", "EXISTS",
+        # Имена типов в приведениях вроде ``$1::bigint[]``.
+        "bigint", "int", "integer", "smallint", "text", "boolean", "numeric",
+        "timestamptz", "date", "double", "precision", "interval",
+    )
+)
+
+
+def _table_columns(text: str, table: str) -> set[str]:
+    """Состав колонок таблицы, вычитанный из её ``CREATE TABLE``."""
+    block = text.split(f"CREATE TABLE IF NOT EXISTS {table} (", 1)[1]
+    block = block.split("\n);", 1)[0]
+    columns: set[str] = set()
+    for line in block.splitlines():
+        found = re.match(r"\s{4}([a-z_]+)\s+[A-Za-z]", line)
+        if found and found.group(1) not in {"unique", "check", "constraint"}:
+            columns.add(found.group(1))
+    return columns
+
+
+def _schema() -> dict[str, set[str]]:
+    """Схема двойника — ИЗ МИГРАЦИЙ, а не переписанная руками в тест.
+
+    Переписанный руками список однажды разошёлся бы с базой, и разошёлся бы
+    молча: проверки продолжали бы проходить, а падать начал бы боевой прогон —
+    то есть ровно то, что уже произошло.
+    """
+    positions = _table_columns(
+        (_ROOT / "db" / "migrations" / "018_positions.sql").read_text(
+            encoding="utf-8"
+        ),
+        "positions",
+    )
+    for name in ("019_positions_data_gap.sql", "020_positions_sheet_export.sql"):
+        text = (_ROOT / "db" / "migrations" / name).read_text(encoding="utf-8")
+        positions |= set(
+            re.findall(
+                r"ALTER TABLE positions\s+ADD COLUMN IF NOT EXISTS\s+([a-z_]+)",
+                text,
+            )
+        )
+    instruments = _table_columns(
+        (_ROOT / "db" / "init.sql").read_text(encoding="utf-8"), "instruments"
+    )
+    return {"positions": positions, "instruments": instruments}
+
+
+class UndefinedColumn(Exception):
+    """То, чем на настоящей базе оборачивается ``asyncpg.UndefinedColumnError``."""
+
+
+def check_sql_columns(sql: str, schema: dict[str, set[str]]) -> None:
+    """Сверяет каждую колонку запроса с составом таблиц. Бросает при чужой.
+
+    ПРОВЕРЯЮТСЯ ОБА ВИДА ССЫЛОК, и второй важнее первого:
+
+     1. КВАЛИФИЦИРОВАННЫЕ (``p.symbol``) — псевдоним связывается с таблицей по
+        ``FROM``/``JOIN``, дальше сверка прямая.
+     2. НЕКВАЛИФИЦИРОВАННЫЕ (``SELECT id, symbol ... FROM positions``) — когда в
+        запросе участвует РОВНО ОДНА таблица, все свободные имена обязаны быть
+        её колонками. Проверять только первый вид значило бы пропустить ровно ту
+        форму запроса, на которой всё и сломалось.
+    """
+    text = re.sub(r"'[^']*'", "''", sql)
+    bindings: dict[str, str] = {}
+    tables: set[str] = set()
+    for found in re.finditer(
+        r"\b(?:FROM|JOIN)\s+([a-z_]+)(?:\s+(?:AS\s+)?([a-z_]+))?", text, re.I
+    ):
+        table, alias = found.group(1), found.group(2)
+        if table not in schema:
+            continue
+        tables.add(table)
+        bindings[alias if alias and alias.lower() not in _SQL_KEYWORDS else table] = table
+    for found in re.finditer(r"\b([a-z_]+)\.([a-z_*]+)", text):
+        alias, column = found.groups()
+        table = bindings.get(alias)
+        if table and column != "*" and column not in schema[table]:
+            raise UndefinedColumn(f'column "{column}" of relation "{table}" does not exist')
+    if len(tables) != 1:
+        return
+    only = next(iter(tables))
+    for found in re.finditer(r"(?<![.\w$])([a-z_][a-z_0-9]*)\s*(\.|\()?", text):
+        word, after = found.group(1), found.group(2)
+        if after or word in _SQL_KEYWORDS or word in schema or word in bindings:
+            continue
+        if word not in schema[only]:
+            raise UndefinedColumn(f'column "{word}" does not exist')
+
+
+class _SchemaPool:
+    """Двойник пула asyncpg, СВЕРЯЮЩИЙ колонки запроса с настоящей схемой.
+
+    Он намеренно строг там же, где строга настоящая база: запрос к
+    несуществующей колонке не выполняется, а бросает — ту же по смыслу ошибку,
+    что прилетела с боевой базы.
+    """
+
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = [dict(row) for row in rows]
+        self.schema = _schema()
+        self.queries: list[str] = []
+
+    async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
+        self.queries.append(sql)
+        check_sql_columns(sql, self.schema)
+        wanted = {int(i) for i in (args[0] if args else [])}
+        return [
+            {key: row[key] for key in _MARK_KEYS}
+            for row in sorted(self.rows, key=lambda r: int(r["id"]))
+            if int(row["id"]) in wanted
+        ]
+
+    async def execute(self, sql: str, *args: Any) -> str:
+        self.queries.append(sql)
+        check_sql_columns(sql, self.schema)
+        wanted = {int(i) for i in (args[0] if args else [])}
+        touched = 0
+        for row in self.rows:
+            if int(row["id"]) in wanted:
+                row["sheet_opened_at"] = None
+                row["sheet_closed_at"] = None
+                touched += 1
+        return f"UPDATE {touched}"
+
+
+# Что метод отдаёт наружу: восемь полей, и ``symbol`` среди них — из instruments.
+_MARK_KEYS = (
+    "id", "symbol", "status", "opened_at", "closed_at", "exit_reason",
+    "sheet_opened_at", "sheet_closed_at",
+)
+
+
+def test_the_positions_schema_of_the_double_matches_production(
+) -> None:
+    """Состав ``positions`` у двойника совпадает с боевым — все 37 колонок.
+
+    Список сверяется с тем, что владелец прочитал на боевой базе 31.08.2026.
+    Расхождение здесь означает, что двойник разошёлся с реальностью, и все
+    проверки, на него опирающиеся, перестали что-либо доказывать.
+
+    ``symbol`` в этом списке НЕТ — и это главное, что список утверждает.
+    """
+    production = {
+        "id", "instrument_id", "signal_id", "logic_version", "horizon_h",
+        "side", "is_virtual", "status", "signal_ts", "signal_price",
+        "opened_at", "entry_price", "entry_lag_sec", "entry_slippage_pct",
+        "qty", "notional_usd", "target_pct", "target_price", "stop_pct",
+        "stop_price", "cost_pct", "deadline_at", "last_checked_ts",
+        "closed_at", "exit_price", "exit_reason", "outcome_certain",
+        "net_pnl_pct", "net_pnl_usd", "bars_held", "mae_pct", "mfe_pct",
+        "resolution", "created_at", "updated_at", "sheet_opened_at",
+        "sheet_closed_at",
+    }
+    schema = _schema()
+    assert schema["positions"] == production
+    assert len(production) == 37
+    assert "symbol" not in schema["positions"], "колонки symbol в positions нет"
+    assert "symbol" in schema["instruments"]
+
+
+def test_the_double_rejects_the_query_that_broke_on_the_real_database(
+) -> None:
+    """КОНТРОЛЬ: прежняя редакция запроса двойником ОТВЕРГАЕТСЯ.
+
+    Без этой проверки нельзя утверждать, что двойник вообще что-то ловит: он мог
+    бы пропускать всё подряд и «доказывать» исправность любого запроса. Здесь
+    берётся ТОТ САМЫЙ текст, который упал на боевой базе.
+    """
+    schema = _schema()
+    broken = """
+        SELECT id, symbol, status, opened_at, closed_at, exit_reason,
+               sheet_opened_at, sheet_closed_at
+        FROM positions
+        WHERE id = ANY($1::bigint[])
+        ORDER BY id;
+    """
+    with pytest.raises(UndefinedColumn) as failure:
+        check_sql_columns(broken, schema)
+    assert "symbol" in str(failure.value)
+
+    # И квалифицированная форма той же ошибки — тоже.
+    with pytest.raises(UndefinedColumn):
+        check_sql_columns(
+            "SELECT p.id, p.symbol FROM positions p WHERE p.id = $1;", schema
+        )
+    # А верный запрос проходит: иначе двойник отвергал бы всё подряд.
+    check_sql_columns(
+        "SELECT p.id, i.symbol FROM positions p "
+        "JOIN instruments i ON i.id = p.instrument_id WHERE p.id = $1;",
+        schema,
+    )
+
+
+async def test_the_real_query_runs_against_the_real_schema() -> None:
+    """Оба метода этапа проходят сверку со схемой и отдают токен из instruments.
+
+    Запрос ВЫПОЛНЯЕТСЯ настоящим методом ``DB``, а не пересказывается: только
+    так проверка касается того самого текста SQL, который уйдёт в боевую базу.
+    """
+    from src.core.db import DB
+
+    real = DB()
+    pool = _SchemaPool([_mark_row(11), _mark_row(12)])
+    real._pool = pool  # type: ignore[assignment]
+
+    rows = await real.get_positions_sheet_marks([12, 11])
+    assert [row["id"] for row in rows] == [11, 12], "порядок по id не соблюдён"
+    assert rows[0]["symbol"] == "ETH/USDT", "токен не взят из instruments"
+    # Соединение с instruments стоит в запросе явно.
+    assert "JOIN instruments" in pool.queries[0]
+
+    touched = await real.reset_positions_sheet_marks([11])
+    assert touched == 1
+    assert pool.rows[0]["sheet_opened_at"] is None
+    assert pool.rows[0]["sheet_closed_at"] is None
+    # Вторая позиция не тронута: сброс идёт РОВНО по перечню.
+    assert pool.rows[1]["sheet_opened_at"] is not None
+
+
+# =============================================================================
 # §5.5. Скрипт восстановления: подтверждение числом
 # =============================================================================
 
 class _FakeDB:
-    """Двойник базы для скрипта репарации: считает вызовы UPDATE.
+    """Двойник базы для скрипта репарации: НАСТОЯЩИЕ методы ``DB`` поверх
+    двойника пула, сверяющего колонки со схемой.
 
-    Проверяется именно ФАКТ вызова, а не текст вывода: скрипт, напечатавший
-    отказ и всё-таки сбросивший отметки, прошёл бы проверку по выводу.
+    Метод целиком здесь НЕ подменяется — и это исправление правки к этапу.
+    Подменённый метод не выполняет SQL вовсе, и любая колонка в нём одинаково
+    «правильна»: именно так обращение к несуществующей колонке ``symbol``
+    прошло все проверки и упало на боевой базе.
+
+    Считается только ФАКТ вызова сброса: скрипт, напечатавший отказ и всё-таки
+    сбросивший отметки, прошёл бы проверку по выводу.
     """
 
     def __init__(self, rows: list[dict[str, Any]]) -> None:
-        self.rows = rows
+        from src.core.db import DB
+
+        self.pool = _SchemaPool(rows)
+        self._real = DB()
+        self._real._pool = self.pool  # type: ignore[assignment]
         self.resets: list[list[int]] = []
 
     async def connect(self) -> None:
@@ -422,15 +679,15 @@ class _FakeDB:
     async def get_positions_sheet_marks(
         self, position_ids: list[int]
     ) -> list[dict[str, Any]]:
-        wanted = {int(i) for i in position_ids}
-        return [row for row in self.rows if int(row["id"]) in wanted]
+        return await self._real.get_positions_sheet_marks(position_ids)
 
     async def reset_positions_sheet_marks(self, position_ids: list[int]) -> int:
         self.resets.append([int(i) for i in position_ids])
-        return len(position_ids)
+        return await self._real.reset_positions_sheet_marks(position_ids)
 
 
 def _mark_row(position_id: int) -> dict[str, Any]:
+    """Строка позиции с токеном, как её отдаёт соединение positions+instruments."""
     return {
         "id": position_id,
         "symbol": "ETH/USDT",
