@@ -74,6 +74,7 @@ from src.core.logging import setup_logging  # noqa: E402
 from src.shadow.trailing import (  # noqa: E402
     CONTROL_VARIANT,
     ShadowOutcome,
+    closing_moment,
     resolve_position,
     variant_name,
 )
@@ -113,10 +114,22 @@ def compare_control(
 ) -> list[str]:
     """Расхождения контроля с фактом. Пустой список — совпало.
 
-    Сверяются четыре величины, названные §3.3 ТЗ: причина выхода, бар выхода,
-    цена выхода и итог в процентах. Каждая сравнивается с тем числом знаков, с
-    которым она ЛЕЖИТ В БАЗЕ: сравнение «примерно» пропустило бы ровно то
-    расхождение, ради которого сверка и делается.
+    Сверяются четыре величины: причина выхода, МОМЕНТ ЗАКРЫТИЯ, цена выхода и
+    итог в процентах. Каждая сравнивается с тем числом знаков, с которым она
+    ЛЕЖИТ В БАЗЕ: сравнение «примерно» пропустило бы ровно то расхождение, ради
+    которого сверка и делается.
+
+    ОШИБКА В ТЗ, НАЗВАННАЯ, А НЕ ОБОЙДЁННАЯ. §3.3 ТЗ требует сверять
+    ``exit_bar_ts``, но КОЛОНКИ С ТАКИМ ИМЕНЕМ В ``positions`` НЕТ — и §11.3
+    того же ТЗ приводит полный состав таблицы, где её действительно нет.
+    Требование противоречило само себе. Момент закрытия лежит в ``closed_at``.
+
+    И СВЕРЯЕТСЯ ОН ЧЕРЕЗ :func:`closing_moment`, а не напрямую. ``check_exit``
+    возвращает время ОТКРЫТИЯ бара выхода, а ``runner`` пишет в ``closed_at``
+    время его ЗАКРЫТИЯ. Первая редакция сравнивала одно с другим, и на боевой
+    базе 31.08.2026 все одиннадцать позиций разошлись ровно на 60 секунд — факт
+    позже пересчёта. Допуск при этом остаётся НУЛЕВЫМ: изменилось не «насколько
+    близко», а «что с чем».
 
     ``None`` вместо контроля — тоже расхождение, и названное словами: живое
     правило на этом ряде исхода не дало, а в базе исход есть.
@@ -129,10 +142,11 @@ def compare_control(
             f"exit_reason: факт {position['exit_reason']}, "
             f"пересчёт {control.exit_reason}"
         )
-    if control.exit_bar_ts != position["closed_at"]:
+    closed = closing_moment(control.exit_bar_ts, str(position["resolution"]))
+    if closed != position["closed_at"]:
         problems.append(
-            f"exit_bar_ts: факт {position['closed_at']}, "
-            f"пересчёт {control.exit_bar_ts}"
+            f"closed_at: факт {position['closed_at']}, пересчёт {closed} "
+            f"(бар выхода {control.exit_bar_ts})"
         )
     fact_price = _round(position["exit_price"], PRICE_PLACES)
     if _round(control.exit_price, PRICE_PLACES) != fact_price:
@@ -409,8 +423,21 @@ async def _run(args: argparse.Namespace, since: datetime | None,
             mismatches.append((position_id, problems))
         shadows[position_id] = shadow.rows
 
-    compared = len(positions) - len(failures)
+    # СВЕРЕНО — ЭТО ЧИСЛО ПОЗИЦИЙ, ПО КОТОРЫМ СВЕРКА ВООБЩЕ ПРОВОДИЛАСЬ, а не
+    # число удавшихся. Первая редакция вычитала отсюда позиции, на которых
+    # расчёт упал с исключением, но в расхождения их всё равно засчитывала — и
+    # на боевом прогоне 31.08.2026 напечатала невозможное: сверено 11,
+    # разошлось 12. Позиция, расчёт которой не удался, СВЕРЕНА (попытка была) и
+    # РАЗОШЛАСЬ (совпадения не получено); в оба счётчика она входит одинаково.
+    compared = len(positions)
     mismatched = len(mismatches) + len(failures)
+    if mismatched > compared:
+        # Печатать невозможное число хуже, чем упасть: увидев «11 и 12», человек
+        # начинает сомневаться во ВСЁМ выводе, и правильно делает.
+        raise AssertionError(
+            f"расхождений {mismatched} при {compared} сверенных — счётчики "
+            "разошлись; печатать такой отчёт нельзя"
+        )
     _log.info(
         "Теневой замер: контроль",
         shadow_control_compared=compared,

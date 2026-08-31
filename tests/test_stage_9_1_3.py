@@ -42,7 +42,9 @@ import pytest
 from src.barrier.outcomes import Bar
 from src.shadow.trailing import (
     CONTROL_VARIANT,
+    armed_scan,
     check_window,
+    closing_moment,
     resolve_position,
     variant_name,
 )
@@ -56,6 +58,7 @@ from tests.schema_double import (
 )
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
+
 
 # Позиция-образец: вход по 100, цель +2%, предел −1%, час горизонта, слот $2.
 # Круглые числа выбраны затем, чтобы ответ был виден глазом, а не только
@@ -250,6 +253,157 @@ def test_the_control_reproduces_the_recorded_outcome_exactly() -> None:
     assert shadow.control.activation_frac is None
     assert shadow.control.pullback_frac is None
     assert shadow.control.armed is False
+
+
+# =============================================================================
+# Правка после боевого прогона: момент закрытия, область задетости, счётчики
+# =============================================================================
+
+def test_the_closing_moment_is_the_bar_close_not_the_bar_open() -> None:
+    """Момент закрытия — ЗАКРЫТИЕ бара выхода, а не его открытие.
+
+    ЭТА ПРОВЕРКА НАПИСАНА ПОСЛЕ БОЕВОГО ПРОГОНА, КОТОРЫЙ ЕЁ ПОТРЕБОВАЛ. Все
+    одиннадцать позиций разошлись ровно на 60 секунд: ``check_exit`` возвращает
+    время ОТКРЫТИЯ бара, а ``runner`` пишет в ``closed_at`` время его ЗАКРЫТИЯ.
+    Сверялись разные величины при нулевом допуске.
+
+    ПОДМЕНА ОДНОГО ДРУГИМ РОНЯЕТ ЭТУ ПРОВЕРКУ — в этом её смысл.
+    """
+    bar_open = datetime(2026, 8, 31, 1, 5, tzinfo=UTC)
+    assert closing_moment(bar_open, "1m") == bar_open + timedelta(minutes=1)
+    assert closing_moment(bar_open, "1h") == bar_open + timedelta(hours=1)
+    # Величины РАЗНЫЕ, и разница — ровно длина бара.
+    assert closing_moment(bar_open, "1m") != bar_open
+
+
+def test_the_closing_rule_still_matches_the_live_runner() -> None:
+    """Правило ``runner`` не изменилось: ``closed_at = бар выхода + 60 секунд``.
+
+    ЗДЕСЬ ДВА МЕСТА ЗНАЮТ ОДНО И ТО ЖЕ, и это признано, а не спрятано.
+    ``src/positions/runner.py`` считает момент закрытия литералом 60 секунд;
+    :func:`closing_moment` выводит его из разрешения бара. Сегодня они совпадают
+    (``positions_resolution_chk`` допускает только ``1m``), но совпадение это не
+    вечное — и потому проверяется по ТЕКСТУ живого правила. Изменится там
+    формула — эта проверка упадёт, а не разойдётся молча.
+    """
+    source = (_ROOT / "src" / "positions" / "runner.py").read_text(encoding="utf-8")
+    assert "decision.exit_bar_ts + timedelta(seconds=60)" in source, (
+        "правило момента закрытия в runner изменилось — проверьте closing_moment"
+    )
+    # И у закрытия по пробелу момент ДРУГОЙ — ``now``; такие позиции в замер не
+    # входят вовсе, поэтому вывести его из бара и не требуется.
+    assert "now if by_gap else" in source
+
+
+async def test_a_bar_open_instead_of_a_bar_close_is_caught_as_a_mismatch(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Позиция с ``closed_at`` по ОТКРЫТИЮ бара распознаётся как расхождение.
+
+    Это та самая путаница, что пришла с боевой базы, поданная как вход: если
+    сверка снова начнёт сравнивать открытие бара с закрытием, она либо примет
+    неверную позицию (и эта проверка упадёт), либо отвергнет верную (и упадёт
+    соседняя). Обе стороны закрыты.
+    """
+    wrong = _position_row(closed_at=OPENED + timedelta(minutes=1))
+    pool = _ShadowPool([wrong], _bar_rows())
+    assert await _run_script(monkeypatch, pool, []) == 2
+    out = capsys.readouterr().out
+    assert "closed_at" in out
+    assert "КОНТРОЛЬ НЕ СОВПАЛ" in out
+    assert pool.writes == []
+
+
+def test_the_arming_scan_stops_at_the_variants_own_exit_bar() -> None:
+    """Задетость считается ТОЛЬКО в пределах жизни варианта (боевая позиция 6).
+
+    ВОСПРОИЗВЕДЕНИЕ НАСТОЯЩЕЙ ПРИЧИНЫ. Вариант вышел по пределу на первом баре;
+    порога включения цена достигла ПОЗЖЕ — когда сделки уже не было. Просмотр
+    всего окна объявлял такую сделку задетой, завышая главное число этапа, и
+    ронял расчёт утверждением «выход stop при armed=true».
+
+    Механизм эту сделку не трогал: он не успел включиться до её выхода.
+    """
+    path = (
+        [(100.1, 98.5, 99.0)]              # предел задет сразу, порог — нет
+        + _flat(101.5, 101.0, 101.2, 59)   # порог задет уже ПОСЛЕ выхода
+    )
+    shadow = _resolve(_bars(path))
+
+    assert shadow.control is not None
+    assert shadow.control.exit_reason == "stop"
+    assert all(v.exit_reason == "stop" for v in shadow.variants)
+    assert all(not v.armed for v in shadow.variants), (
+        "задетость засчитана по бару, случившемуся после выхода варианта"
+    )
+    assert all(v.armed_at is None for v in shadow.variants)
+
+    # Тот же ряд, но без ограничения по бару выхода, даёт ДРУГОЙ ответ — значит
+    # ограничение действительно работает, а не совпало.
+    prefix = _bars(path)
+    unscoped, _at = armed_scan(
+        prefix, entry_price=ENTRY, target_pct=TARGET_PCT,
+        activation_ratio=0.25, direction="buy",
+    )
+    scoped, _at2 = armed_scan(
+        prefix, entry_price=ENTRY, target_pct=TARGET_PCT,
+        activation_ratio=0.25, direction="buy", until=OPENED,
+    )
+    assert unscoped is True and scoped is False
+
+
+def test_a_threshold_and_a_stop_in_the_same_bar_are_ambiguous_not_stop() -> None:
+    """Порог и предел В ОДНОМ баре дают ``ambiguous`` — способом живого правила.
+
+    УТВЕРЖДЕНИЕ СУЖЕНО ДО «МЕЖДУ БАРАМИ» именно из-за этого случая: максимум
+    бара может дойти до порога включения, а минимум того же бара — до предела, и
+    порядок событий внутри минуты ряду свечей неизвестен. Своего способа
+    разрешения здесь не изобретается: правило 8.10 возвращает ``ambiguous``, и
+    выход ``stop`` до этого случая просто не доходит.
+
+    Уровни подобраны так, что ответ виден в уме: порог A=0.25 стоит на 100.50 и
+    задет максимумом 100.60, предел 99.00 задет минимумом 98.50 — тем же баром.
+    """
+    path = [(100.6, 98.5, 99.0)] + _flat(99.0, 98.0, 98.5, 59)
+    shadow = _resolve(_bars(path))
+
+    low = [v for v in shadow.variants if v.activation_frac == 0.25]
+    high = [v for v in shadow.variants if v.activation_frac == 0.50]
+    assert all(v.exit_reason == "ambiguous" for v in low), (
+        "одновременное касание разрешено догадкой вместо ambiguous"
+    )
+    # У неизмеренного исхода нет ни бара, ни цены, ни итога.
+    assert all(v.exit_bar_ts is None and v.exit_price is None for v in low)
+    assert all(v.net_pnl_pct is None and v.net_pnl_usd is None for v in low)
+    # Порог 101.00 этот бар не достал — обычный предел, механизм не задет.
+    assert all(v.exit_reason == "stop" for v in high)
+    assert all(not v.armed for v in high)
+
+
+async def test_the_mismatch_count_can_never_exceed_the_compared_count(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Расхождений не бывает больше, чем сверено (боевой вывод «11 и 12»).
+
+    Позиция, расчёт которой упал с исключением, СВЕРЕНА (попытка была) и
+    РАЗОШЛАСЬ (совпадения не получено) — в оба счётчика она входит одинаково.
+    Первая редакция вычитала её из сверенных, но засчитывала в расхождения, и
+    печатала невозможное. Увидев такое число, человек начинает сомневаться во
+    ВСЁМ выводе, и правильно делает.
+    """
+    # Позиция с несогласованным сроком: расчёт откажется считать её вовсе.
+    broken = _position_row(id=1, deadline_at=DEADLINE + timedelta(minutes=7))
+    pool = _ShadowPool([broken, _position_row(id=2)], _bar_rows())
+    code = await _run_script(monkeypatch, pool, [])
+    out = capsys.readouterr().out
+
+    assert code == 2
+    compared = int(out.split("Сверено позиций:")[1].split()[0])
+    mismatched = int(out.split("Разошлось:")[1].split()[0])
+    assert compared == 2, f"сверено {compared}, а позиций 2"
+    assert mismatched <= compared, f"разошлось {mismatched} при {compared} сверенных"
+    assert mismatched == 1
+    assert pool.writes == []
 
 
 # =============================================================================
@@ -488,7 +642,12 @@ def _position_row(**over: Any) -> dict[str, Any]:
         "id": 1, "instrument_id": 10, "symbol": "ETH/USDT", "base": "ETH",
         "logic_version": 5, "horizon_h": HORIZON_H, "side": "buy",
         "status": "closed", "opened_at": OPENED, "deadline_at": DEADLINE,
-        "closed_at": OPENED + timedelta(minutes=1),
+        # ЗАКРЫТИЕ БАРА, А НЕ ЕГО ОТКРЫТИЕ. Бар выхода открывается в OPENED+1мин
+        # и закрывается минутой позже; ровно так ``src/positions/runner.py``
+        # и пишет ``closed_at``. Первая редакция фикстуры ставила сюда открытие
+        # бара — ту же путаницу, из-за которой боевой прогон дал одиннадцать
+        # расхождений по 60 секунд.
+        "closed_at": OPENED + timedelta(minutes=2),
         "entry_price": ENTRY, "notional_usd": SLOT,
         "target_pct": TARGET_PCT, "target_price": 102.0,
         "stop_pct": STOP_PCT, "stop_price": 99.0,
