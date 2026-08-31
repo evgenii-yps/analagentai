@@ -34,9 +34,12 @@
 from __future__ import annotations
 
 import pathlib
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import numpy as np
 import pytest
 
 from src.barrier.outcomes import Bar
@@ -886,17 +889,45 @@ async def test_a_small_sample_forbids_the_words_better_and_worse(
 # =============================================================================
 
 class _ResamplePool(SchemaPool):
-    """Пул со строками ``trailing_outcomes`` для части А."""
+    """Пул со строками ``trailing_outcomes`` для части А, ПОРЦИЯМИ.
+
+    Двойник соблюдает ключ-границу и предел порции, как настоящая база: иначе он
+    был бы мягче её и «доказал» бы работоспособность чтения, которое на самом
+    деле тянет всю таблицу разом.
+    """
 
     def __init__(self, rows: list[dict[str, Any]]) -> None:
         super().__init__()
-        self.rows = rows
+        # Порядок тот же, что в запросе: по времени сигнала, затем по ключу пары.
+        self.rows = sorted(
+            rows,
+            key=lambda r: (r["ts"], int(r["signal_id"]), int(r["horizon_h"]),
+                           float(r["activation_ratio"]), float(r["retrace_ratio"])),
+        )
+        self.batches = 0
 
     async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
         self._check(sql)
-        if "FROM trailing_outcomes" in sql:
-            return project(sql, self.rows)
-        return []
+        if "FROM trailing_outcomes" not in sql:
+            return []
+        self.batches += 1
+        # ДВОЙНИК ДЕЛАЕТ РОВНО ТО, ЧТО НАПИСАНО В ЗАПРОСЕ. Первая редакция
+        # применяла ключ-границу и предел порции сама, независимо от текста SQL,
+        # и контрольный опыт показал это прямо: удаление ``LIMIT`` из запроса не
+        # роняло ни одной проверки — двойник продолжал резать порции за базу.
+        # Это ровно тот случай «двойник мягче настоящей системы», из-за которого
+        # на Этапе 9.1.2.2 боевой прогон падал на зелёном стенде.
+        after, limit = (args[0], args[1], args[2]), args[3]
+        rows = self.rows
+        if "(s.ts, t.signal_id, t.horizon_h) > ($1, $2, $3)" in sql:
+            if after[0] is not None:
+                rows = [
+                    r for r in rows
+                    if (r["ts"], int(r["signal_id"]), int(r["horizon_h"])) > after
+                ]
+        if "LIMIT $4" in sql:
+            rows = rows[: int(limit)]
+        return project(sql, rows)
 
 
 def _resample_rows(pairs: int = 60) -> list[dict[str, Any]]:
@@ -1018,6 +1049,317 @@ async def test_part_a_says_so_when_the_old_half_is_empty(
     assert "(пар нет — считать нечего)" in out
 
 
+# Потолок пиковой памяти части А на боевом объёме, МБ. Взят с запасом больше
+# чем вдвое над измеренным (104,6 МБ на 1 707 940 строках) и вчетверо ниже
+# лимита контейнера ``mem_limit: 1g``. Не «сколько влезет», а «сколько можно
+# взять, не мешая девяти службам, которые работают круглосуточно».
+MEMORY_CEILING_MB = 300.0
+
+# Боевой объём на 31.08.2026. Требование правки — проверять не меньше полутора
+# миллионов строк, и здесь стоит ровно то число, на котором расчёт был убит.
+PRODUCTION_ROWS = 1_707_940
+
+
+def _memory_probe(rows: int, *, load_everything: bool = False) -> dict[str, Any]:
+    """Замер памяти ОТДЕЛЬНЫМ процессом. Возвращает разобранный ответ.
+
+    Отдельный процесс здесь не удобство, а условие осмысленности: ``ru_maxrss``
+    не опускается, и внутри общего прогона проверок замер поймал бы пик,
+    оставленный чужой проверкой.
+    """
+    import json
+
+    probe = _ROOT / "tests" / "memory" / "resample_memory_probe.py"
+    argv = [sys.executable, str(probe), str(rows)]
+    if load_everything:
+        argv.append("--load-everything")
+    done = subprocess.run(
+        argv, cwd=str(_ROOT), capture_output=True, text=True, timeout=900
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    return json.loads(done.stdout.strip().splitlines()[-1])
+
+
+def test_the_measurement_fits_the_container_limit_at_production_volume() -> None:
+    """§4 правки: на боевом объёме расчёт укладывается в лимит с запасом.
+
+    Боевой прогон 31.08.2026 был убит ядром: ``anon-rss`` 811 МБ и 919 МБ в двух
+    прогонах подряд при ``mem_limit: 1g``. Причина — вся таблица словарями;
+    считаемые числа при этом занимают тринадцать мегабайт.
+
+    Проверяется НЕ игрушка: 1 707 940 строк, ровно тот объём, на котором расчёт
+    и умер.
+    """
+    measured = _memory_probe(PRODUCTION_ROWS)
+    assert measured["rows"] == PRODUCTION_ROWS
+    assert measured["pairs"] == PRODUCTION_ROWS // 13
+    assert measured["peak_rss_mb"] < MEMORY_CEILING_MB, (
+        f"пик {measured['peak_rss_mb']} МБ при потолке {MEMORY_CEILING_MB} МБ"
+    )
+
+
+def test_the_measurement_still_fits_when_the_sample_grows_threefold() -> None:
+    """Запас на рост выборки втрое — требование правки, а не пожелание.
+
+    Выборка растёт примерно на 50 тысяч пар за двое суток. К середине сентября
+    строк будет втрое больше, и «влезло сегодня» ничего не значит, если завтра
+    придётся снова поднимать лимит.
+    """
+    measured = _memory_probe(PRODUCTION_ROWS * 3)
+    assert measured["peak_rss_mb"] < MEMORY_CEILING_MB, (
+        f"при росте втрое пик {measured['peak_rss_mb']} МБ"
+    )
+
+
+def test_loading_the_whole_sample_again_blows_the_limit() -> None:
+    """КОНТРОЛЬНЫЙ ОПЫТ (§11.2): верните дефект — и проверка упадёт.
+
+    Зелёный замер сам по себе не отличим от отсутствия замера. Здесь прежнее
+    поведение — чтение всей выборки одним списком — возвращается нарочно, и
+    показывается, что оно НЕ проходит: на тех же 1 707 940 строках пик выходит
+    за лимит контейнера, то есть воспроизводит боевое убийство процесса.
+    """
+    measured = _memory_probe(PRODUCTION_ROWS, load_everything=True)
+    assert measured["peak_rss_mb"] > MEMORY_CEILING_MB, (
+        "прежний способ уложился в потолок — значит потолок ничего не проверяет"
+    )
+    # И он же выходит за сам лимит контейнера: это и есть боевое убийство.
+    assert measured["peak_rss_mb"] > 1024.0, (
+        f"прежний способ дал {measured['peak_rss_mb']} МБ — "
+        "воспроизвести отказ по лимиту 1 ГБ не удалось"
+    )
+
+
+def test_the_compose_memory_limit_was_not_quietly_raised() -> None:
+    """``mem_limit`` службы backtest НЕ поднят: правка уложилась в прежний лимит.
+
+    Поднимать лимит молча запрещено прямо. Здесь это проверяется по файлу, а не
+    обещанием: на машине 3,8 ГБ и девять постоянных служб, и отдать калькулятору
+    полмашины значило бы рискнуть тем, что работает круглосуточно.
+    """
+    compose = (_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "mem_limit: 1g" in compose
+
+
+def test_the_streaming_pass_gives_the_same_numbers_as_the_old_way() -> None:
+    """§5 правки: способ счёта изменился, СЧИТАЕМОЕ — нет. До последнего знака.
+
+    Прежний способ держал всю выборку списком словарей и звал ``collect`` один
+    раз на всё; новый читает порциями и зовёт ``collect`` на каждой паре
+    отдельно. Отбор пар при этом ТОТ ЖЕ (одна и та же функция), и матрица чисел
+    обязана совпасть побитово — вместе с ПОРЯДКОМ строк: от порядка зависят и
+    деление выборки пополам, и последовательность случайных чисел в
+    перестановочной проверке.
+    """
+    import asyncio
+
+    import scripts.trailing_resample_9_1_3 as script
+    from scripts.trailing_stats import collect as collect_all
+    from scripts.trailing_stats import matrix as matrix_all
+    from src.core.db import db as real_db
+
+    rows = _resample_rows(pairs=40)
+
+    # СТАРЫЙ способ: всё разом.
+    projected = [
+        {**row, "token": row["base"]} for row in sorted(
+            rows, key=lambda r: (r["ts"], int(r["signal_id"]),
+                                 int(r["horizon_h"]))
+        )
+    ]
+    old_pairs, old_dropped = collect_all(projected)
+    old_values = matrix_all(old_pairs)
+
+    # НОВЫЙ способ: порциями, ``collect`` на каждой паре.
+    pool = _ResamplePool(rows)
+    real_db._pool = pool  # type: ignore[assignment]
+    original = type(script.db).TRAILING_RESAMPLE_BATCH
+    try:
+        # Порция заведомо не кратна тринадцати: границы приходятся на середину
+        # пар, и склейка проверяется, а не обходится стороной.
+        type(script.db).TRAILING_RESAMPLE_BATCH = 47
+        new_matrix, composition, new_dropped, rows_read = asyncio.run(
+            script.stream_sample()
+        )
+    finally:
+        type(script.db).TRAILING_RESAMPLE_BATCH = original
+
+    assert rows_read == len(rows), "прочитано не всё или что-то дважды"
+    assert new_matrix.values.shape == old_values.shape
+    assert np.array_equal(new_matrix.values, old_values), (
+        "числа разошлись между старым и новым способом счёта"
+    )
+    assert composition.pairs == len(old_pairs)
+    assert {k: v for k, v in new_dropped.items() if v} == {
+        k: v for k, v in old_dropped.items() if v
+    }
+    assert pool.batches > 1, f"порций {pool.batches}: чтение не порционное"
+
+
+def test_a_pair_split_across_two_batches_is_not_lost_or_halved() -> None:
+    """Пара, разорванная границей порции, попадает в выборку ЦЕЛИКОМ и один раз.
+
+    Это самое хрупкое место порционного чтения: обрезанная пара выглядит
+    неполной, и посчитанная по обрезку она была бы молча выброшена из сравнения
+    по причине, которой в данных нет.
+    """
+    import asyncio
+
+    import scripts.trailing_resample_9_1_3 as script
+    from src.core.db import db as real_db
+
+    rows = _resample_rows(pairs=17)
+    pool = _ResamplePool(rows)
+    real_db._pool = pool  # type: ignore[assignment]
+    original = type(script.db).TRAILING_RESAMPLE_BATCH
+    try:
+        # 20 строк — полторы пары: каждая порция рвёт пару посередине.
+        type(script.db).TRAILING_RESAMPLE_BATCH = 20
+        built, composition, _dropped, rows_read = asyncio.run(script.stream_sample())
+    finally:
+        type(script.db).TRAILING_RESAMPLE_BATCH = original
+
+    assert len(built) == 17, f"собрано пар {len(built)}, ожидалось 17"
+    assert composition.pairs == 17
+    assert rows_read == len(rows), "строки посчитаны дважды или потеряны"
+    assert pool.batches > 5, "порции оказались слишком крупными для проверки"
+
+
+def test_a_cursor_that_stops_moving_raises_instead_of_looping_forever() -> None:
+    """Граница чтения, не двигающаяся вперёд, роняет расчёт, а не крутит цикл.
+
+    НАЙДЕНО КОНТРОЛЬНЫМ ОПЫТОМ. Убрав ключ-границу из запроса, я получил не
+    падение проверки, а ВЕЧНЫЙ ЦИКЛ: каждая порция возвращала одно и то же
+    начало таблицы. Снаружи это неотличимо от долгого счёта — тот же класс
+    дефекта, что тихий обрыв, из-за которого правка и понадобилась.
+
+    Теперь такой случай распознаётся сразу и называется словами.
+    """
+    import asyncio
+
+    import scripts.trailing_resample_9_1_3 as script
+    from src.core.db import db as real_db
+
+    class _StuckPool(_ResamplePool):
+        """Пул, который игнорирует ключ-границу — как запрос без неё."""
+
+        async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
+            return await super().fetch(
+                sql.replace("(s.ts, t.signal_id, t.horizon_h) > ($1, $2, $3)",
+                            "TRUE"),
+                *args,
+            )
+
+    pool = _StuckPool(_resample_rows(pairs=17))
+    real_db._pool = pool  # type: ignore[assignment]
+    original = type(script.db).TRAILING_RESAMPLE_BATCH
+    try:
+        type(script.db).TRAILING_RESAMPLE_BATCH = 20
+        with pytest.raises(RuntimeError, match="не сдвинулась вперёд"):
+            asyncio.run(script.stream_sample())
+    finally:
+        type(script.db).TRAILING_RESAMPLE_BATCH = original
+
+
+def test_one_shared_bootstrap_would_differ_in_the_sixteenth_digit() -> None:
+    """ПОЧЕМУ ОСТАВЛЕНЫ ДВЕНАДЦАТЬ ОТДЕЛЬНЫХ ПЕРЕСБОРОК, а не одна общая.
+
+    Одним вызовом на матрицу из двенадцати столбцов те же интервалы считаются в
+    13 раз быстрее (1,2 минуты против 15,6 на 131 380 парах). Соблазн взять
+    ускорение велик — и здесь записано, чем за него платят: результат расходится
+    в ШЕСТНАДЦАТОМ знаке, потому что умножение матрицы на матрицу и на вектор
+    складывают числа в разном порядке.
+
+    На печать в четырёх знаках это не влияет никак. И всё же взят медленный
+    путь: правка была о ПАМЯТИ, и поменять числа заодно с ней значило бы лишить
+    владельца возможности сверить новый вывод со старым. Проверка фиксирует
+    факт расхождения — чтобы следующий, кому захочется ускорить, увидел цену
+    сразу, а не искал её сам.
+    """
+    from scripts.trailing_stats import (
+        BOOTSTRAP_SEED,
+        bootstrap_diff,
+        bootstrap_means,
+        interval,
+    )
+
+    rng = np.random.default_rng(9_1_3)
+    values = rng.normal(size=(60, 13))
+    fixed = values[:, 0]
+
+    diffs = values[:, 1:] - fixed[:, None]
+    cloud = bootstrap_means(diffs, resamples=500, seed=BOOTSTRAP_SEED)
+    exact = 0
+    for column in range(12):
+        _mean, lo, hi = bootstrap_diff(
+            values[:, column + 1], fixed, resamples=500, seed=BOOTSTRAP_SEED
+        )
+        lo2, hi2 = interval(cloud[:, column])
+        # Совпадение с точностью печати — да; побитовое — нет.
+        assert lo == pytest.approx(lo2, abs=1e-12)
+        assert hi == pytest.approx(hi2, abs=1e-12)
+        if (lo, hi) == (lo2, hi2):
+            exact += 1
+    assert exact < 12, (
+        "общий вызов вдруг стал побитово равен двенадцати отдельным — "
+        "размен, описанный в докстринге, больше не нужен, и комментарий "
+        "в scripts/trailing_resample_9_1_3.py надо переписать"
+    )
+
+    # А в самом скрипте по-прежнему стоит медленный, побитово верный путь.
+    source = (_ROOT / "scripts" / "trailing_resample_9_1_3.py").read_text(
+        encoding="utf-8"
+    )
+    assert "bootstrap_diff(" in source
+    assert "bootstrap_means(" not in source
+
+
+def test_the_memory_estimate_is_printed_and_refuses_when_it_will_not_fit(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Расчёт, не помещающийся в лимит, ОТКАЗЫВАЕТСЯ с числами, а не умирает.
+
+    Убитый ядром процесс печатает код возврата 137 и оборванный вывод,
+    неотличимый от вывода расчёта, который посчитал и промолчал. Прочитав лимит
+    заранее, скрипт отказывается сам — и решение о лимите принимает владелец.
+    """
+    import scripts.trailing_resample_9_1_3 as script
+
+    monkeypatch.setattr(script, "cgroup_memory_limit_mb", lambda: 1024.0)
+    assert script.print_memory_verdict(100) is None
+    out = capsys.readouterr().out
+    assert "Лимит контейнера: 1,024 МБ" in out
+    assert "бюджет расчёта: 512 МБ" in out
+
+    # Выборка, которой заведомо не хватит бюджета.
+    refusal = script.print_memory_verdict(200_000_000)
+    assert refusal is not None and "бюджете" in refusal
+
+    # Лимита нет — расчёт не отказывается: отказывать не от чего.
+    monkeypatch.setattr(script, "cgroup_memory_limit_mb", lambda: None)
+    assert script.print_memory_verdict(10_000_000) is None
+    assert "Лимит памяти контейнера не задан" in capsys.readouterr().out
+
+
+async def test_part_a_prints_peak_memory_and_a_completion_marker(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Пиковая память печатается, и вывод оканчивается признаком завершения.
+
+    Без признака оборванный вывод неотличим от полного — тот же класс дефекта,
+    что измеритель, печатающий невозможное число.
+    """
+    import scripts.trailing_resample_9_1_3 as script
+
+    pool = _ResamplePool(_resample_rows())
+    assert await _run_resample(monkeypatch, pool) == 0
+    out = capsys.readouterr().out
+    assert "Пиковая память:" in out
+    assert script.DONE_MARKER
+    assert out.rstrip().endswith(script.DONE_MARKER)
+    assert "ПРИЗНАК ЗАВЕРШЕНИЯ" in out
+
+
 async def test_part_a_returns_three_on_an_empty_table(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1076,7 +1418,10 @@ def test_every_stage_query_passes_the_schema_check() -> None:
         await real.position_trailing_shadow_exists()
         await real.get_positions_for_shadow()
         await real.count_positions_for_shadow()
-        await real.get_trailing_resample_rows()
+        await real.fetch_trailing_resample_batch()
+        await real.fetch_trailing_resample_batch(
+            after=(datetime(2026, 8, 29, tzinfo=UTC), 7, 4)
+        )
         await real.save_position_trailing_shadow([{
             "position_id": 1, "variant": CONTROL_VARIANT,
             "activation_frac": None, "pullback_frac": None,
