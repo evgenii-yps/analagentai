@@ -911,14 +911,23 @@ class _ResamplePool(SchemaPool):
         if "FROM trailing_outcomes" not in sql:
             return []
         self.batches += 1
+        # ДВОЙНИК ДЕЛАЕТ РОВНО ТО, ЧТО НАПИСАНО В ЗАПРОСЕ. Первая редакция
+        # применяла ключ-границу и предел порции сама, независимо от текста SQL,
+        # и контрольный опыт показал это прямо: удаление ``LIMIT`` из запроса не
+        # роняло ни одной проверки — двойник продолжал резать порции за базу.
+        # Это ровно тот случай «двойник мягче настоящей системы», из-за которого
+        # на Этапе 9.1.2.2 боевой прогон падал на зелёном стенде.
         after, limit = (args[0], args[1], args[2]), args[3]
         rows = self.rows
-        if after[0] is not None:
-            rows = [
-                r for r in rows
-                if (r["ts"], int(r["signal_id"]), int(r["horizon_h"])) > after
-            ]
-        return project(sql, rows[: int(limit)])
+        if "(s.ts, t.signal_id, t.horizon_h) > ($1, $2, $3)" in sql:
+            if after[0] is not None:
+                rows = [
+                    r for r in rows
+                    if (r["ts"], int(r["signal_id"]), int(r["horizon_h"])) > after
+                ]
+        if "LIMIT $4" in sql:
+            rows = rows[: int(limit)]
+        return project(sql, rows)
 
 
 def _resample_rows(pairs: int = 60) -> list[dict[str, Any]]:
@@ -1214,6 +1223,42 @@ def test_a_pair_split_across_two_batches_is_not_lost_or_halved() -> None:
     assert composition.pairs == 17
     assert rows_read == len(rows), "строки посчитаны дважды или потеряны"
     assert pool.batches > 5, "порции оказались слишком крупными для проверки"
+
+
+def test_a_cursor_that_stops_moving_raises_instead_of_looping_forever() -> None:
+    """Граница чтения, не двигающаяся вперёд, роняет расчёт, а не крутит цикл.
+
+    НАЙДЕНО КОНТРОЛЬНЫМ ОПЫТОМ. Убрав ключ-границу из запроса, я получил не
+    падение проверки, а ВЕЧНЫЙ ЦИКЛ: каждая порция возвращала одно и то же
+    начало таблицы. Снаружи это неотличимо от долгого счёта — тот же класс
+    дефекта, что тихий обрыв, из-за которого правка и понадобилась.
+
+    Теперь такой случай распознаётся сразу и называется словами.
+    """
+    import asyncio
+
+    import scripts.trailing_resample_9_1_3 as script
+    from src.core.db import db as real_db
+
+    class _StuckPool(_ResamplePool):
+        """Пул, который игнорирует ключ-границу — как запрос без неё."""
+
+        async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
+            return await super().fetch(
+                sql.replace("(s.ts, t.signal_id, t.horizon_h) > ($1, $2, $3)",
+                            "TRUE"),
+                *args,
+            )
+
+    pool = _StuckPool(_resample_rows(pairs=17))
+    real_db._pool = pool  # type: ignore[assignment]
+    original = type(script.db).TRAILING_RESAMPLE_BATCH
+    try:
+        type(script.db).TRAILING_RESAMPLE_BATCH = 20
+        with pytest.raises(RuntimeError, match="не сдвинулась вперёд"):
+            asyncio.run(script.stream_sample())
+    finally:
+        type(script.db).TRAILING_RESAMPLE_BATCH = original
 
 
 def test_one_shared_bootstrap_would_differ_in_the_sixteenth_digit() -> None:
