@@ -760,6 +760,42 @@ async def test_signals_of_different_tokens_in_one_window_both_remain(
     )
 
 
+async def test_control_experiment_a_key_without_the_instrument_halves_the_sample(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """КОНТРОЛЬНЫЙ ОПЫТ к ключу прореживания с ИНСТРУМЕНТОМ.
+
+    Проверка выше обязана ловить именно наличие инструмента в ключе. Здесь то же
+    прореживание считается ключом БЕЗ инструмента — и от двух наблюдений
+    остаётся одно. На пяти токенах так исчезли бы четыре пятых выборки, и
+    исчезли бы молча: счётчик показал бы меньшее число, ничего не объяснив.
+    """
+    signals = [
+        signal_row(1, price=105.0),
+        signal_row(2, ts=SIGNAL_TS + timedelta(minutes=1),
+                   instrument_id=OTHER_INSTRUMENT, price=105.0),
+    ]
+    series = flat_series(days_before=7.5, days_after=1.0)
+    pool = _RangePool(
+        instruments=INSTRUMENTS,
+        signals=signals,
+        bars={INSTRUMENT: series, OTHER_INSTRUMENT: list(series)},
+        outcomes=[outcome_row(1), outcome_row(2)],
+    )
+    scan, counters = await run_scan(pool, monkeypatch)
+
+    with_instrument = {
+        (int(iid), rangepos.independent_window(float(ts)))
+        for iid, ts in zip(scan.instrument_id.values, scan.ts_epoch.values,
+                           strict=True)
+    }
+    without_instrument = {
+        rangepos.independent_window(float(ts)) for ts in scan.ts_epoch.values
+    }
+    assert len(with_instrument) == counters.independent == 2
+    assert len(without_instrument) == 1, "опыт построен неверно: окна разные"
+
+
 async def test_the_next_window_opens_a_new_independent_slot(
     monkeypatch: pytest.MonkeyPatch
 ) -> None:
