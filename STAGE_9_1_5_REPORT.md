@@ -479,4 +479,41 @@ $ git ls-remote origin main
 
 ## §13. Хэш `main` после слияния
 
-Заполняется после `git push`; снят командой `git ls-remote origin main`.
+Слияние выполнено `--no-ff` и отправлено. Хэш снят **`git ls-remote origin main`**,
+а не из локального remote-tracking ref (см. замечание в §12):
+
+```
+$ git ls-remote origin main
+e9c1b815f4966f474af87e311361682e15c15c68	refs/heads/main
+
+$ git ls-remote origin claude/weekly-range-position-measurement-z4samw
+48cd147…	refs/heads/claude/weekly-range-position-measurement-z4samw
+```
+
+**`main` = `e9c1b815f4966f474af87e311361682e15c15c68`** (`e9c1b81`), было
+`52abfd8`. Ветка `claude/weekly-range-position-measurement-z4samw` не удалена
+и указывает на `48cd147` — последний коммит перед слиянием; сам коммит слияния
+`e9c1b81` живёт только в `main`, как и полагается при `--no-ff`.
+
+Слитое дерево проверено **ДО** пуша: **853 проверки пройдено, 75 пропущено**,
+`ruff check .` — `All checks passed!`, отпечаток решений `decision` тот же
+(`323 случая, 1f12d5d2…de18d`), запрещённые §1 каталоги не изменены ни одной
+строкой (`git diff --stat` по ним пуст).
+
+Изменения этапа целиком — семь файлов, **4342 строки, все добавлением**:
+
+```
+ STAGE_9_1_5_REPORT.md                              |  482 ++
+ db/migrations/023_signal_range_position.sql        |  148 ++
+ db/migrations/023_signal_range_position_rollback.sql |  25 ++
+ scripts/range_position_9_1_5.py                    | 1717 ++
+ src/core/db.py                                     |  286 ++
+ tests/schema_double.py                             |   17 ++
+ tests/test_stage_9_1_5.py                          | 1667 ++
+```
+
+> **Оговорка к строке отчёта выше.** Этот раздел дописан ПОСЛЕ слияния, поэтому
+> сам он в коммит `e9c1b81` не входит и приходит в `main` следующим слиянием.
+> Написать здесь хэш заранее было нельзя: он не существовал; подставить
+> заполнитель и назвать его хэшем — значило бы сообщить число, которого никто
+> не снимал.
