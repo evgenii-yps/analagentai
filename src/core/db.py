@@ -1886,6 +1886,292 @@ class DB:
         )
         return [dict(row) for row in rows]
 
+    # ------------------------------------------------------------------
+    # Этап 9.1.5: положение цены сигнала в НЕДЕЛЬНОМ РАЗМАХЕ. ЗАМЕР.
+    #
+    # Все методы ниже ЧИТАЮТ факт и пишут ровно одну производную таблицу
+    # signal_range_position. Ни signals, ни ohlcv, ни signal_targets, ни
+    # signal_outcomes_barrier ими не изменяются.
+    # ------------------------------------------------------------------
+
+    async def signal_range_position_exists(self) -> bool:
+        """Есть ли таблица замера (миграция 023 могла быть не применена).
+
+        СХЕМА ЗДЕСЬ НЕ ДУБЛИРУЕТСЯ, как и в 9.1.3 и 9.1.4. Второй экземпляр той
+        же схемы — это два места, знающих одно и то же, и они однажды
+        разойдутся. Пусть лучше скрипт скажет «примените миграцию 023», чем
+        заведёт таблицу, которая чуть-чуть не такая, как в файле миграции.
+        """
+        return bool(
+            await self.pool.fetchval(
+                "SELECT to_regclass('signal_range_position') IS NOT NULL;"
+            )
+        )
+
+    async def get_range_position_instruments(
+        self, *, timeframe: str
+    ) -> list[dict[str, Any]]:
+        """Инструменты с направленными сигналами и САМЫЙ РАННИЙ бар каждого.
+
+        ЗАЧЕМ ЗДЕСЬ САМЫЙ РАННИЙ БАР. Окно замера — семь суток НАЗАД от
+        сигнала, а минутные свечи живут ``RETENTION_1M_DAYS`` суток. У сигнала,
+        чьё окно начинается раньше первого сохранившегося бара, окна нет вовсе,
+        и посчитать по обрезку значило бы выдать размах трёх суток за размах
+        семи. Первый бар инструмента — это ровно та граница, левее которой
+        полного окна не бывает; она читается ОДИН РАЗ на инструмент, а не на
+        каждый из десятков тысяч сигналов.
+        """
+        rows = await self.pool.fetch(
+            """
+            SELECT i.id AS instrument_id, i.base AS token,
+                   min(o.ts) AS first_bar_ts,
+                   max(o.ts) AS last_bar_ts
+            FROM instruments i
+            LEFT JOIN ohlcv o
+              ON o.instrument_id = i.id AND o.timeframe = $1
+            WHERE EXISTS (
+                SELECT 1 FROM signals s
+                WHERE s.instrument_id = i.id AND s.decision <> 'wait'
+            )
+            GROUP BY i.id, i.base
+            ORDER BY i.id;
+            """,
+            str(timeframe),
+        )
+        return [dict(row) for row in rows]
+
+    async def count_range_position_signals(self) -> dict[str, int]:
+        """Сколько направленных сигналов есть всего и сколько из них с исходом.
+
+        ДВА ЧИСЛА, А НЕ ОДНО (§4 ТЗ, ЧИСЛО 1). «Сигналов всего» и «сигналов, по
+        которым Этап 8.8 успел посчитать исход» — разные величины, и разница
+        между ними это не потеря замера, а состояние расчёта исходов. Печатать
+        одно вместо другого значило бы объявить недосчитанное несуществующим.
+        """
+        row = await self.pool.fetchrow(
+            """
+            SELECT count(*) AS directional_total,
+                   count(*) FILTER (
+                       WHERE EXISTS (
+                           SELECT 1 FROM signal_outcomes_barrier b
+                           WHERE b.signal_id = s.id
+                       )
+                   ) AS with_outcome
+            FROM signals s
+            WHERE s.decision <> 'wait';
+            """
+        )
+        if row is None:
+            return {"directional_total": 0, "with_outcome": 0}
+        return {
+            "directional_total": int(row["directional_total"] or 0),
+            "with_outcome": int(row["with_outcome"] or 0),
+        }
+
+    # Порции чтения. Подобраны так, чтобы обращений к базе были сотни, а не
+    # десятки тысяч, и чтобы ни одна порция не стоила больше нескольких
+    # десятков мегабайт Python-объектов: на Этапе 9.1.3 полная загрузка
+    # выборки была убита ядром по ``mem_limit: 1g`` дважды подряд.
+    RANGE_POSITION_SIGNALS_BATCH = 10_000
+    RANGE_POSITION_BARS_BATCH = 20_000
+    RANGE_POSITION_OUTCOMES_BATCH = 20_000
+
+    async def fetch_range_position_signals_batch(
+        self,
+        *,
+        instrument_id: int,
+        after: tuple[datetime, int] | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Порция сигналов ОДНОГО инструмента в порядке времени. ТОЛЬКО ЧТЕНИЕ.
+
+        ЦЕНА СИГНАЛА БЕРЁТСЯ ИЗ ЗАМОРОЖЕННОЙ СТРОКИ ``signal_targets``, а не из
+        свечи и не из цены входа позиции (§2.2 ТЗ). В самой таблице ``signals``
+        колонки с ценой нет вовсе — это проверяемый факт схемы, а не мнение, —
+        и единственная цена, ЗАПИСАННАЯ В МОМЕНТ РЕШЕНИЯ, лежит именно там.
+        Цена входа позиции не годится принципиально: позиция открывается ПОСЛЕ
+        сигнала и по другой цене, и подстановка её сюда сдвинула бы положение в
+        размахе на величину, которой в момент решения ещё не существовало.
+
+        ``DISTINCT ON (s.id)`` с ``ORDER BY s.id, t.horizon_h`` берёт строку
+        МЛАДШЕГО горизонта. Цена решения у всех горизонтов одна и та же —
+        она замораживается один раз на сигнал, — но выбирать её надо
+        ОПРЕДЕЛЁННЫМ правилом, а не «какая попадётся»: молчаливая зависимость
+        от порядка строк однажды дала бы два разных числа на одних данных.
+
+        ПОРЯДОК — ПО ВРЕМЕНИ СИГНАЛА, затем по идентификатору. Расчёт положения
+        идёт ОДНИМ проходом по барам с подвижными минимумом и максимумом, и
+        этот проход требует, чтобы сигналы приходили строго по возрастанию
+        времени: окно следующего сигнала не может начинаться раньше окна
+        предыдущего. Сменить порядок значило бы сломать сам способ счёта.
+
+        Граница порции — ключ ``(ts, id)``, а не ``OFFSET``: ``OFFSET``
+        заставил бы базу перечитывать пропущенное, и сотая порция стоила бы как
+        сто первых.
+        """
+        limit = self.RANGE_POSITION_SIGNALS_BATCH if limit is None else int(limit)
+        rows = await self.pool.fetch(
+            """
+            SELECT q.signal_id, q.ts, q.logic_version, q.decision,
+                   q.price_at_signal
+            FROM (
+                SELECT DISTINCT ON (s.id)
+                       s.id AS signal_id, s.ts, s.logic_version, s.decision,
+                       t.price_at_signal
+                FROM signals s
+                JOIN signal_targets t ON t.signal_id = s.id
+                WHERE s.instrument_id = $1
+                  AND s.decision <> 'wait'
+                  AND EXISTS (
+                      SELECT 1 FROM signal_outcomes_barrier b
+                      WHERE b.signal_id = s.id
+                  )
+                ORDER BY s.id, t.horizon_h
+            ) q
+            WHERE $2::timestamptz IS NULL OR (q.ts, q.signal_id) > ($2, $3)
+            ORDER BY q.ts, q.signal_id
+            LIMIT $4;
+            """,
+            int(instrument_id),
+            None if after is None else after[0],
+            None if after is None else int(after[1]),
+            int(limit),
+        )
+        return [dict(row) for row in rows]
+
+    async def fetch_range_position_bars_batch(
+        self,
+        *,
+        instrument_id: int,
+        timeframe: str,
+        ts_from: datetime,
+        after_ts: datetime | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Порция баров ОДНОГО инструмента в порядке времени. ТОЛЬКО ЧТЕНИЕ.
+
+        ПОЧЕМУ ПОРЦИЯМИ, А НЕ ЦЕЛИКОМ, И ПОЧЕМУ ЭТО ВАЖНО ИМЕННО ЗДЕСЬ. Окно
+        замера — семь суток минутных баров, то есть около 10 080 штук НА КАЖДЫЙ
+        сигнал. Прочитать окно отдельным запросом на сигнал значило бы прочитать
+        сотни миллионов строк и пересчитать минимум с максимумом заново каждый
+        раз. Здесь бары читаются ОДИН РАЗ по инструменту в порядке времени, а
+        окно ведётся подвижными минимумом и максимумом поверх этого потока.
+
+        Возвращаются ровно ``ts``, ``low`` и ``high``: ни ``open``, ни
+        ``close``, ни ``volume`` в размах не входят, и читать их значило бы
+        втрое увеличить объём порции ради полей, которые никто не смотрит.
+        """
+        limit = self.RANGE_POSITION_BARS_BATCH if limit is None else int(limit)
+        rows = await self.pool.fetch(
+            """
+            SELECT ts, low, high
+            FROM ohlcv
+            WHERE instrument_id = $1
+              AND timeframe = $2
+              AND ts >= $3
+              AND ($4::timestamptz IS NULL OR ts > $4)
+            ORDER BY ts
+            LIMIT $5;
+            """,
+            int(instrument_id), str(timeframe), ts_from, after_ts, int(limit),
+        )
+        return [dict(row) for row in rows]
+
+    async def fetch_range_position_outcomes_batch(
+        self,
+        *,
+        after: tuple[int, int] | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Порция ИСХОДОВ Этапа 8.8 для таблиц §4. ТОЛЬКО ЧТЕНИЕ.
+
+        ИСХОД НЕ СЧИТАЕТСЯ ЗАНОВО. Таблица ``signal_outcomes_barrier`` и её
+        колонка ``outcome`` — это уже посчитанное правило «цель–предел–срок»
+        Этапа 8.8, а ``net_pnl_pct`` — чистый итог С ТЕМИ ЖЕ ИЗДЕРЖКАМИ, что в
+        живом расчёте (они записаны в ту же строку колонкой ``cost_pct``).
+        Второй экземпляр этой арифметики однажды разошёлся бы с первым, и тогда
+        замер мерил бы собственную ошибку.
+
+        ``ambiguous`` и ``no_data`` отсюда НЕ отфильтрованы намеренно: у них
+        ``net_pnl_pct IS NULL``, их численность обязана быть напечатана в
+        составе выборки, и решение, что с ними делать, принимает расчёт, а не
+        запрос. Тихая фильтрация в SQL сделала бы их несуществующими.
+        """
+        limit = self.RANGE_POSITION_OUTCOMES_BATCH if limit is None else int(limit)
+        rows = await self.pool.fetch(
+            """
+            SELECT b.signal_id, b.horizon_h, b.direction, b.outcome,
+                   b.net_pnl_pct, b.logic_version, s.ts, s.instrument_id,
+                   i.base AS token
+            FROM signal_outcomes_barrier b
+            JOIN signals s ON s.id = b.signal_id
+            JOIN instruments i ON i.id = s.instrument_id
+            WHERE $1::bigint IS NULL
+               OR (b.signal_id, b.horizon_h) > ($1, $2)
+            ORDER BY b.signal_id, b.horizon_h
+            LIMIT $3;
+            """,
+            None if after is None else int(after[0]),
+            None if after is None else int(after[1]),
+            int(limit),
+        )
+        return [dict(row) for row in rows]
+
+    async def save_signal_range_position(self, rows: list[dict[str, Any]]) -> int:
+        """Пачка строк замера. Возвращает число отправленных строк.
+
+        ИДЕМПОТЕНТНОСТЬ ЗДЕСЬ СТРОЖЕ, ЧЕМ В 9.1.4, И НАМЕРЕННО. Условие
+        ``WHERE`` при ``DO UPDATE`` не даёт перезаписать строку, у которой ВСЕ
+        значения совпали, — а значит, повторный прогон на тех же данных не
+        двигает даже ``computed_at``. Простой ``DO UPDATE`` без условия
+        переписывал бы метку времени каждым прогоном, и требование §7 ТЗ
+        «повторный прогон не меняет ни числа строк, ни значений» выполнялось бы
+        только на словах.
+        """
+        if not rows:
+            return 0
+        await self.pool.executemany(
+            """
+            INSERT INTO signal_range_position (
+                signal_id, window_days, range_low, range_high,
+                range_width_pct, pos, last_bar_ts, bars_in_window, resolution
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            ON CONFLICT (signal_id, window_days) DO UPDATE SET
+                range_low       = EXCLUDED.range_low,
+                range_high      = EXCLUDED.range_high,
+                range_width_pct = EXCLUDED.range_width_pct,
+                pos             = EXCLUDED.pos,
+                last_bar_ts     = EXCLUDED.last_bar_ts,
+                bars_in_window  = EXCLUDED.bars_in_window,
+                resolution      = EXCLUDED.resolution,
+                computed_at     = now()
+            WHERE signal_range_position.range_low
+                      IS DISTINCT FROM EXCLUDED.range_low
+               OR signal_range_position.range_high
+                      IS DISTINCT FROM EXCLUDED.range_high
+               OR signal_range_position.range_width_pct
+                      IS DISTINCT FROM EXCLUDED.range_width_pct
+               OR signal_range_position.pos IS DISTINCT FROM EXCLUDED.pos
+               OR signal_range_position.last_bar_ts
+                      IS DISTINCT FROM EXCLUDED.last_bar_ts
+               OR signal_range_position.bars_in_window
+                      IS DISTINCT FROM EXCLUDED.bars_in_window
+               OR signal_range_position.resolution
+                      IS DISTINCT FROM EXCLUDED.resolution;
+            """,
+            [
+                (
+                    int(r["signal_id"]), int(r["window_days"]),
+                    _num(r["range_low"]), _num(r["range_high"]),
+                    _num(r["range_width_pct"]), _num(r["pos"]),
+                    r["last_bar_ts"], int(r["bars_in_window"]),
+                    str(r["resolution"]),
+                )
+                for r in rows
+            ],
+        )
+        return len(rows)
+
     async def get_positions_sheet_marks(
         self, position_ids: list[int]
     ) -> list[dict[str, Any]]:
