@@ -118,6 +118,23 @@ def schema() -> dict[str, set[str]]:
         "position_stop_shadow",
     )
 
+    # Этап 9.1.5. Замер положения в недельном размахе читает ЗАМОРОЖЕННУЮ цену
+    # решения и уже посчитанный исход, а пишет одну свою таблицу. Без этих трёх
+    # имён двойник пропускал бы ссылки на их колонки молча — то есть был бы
+    # мягче настоящей базы ровно там, где этап и работает.
+    out["signal_targets"] = table_columns(
+        (migrations / "014_risk_targets.sql").read_text(encoding="utf-8"),
+        "signal_targets",
+    )
+    out["signal_outcomes_barrier"] = table_columns(
+        (migrations / "015_barrier_outcomes.sql").read_text(encoding="utf-8"),
+        "signal_outcomes_barrier",
+    )
+    out["signal_range_position"] = table_columns(
+        (migrations / "023_signal_range_position.sql").read_text(encoding="utf-8"),
+        "signal_range_position",
+    )
+
     # Колонки, добавленные к signals миграциями и кодом выгрузки, — иначе
     # двойник объявил бы исправные запросы неверными.
     for path in sorted(migrations.glob("*.sql")):
