@@ -2172,6 +2172,127 @@ class DB:
         )
         return len(rows)
 
+    # --- Этап 9.1.6: замер правила «ожидание возврата в плюс до 48 часов» ---
+    #
+    # ВЫБОРКА ПОЗИЦИЙ ЗДЕСЬ НЕ ЗАВОДИТСЯ ЗАНОВО. Она та же, что у Этапов 9.1.3
+    # и 9.1.4: ``get_positions_for_shadow`` отбирает закрытые позиции без
+    # ``data_gap``, а одна версия логики (§5.1 ТЗ) отбирается из уже
+    # прочитанного столбца ``logic_version`` в самом скрипте. Второй запрос с
+    # тем же смыслом однажды разошёлся бы с первым, и разошёлся бы МОЛЧА: два
+    # замера на «одной и той же» выборке дали бы несравнимые числа.
+    #
+    # ПИШЕТ ЭТАП ТОЛЬКО В ``position_plus_exit_shadow``. ``positions``,
+    # ``signals``, ``ohlcv`` и ``signal_targets`` не изменяются ни одной
+    # строкой (§1.3 ТЗ).
+
+    async def count_positions_by_logic_version(self) -> list[dict[str, Any]]:
+        """Состав таблицы позиций ПО ВЕРСИЯМ ЛОГИКИ. ТОЛЬКО ЧТЕНИЕ.
+
+        ЗАЧЕМ ОТДЕЛЬНЫЙ СЧЁТЧИК, КОГДА ЕСТЬ ``count_positions_for_shadow``. Тот
+        считает по всей таблице сразу, а §5.1 ТЗ 9.1.6 запрещает смешивать
+        версии логики и требует НАЗВАТЬ версию и число позиций. Сузить
+        существующий счётчик параметром значило бы менять поведение метода,
+        которым пользуется Этап 9.1.4, — то есть трогать чужой замер ради
+        своего. Здесь считаются все версии сразу, а выбирает одну вызывающий:
+        тогда видно и то, что версия в базе не одна, если это так.
+
+        Возвращает по строке на версию: сколько закрытых, сколько из них
+        ``data_gap`` и сколько ещё открыто.
+        """
+        rows = await self.pool.fetch(
+            """
+            SELECT logic_version,
+                   count(*) FILTER (WHERE status = 'closed') AS closed_total,
+                   count(*) FILTER (WHERE status = 'closed'
+                                      AND exit_reason = 'data_gap') AS data_gap,
+                   count(*) FILTER (WHERE status = 'open') AS still_open
+            FROM positions
+            GROUP BY logic_version
+            ORDER BY logic_version;
+            """
+        )
+        return [dict(row) for row in rows]
+
+    async def position_plus_exit_shadow_exists(self) -> bool:
+        """Есть ли таблица замера (миграция 024 могла быть не применена).
+
+        СХЕМА ЗДЕСЬ НЕ ДУБЛИРУЕТСЯ, как и в 9.1.3 и 9.1.4. Второй экземпляр той
+        же схемы — это два места, знающих одно и то же, и они однажды
+        разойдутся. Пусть лучше скрипт скажет «примените миграцию 024», чем
+        заведёт таблицу, которая чуть-чуть не такая, как в файле миграции.
+        """
+        return bool(
+            await self.pool.fetchval(
+                "SELECT to_regclass('position_plus_exit_shadow') IS NOT NULL;"
+            )
+        )
+
+    async def save_position_plus_exit_shadow(
+        self, rows: list[dict[str, Any]]
+    ) -> int:
+        """Пачка строк замера. Возвращает число отправленных строк.
+
+        ИДЕМПОТЕНТНОСТЬ ПО ОБРАЗЦУ 9.1.5, А НЕ 9.1.4, И ЭТО ТРЕБОВАНИЕ §7.5 ТЗ:
+        «повторный прогон не должен менять ни числа строк, ни значений».
+        Условие ``WHERE`` при ``DO UPDATE`` не даёт перезаписать строку, у
+        которой совпали все значения, — а значит, второй прогон на тех же
+        данных не двигает даже ``computed_at``. Простой ``DO UPDATE`` без
+        условия переписывал бы метку времени каждым прогоном, и требование
+        выполнялось бы только на словах.
+        """
+        if not rows:
+            return 0
+        await self.pool.executemany(
+            """
+            INSERT INTO position_plus_exit_shadow (
+                position_id, variant, logic_version, exit_reason, exit_bar_ts,
+                closed_at, exit_price, net_pnl_pct, net_pnl_usd, held_hours,
+                bars_used, resolution
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            ON CONFLICT (position_id, variant, logic_version) DO UPDATE SET
+                exit_reason = EXCLUDED.exit_reason,
+                exit_bar_ts = EXCLUDED.exit_bar_ts,
+                closed_at   = EXCLUDED.closed_at,
+                exit_price  = EXCLUDED.exit_price,
+                net_pnl_pct = EXCLUDED.net_pnl_pct,
+                net_pnl_usd = EXCLUDED.net_pnl_usd,
+                held_hours  = EXCLUDED.held_hours,
+                bars_used   = EXCLUDED.bars_used,
+                resolution  = EXCLUDED.resolution,
+                computed_at = now()
+            WHERE position_plus_exit_shadow.exit_reason
+                      IS DISTINCT FROM EXCLUDED.exit_reason
+               OR position_plus_exit_shadow.exit_bar_ts
+                      IS DISTINCT FROM EXCLUDED.exit_bar_ts
+               OR position_plus_exit_shadow.closed_at
+                      IS DISTINCT FROM EXCLUDED.closed_at
+               OR position_plus_exit_shadow.exit_price
+                      IS DISTINCT FROM EXCLUDED.exit_price
+               OR position_plus_exit_shadow.net_pnl_pct
+                      IS DISTINCT FROM EXCLUDED.net_pnl_pct
+               OR position_plus_exit_shadow.net_pnl_usd
+                      IS DISTINCT FROM EXCLUDED.net_pnl_usd
+               OR position_plus_exit_shadow.held_hours
+                      IS DISTINCT FROM EXCLUDED.held_hours
+               OR position_plus_exit_shadow.bars_used
+                      IS DISTINCT FROM EXCLUDED.bars_used
+               OR position_plus_exit_shadow.resolution
+                      IS DISTINCT FROM EXCLUDED.resolution;
+            """,
+            [
+                (
+                    int(r["position_id"]), str(r["variant"]),
+                    int(r["logic_version"]), str(r["exit_reason"]),
+                    r.get("exit_bar_ts"), r.get("closed_at"),
+                    _num(r.get("exit_price")), _num(r.get("net_pnl_pct")),
+                    _num(r.get("net_pnl_usd")), _num(r.get("held_hours")),
+                    int(r["bars_used"]), str(r["resolution"]),
+                )
+                for r in rows
+            ],
+        )
+        return len(rows)
+
     async def get_positions_sheet_marks(
         self, position_ids: list[int]
     ) -> list[dict[str, Any]]:

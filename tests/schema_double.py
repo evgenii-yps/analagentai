@@ -135,6 +135,17 @@ def schema() -> dict[str, set[str]]:
         "signal_range_position",
     )
 
+    # Этап 9.1.6. Замер правила «ожидание возврата в плюс до 48 часов» пишет
+    # одну свою таблицу. Без этого имени двойник пропускал бы ссылки на её
+    # колонки молча — то есть был бы мягче настоящей базы ровно там, где этап
+    # и работает.
+    out["position_plus_exit_shadow"] = table_columns(
+        (migrations / "024_position_plus_exit_shadow.sql").read_text(
+            encoding="utf-8"
+        ),
+        "position_plus_exit_shadow",
+    )
+
     # Колонки, добавленные к signals миграциями и кодом выгрузки, — иначе
     # двойник объявил бы исправные запросы неверными.
     for path in sorted(migrations.glob("*.sql")):
