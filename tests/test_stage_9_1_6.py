@@ -159,9 +159,52 @@ def _hold(high: float, low: float, close: float, minutes: int
     return [(high, low, close)] * minutes
 
 
+def stored_levels(entry: float, target_pct: float, stop_pct: float
+                  ) -> tuple[float, float]:
+    """Уровни ТАК, КАК ИХ ХРАНИТ БАЗА: ``rules.levels`` плюс NUMERIC(20,8).
+
+    Ровно этот путь проходит цена при открытии позиции: живой сервис считает
+    уровни формулой, а колонка округляет их до восьми знаков. Пересчёт, не
+    повторивший округление, разошёлся с боевым фактом 06.09.2026 на трёх
+    позициях DOGE — см. §А ТЗ.
+    """
+    target, stop = position_rules.levels(entry, target_pct, stop_pct)
+    return (
+        plus.to_storage(target, plus.PRICE_STORAGE_PLACES),
+        plus.to_storage(stop, plus.PRICE_STORAGE_PLACES),
+    )
+
+
+def resolve_with(module: Any, bars: list[Bar], **over: Any) -> Any:
+    """Расчёт указанным модулем — исправным или подделанным контрольным опытом.
+
+    Уровни приходят ОДНИМ способом в обоих случаях: опыт обязан проверять
+    ровно тот дефект, который в него внесли, а не разницу в том, как тест
+    позвал функцию.
+    """
+    entry = float(over.get("entry_price", ENTRY))
+    target_pct = float(over.get("target_pct", TARGET_PCT))
+    stop_pct = float(over.get("stop_pct", STOP_PCT))
+    target_price, stop_price = stored_levels(entry, target_pct, stop_pct)
+    kwargs: dict[str, Any] = {
+        "entry_price": entry, "target_pct": target_pct, "stop_pct": stop_pct,
+        "fact_target_price": target_price, "fact_stop_price": stop_price,
+        "cost_pct": COST_PCT, "notional_usd": SLOT, "side": "buy",
+        "opened_at": OPENED, "fact_deadline_at": DEADLINE_24,
+        "resolution": "1m",
+    }
+    kwargs.update(over)
+    return module.resolve_position(bars, **kwargs)
+
+
 def resolve(bars: list[Bar], **over: Any) -> dict[str, plus.PlusOutcome]:
+    entry = float(over.get("entry_price", ENTRY))
+    target_pct = float(over.get("target_pct", TARGET_PCT))
+    stop_pct = float(over.get("stop_pct", STOP_PCT))
+    target_price, stop_price = stored_levels(entry, target_pct, stop_pct)
     kwargs: dict[str, Any] = {
         "entry_price": ENTRY, "target_pct": TARGET_PCT, "stop_pct": STOP_PCT,
+        "fact_target_price": target_price, "fact_stop_price": stop_price,
         "cost_pct": COST_PCT, "notional_usd": SLOT, "side": "buy",
         "opened_at": OPENED, "fact_deadline_at": DEADLINE_24,
         "resolution": "1m",
@@ -386,9 +429,13 @@ def test_the_breakeven_price_gives_exactly_zero_by_construction() -> None:
             price = plus.breakeven_price(
                 entry, cost, side="buy", gross=False
             )
+            # Цена приведена к точности хранения (§А 2.2), поэтому ноль здесь —
+            # с точностью до ПОЛОВИНЫ ТИКА, и допуск считается от цены входа, а
+            # не берётся константой: константа по BTC пропустила бы DOGE.
             assert position_rules.net_pnl(entry, price, cost) == pytest.approx(
-                0.0, abs=1e-9
+                0.0, abs=plus.flat_tolerance(entry)
             )
+            assert price == plus.to_storage(price, plus.PRICE_STORAGE_PLACES)
 
 
 def test_the_cost_rate_comes_from_the_position_and_not_from_settings() -> None:
@@ -449,10 +496,15 @@ def test_the_target_level_comes_from_the_live_levels_function() -> None:
     """
     with pytest.raises(ValueError, match="предел должен быть положительным"):
         position_rules.levels(ENTRY, TARGET_PCT, 0.0)
-    body = code_only(inspect.getsource(plus.resolve_variant))
+    # ПРАВКА §А 2.4: уровень БЕРЁТСЯ из строки позиции — это самый точный способ
+    # повторить случившееся, — а ``levels`` стоит на пути расчёта ПРОВЕРКОЙ.
+    body = code_only(inspect.getsource(plus.assert_levels_match_row))
     assert "position_rules.levels(" in body
+    assert "assert_levels_match_row(" in code_only(
+        inspect.getsource(plus.resolve_variant)
+    )
+    rows = resolve(TARGET_ON_FIRST_DAY)
     for variant in plus.variant_names():
-        rows = resolve(TARGET_ON_FIRST_DAY)
         assert rows[variant].exit_price == pytest.approx(102.0)
 
 
@@ -871,12 +923,7 @@ def test_control_experiment_1_shifting_the_24_hour_boundary_by_one_bar() -> None
     # Исправный код на этом же ряде исхода даёт.
     assert resolve(DIP_THEN_BREAKEVEN)["B_nostop_plus_48"].exit_reason == "plus_exit"
     with pytest.raises(ValueError, match="граница первых суток"):
-        broken.resolve_position(
-            DIP_THEN_BREAKEVEN, entry_price=ENTRY, target_pct=TARGET_PCT,
-            stop_pct=STOP_PCT, cost_pct=COST_PCT, notional_usd=SLOT,
-            side="buy", opened_at=OPENED, fact_deadline_at=DEADLINE_24,
-            resolution="1m",
-        )
+        resolve_with(broken, DIP_THEN_BREAKEVEN)
 
 
 def test_control_experiment_2_allowing_an_unclosed_bar_into_the_calculation() -> None:
@@ -915,12 +962,7 @@ def test_control_experiment_3_using_the_bar_close_instead_of_the_breakeven() -> 
     good = resolve(DIP_THEN_BREAKEVEN)["B_nostop_plus_48"]
     assert good.net_pnl_pct == pytest.approx(0.0, abs=1e-12)
     with pytest.raises(ValueError, match="цена выхода не равна цене безубытка"):
-        broken.resolve_position(
-            DIP_THEN_BREAKEVEN, entry_price=ENTRY, target_pct=TARGET_PCT,
-            stop_pct=STOP_PCT, cost_pct=COST_PCT, notional_usd=SLOT,
-            side="buy", opened_at=OPENED, fact_deadline_at=DEADLINE_24,
-            resolution="1m",
-        )
+        resolve_with(broken, DIP_THEN_BREAKEVEN)
 
 
 def test_control_experiment_4_turning_variant_b_into_variant_d() -> None:
@@ -943,12 +985,7 @@ def test_control_experiment_4_turning_variant_b_into_variant_d() -> None:
     with pytest.raises(ValueError, match="валовой плюс считает не тот вариант"):
         broken.assert_variant_contract()
     with pytest.raises(ValueError, match="валовой плюс считает не тот вариант"):
-        broken.resolve_position(
-            DIP_THEN_BREAKEVEN, entry_price=ENTRY, target_pct=TARGET_PCT,
-            stop_pct=STOP_PCT, cost_pct=COST_PCT, notional_usd=SLOT,
-            side="buy", opened_at=OPENED, fact_deadline_at=DEADLINE_24,
-            resolution="1m",
-        )
+        resolve_with(broken, DIP_THEN_BREAKEVEN)
 
 
 def test_control_experiment_5_widening_the_control_tolerance_to_two_digits() -> None:
@@ -988,6 +1025,290 @@ def test_control_experiment_6_dropping_the_insufficient_future_bars_filter() -> 
     assert broken.covers_full_window(OPENED, young, "1m") is True
     with pytest.raises(ValueError, match="не покрывает"):
         broken.assert_sample_covered(OPENED, young, "1m")
+
+
+# =============================================================================
+# ПРАВКА §А. Округление вычисленной цены — тем же способом, каким округляет база
+# =============================================================================
+
+# ТРИ БОЕВЫЕ ПОЗИЦИИ DOGE, НА КОТОРЫХ ВСТАЛ ХОЛОСТОЙ ПРОГОН 06.09.2026.
+# instrument_id=285, exit_reason='target', target_pct=1.002750, cost_pct=0.220000.
+# Пересчёт давал у всех трёх РОВНО 0.782750 = target_pct − cost_pct; факт
+# отличался в шестом знаке, и сторона отличия совпадала со стороной округления
+# цены цели колонкой NUMERIC(20,8). Числа взяты из §А ТЗ дословно.
+DOGE_TARGET_PCT = 1.002750
+DOGE_CASES: tuple[tuple[float, float, float], ...] = (
+    #  цена входа, цель как она лежит в базе, записанный итог
+    (0.08223, 0.08305456, 0.782748),   # округление ВНИЗ
+    (0.08324, 0.08407469, 0.782751),   # округление ВВЕРХ
+    (0.08730, 0.08817540, 0.782749),   # округление ВНИЗ
+)
+
+
+def doge_bars(target_price: float) -> list[Bar]:
+    """Ряд, на котором цель берётся первым же баром и держится до срока."""
+    high = target_price * 1.001
+    return bars_from(
+        [(high, target_price * 0.999, high)]
+        + _hold(high, target_price, high, MINUTES - 1)
+    )
+
+
+def doge_fact(entry: float, target_price: float, net: float) -> dict[str, Any]:
+    return {
+        "id": 1, "exit_reason": "target",
+        "closed_at": OPENED + timedelta(minutes=1),
+        "exit_price": target_price, "net_pnl_pct": net,
+    }
+
+
+def test_the_storage_rounding_is_the_one_postgres_uses_not_pythons() -> None:
+    """§А 2.1: способ округления взят ИЗ БАЗЫ, а не из головы.
+
+    PostgreSQL округляет NUMERIC половиной ОТ НУЛЯ; встроенный ``round()``
+    Python — половиной К ЧЁТНОМУ. На половинах они расходятся, и подставить
+    ``round()`` значило бы завести второе, чуть другое округление рядом с
+    базой. Числа ниже сверены запросом к настоящему PostgreSQL 16.
+    """
+    assert plus.PRICE_STORAGE_PLACES == 8
+    assert plus.PCT_STORAGE_PLACES == 6
+    # ``0.000000005::numeric(20,8)`` на настоящей базе даёт 0.00000001.
+    assert plus.to_storage(0.000000005, 8) == pytest.approx(0.00000001)
+    assert plus.to_storage(-0.000000005, 8) == pytest.approx(-0.00000001)
+    assert plus.to_storage(0.000000015, 8) == pytest.approx(0.00000002)
+    assert plus.to_storage(0.000000025, 8) == pytest.approx(0.00000003)
+    # А ``round()`` на двух из них дал бы другое — потому его здесь и нет.
+    assert round(0.000000015, 8) != plus.to_storage(0.000000015, 8)
+    assert round(0.000000025, 8) != plus.to_storage(0.000000025, 8)
+
+
+@pytest.mark.parametrize(("entry", "target_price", "net"), DOGE_CASES)
+def test_the_three_live_mismatches_of_06_09_2026_now_reproduce_exactly(
+    entry: float, target_price: float, net: float
+) -> None:
+    """§А 4.1: три позиции, остановившие боевой прогон, сходятся до знака.
+
+    ЭТО ПРОВЕРКА НА ВОЗВРАТ ДЕФЕКТА, А НЕ НА ПРАВИЛО. Она держит ровно то
+    место, где пересчёт разошёлся с фактом: цену цели, округлённую базой.
+    """
+    stored_target, stored_stop = stored_levels(entry, DOGE_TARGET_PCT, STOP_PCT)
+    assert stored_target == pytest.approx(target_price, abs=1e-12)
+
+    rows = plus.resolve_position(
+        doge_bars(stored_target), entry_price=entry,
+        target_pct=DOGE_TARGET_PCT, stop_pct=STOP_PCT,
+        fact_target_price=stored_target, fact_stop_price=stored_stop,
+        cost_pct=COST_PCT, notional_usd=SLOT, side="buy", opened_at=OPENED,
+        fact_deadline_at=DEADLINE_24, resolution="1m",
+    )
+    control = rows["control"]
+    assert control.exit_reason == "target"
+    assert control.exit_price == pytest.approx(target_price, abs=1e-12)
+    assert plus.to_storage(control.net_pnl_pct, 6) == pytest.approx(net)
+    assert plus.compare_control(doge_fact(entry, target_price, net), control) == []
+
+    # И то, что было до правки: цель без округления даёт РОВНО
+    # target_pct − cost_pct у всех трёх — тот самый признак из §А 1 ТЗ.
+    raw_target, _ = position_rules.levels(entry, DOGE_TARGET_PCT, STOP_PCT)
+    raw_net = position_rules.net_pnl(entry, raw_target, COST_PCT)
+    assert plus.to_storage(raw_net, 6) == pytest.approx(
+        DOGE_TARGET_PCT - COST_PCT
+    )
+    assert plus.to_storage(raw_net, 6) != pytest.approx(net)
+
+
+def test_the_breakeven_price_is_rounded_like_the_column_too() -> None:
+    """§А 2.2: округляются ВСЕ три вычисляемые цены, включая Pbe.
+
+    §3.6 основного ТЗ задавал Pbe формулой и про округление молчал. Цена
+    безубытка — такая же вычисленная цена, как цель и предел, и оставить её
+    неокруглённой значило бы мерить итог ``plus_exit`` более точной ценой, чем
+    итог ``target``.
+    """
+    for entry in (0.08223, 0.08730, 100.0, 63_412.77):
+        price = plus.breakeven_price(entry, COST_PCT, side="buy", gross=False)
+        assert price == plus.to_storage(price, plus.PRICE_STORAGE_PLACES)
+    # У DOGE округление видно глазом: 0.08223 × 1.0022 = 0.082410906.
+    assert plus.breakeven_price(
+        0.08223, COST_PCT, side="buy", gross=False
+    ) == pytest.approx(0.08241091, abs=1e-12)
+    # Валовой безубыток — сама цена входа, она уже в точности хранения.
+    assert plus.breakeven_price(
+        0.08223, COST_PCT, side="buy", gross=True
+    ) == pytest.approx(0.08223)
+
+
+def test_a_level_that_no_rule_could_have_produced_stops_the_calculation() -> None:
+    """§А 2.4: уровень из строки берётся, но не принимается на веру.
+
+    Допуск — ОДИН ТИК ХРАНЕНИЯ, и он не подобран, а выведен: при открытии
+    позиции ``levels`` считалась от ``ohlcv.close`` (DOUBLE PRECISION), а
+    ``positions.entry_price`` — это NUMERIC(20,8), то есть та же цена,
+    округлённая. Сдвиг цены входа не больше полутика, множитель близок к
+    единице, значит уровень сдвинется не больше чем на тик. Больше — значит
+    уровень посчитан другим правилом.
+    """
+    stored_target, stored_stop = stored_levels(ENTRY, TARGET_PCT, STOP_PCT)
+    tick = plus.storage_tick(plus.PRICE_STORAGE_PLACES)
+    # Сдвиг ровно на тик объясним округлением цены входа — расчёт идёт дальше.
+    plus.assert_levels_match_row(
+        entry_price=ENTRY, target_pct=TARGET_PCT, stop_pct=STOP_PCT,
+        fact_target_price=stored_target + tick, fact_stop_price=stored_stop,
+    )
+    # Сдвиг на сто тиков объяснения не имеет.
+    with pytest.raises(ValueError, match="уровень цели"):
+        plus.assert_levels_match_row(
+            entry_price=ENTRY, target_pct=TARGET_PCT, stop_pct=STOP_PCT,
+            fact_target_price=stored_target + 100 * tick,
+            fact_stop_price=stored_stop,
+        )
+    with pytest.raises(ValueError, match="уровень предела"):
+        plus.assert_levels_match_row(
+            entry_price=ENTRY, target_pct=TARGET_PCT, stop_pct=STOP_PCT,
+            fact_target_price=stored_target,
+            fact_stop_price=stored_stop - 100 * tick,
+        )
+
+
+def test_the_guard_stands_on_the_path_of_every_variant() -> None:
+    """Проверка уровней вызывается ИЗ расчёта, а не лежит рядом с ним."""
+    assert "assert_levels_match_row(" in code_only(
+        inspect.getsource(plus.resolve_variant)
+    )
+
+
+def test_control_experiment_8_dropping_the_rounding_of_a_computed_price() -> None:
+    """ОПЫТ 8 (§А 3): у вычисленной цены выхода снято округление.
+
+    ЭТО ВОЗВРАТ ИМЕННО ТОГО ДЕФЕКТА, что остановил боевой прогон: уровни снова
+    считаются формулой в ``float``, минуя точность хранения. Контроль обязан
+    упасть.
+
+    И ВТОРАЯ ПОЛОВИНА ОПЫТА, РАДИ КОТОРОЙ §3 ТЗ ТРЕБУЕТ ЦЕНУ ПОРЯДКА 0.08: НА
+    BTC ТОТ ЖЕ ДЕФЕКТ ПРОХОДИТ МОЛЧА. У монеты по 78 000 восьмой знак цены на
+    семь порядков меньше, чем у монеты по 0.08, и в шестом знаке
+    ``net_pnl_pct`` его не видно. Опыт, поставленный на BTC, был бы зелёным при
+    внесённом дефекте — ровно тот случай, ради которого писан §9.3 основного ТЗ.
+    """
+    broken = mutated(
+        "    stop_price = float(fact_stop_price) if spec.keeps_stop "
+        "else NO_STOP_PRICE",
+        "    target_price, _own = position_rules.levels(\n"
+        "        entry_price, target_pct, stop_pct\n"
+        "    )\n"
+        "    stop_price = _own if spec.keeps_stop else NO_STOP_PRICE",
+    )
+
+    # --- на DOGE контроль падает на всех трёх боевых позициях ---
+    for entry, target_price, net in DOGE_CASES:
+        stored_target, stored_stop = stored_levels(
+            entry, DOGE_TARGET_PCT, STOP_PCT
+        )
+        fact = doge_fact(entry, target_price, net)
+        common: dict[str, Any] = {
+            "entry_price": entry, "target_pct": DOGE_TARGET_PCT,
+            "stop_pct": STOP_PCT, "fact_target_price": stored_target,
+            "fact_stop_price": stored_stop, "cost_pct": COST_PCT,
+            "notional_usd": SLOT, "side": "buy", "opened_at": OPENED,
+            "fact_deadline_at": DEADLINE_24, "resolution": "1m",
+        }
+        bars = doge_bars(stored_target)
+        assert plus.compare_control(
+            fact, plus.resolve_position(bars, **common)["control"]
+        ) == [], "исправный код обязан сойтись с фактом"
+        problems = broken.compare_control(
+            fact, broken.resolve_position(bars, **common)["control"]
+        )
+        assert problems, f"дефект не пойман на DOGE {entry}"
+        assert any("net_pnl_pct" in problem for problem in problems)
+
+    # --- на BTC ТОТ ЖЕ дефект проходит молча ---
+    btc_entry = 78_000.0
+    btc_target, btc_stop = stored_levels(btc_entry, DOGE_TARGET_PCT, STOP_PCT)
+    btc_common: dict[str, Any] = {
+        "entry_price": btc_entry, "target_pct": DOGE_TARGET_PCT,
+        "stop_pct": STOP_PCT, "fact_target_price": btc_target,
+        "fact_stop_price": btc_stop, "cost_pct": COST_PCT,
+        "notional_usd": SLOT, "side": "buy", "opened_at": OPENED,
+        "fact_deadline_at": DEADLINE_24, "resolution": "1m",
+    }
+    btc_bars = doge_bars(btc_target)
+    btc_control = plus.resolve_position(btc_bars, **btc_common)["control"]
+    btc_fact = {
+        "id": 2, "exit_reason": "target",
+        "closed_at": OPENED + timedelta(minutes=1),
+        "exit_price": plus.to_storage(btc_control.exit_price, 8),
+        "net_pnl_pct": plus.to_storage(btc_control.net_pnl_pct, 6),
+    }
+    assert broken.compare_control(
+        btc_fact, broken.resolve_position(btc_bars, **btc_common)["control"]
+    ) == [], (
+        "опыт на BTC обязан пройти молча — в этом и состоит его вторая половина"
+    )
+
+
+def test_control_experiment_9_computing_the_result_from_percentages() -> None:
+    """ОПЫТ 9 (§А 3): возвращён короткий путь «итог из процентов, минуя цены».
+
+    КОРОТКОГО ПУТИ В КОДЕ НИКОГДА НЕ БЫЛО — равенство ``target_pct − cost_pct``
+    выходило само, потому что цель не округлялась (см. опыт 8). Здесь он
+    внесён ЯВНО: итог считается из процента, приведённого к точности хранения,
+    а не из цены выхода. Контроль обязан упасть.
+    """
+    broken = mutated(
+        "    if decision.exit_reason != position_rules.EXIT_TIMEOUT:\n"
+        "        return _finish(",
+        "    if decision.exit_reason != position_rules.EXIT_TIMEOUT:\n"
+        "        if decision.exit_reason == position_rules.EXIT_TARGET:\n"
+        "            _row = _finish(\n"
+        "                variant=spec.name, exit_reason=decision.exit_reason,\n"
+        "                exit_bar_ts=decision.exit_bar_ts,\n"
+        "                exit_price=decision.exit_price,\n"
+        "                entry_price=entry_price, cost_pct=cost_pct,\n"
+        "                notional_usd=notional_usd, opened_at=opened_at,\n"
+        "                resolution=resolution, bars_used=decision.bars_held,\n"
+        "            )\n"
+        "            return PlusOutcome(**{\n"
+        "                **_row.__dict__,\n"
+        "                'net_pnl_pct': target_pct - float(cost_pct),\n"
+        "            })\n"
+        "        return _finish(",
+    )
+    for entry, target_price, net in DOGE_CASES:
+        stored_target, stored_stop = stored_levels(
+            entry, DOGE_TARGET_PCT, STOP_PCT
+        )
+        common: dict[str, Any] = {
+            "entry_price": entry, "target_pct": DOGE_TARGET_PCT,
+            "stop_pct": STOP_PCT, "fact_target_price": stored_target,
+            "fact_stop_price": stored_stop, "cost_pct": COST_PCT,
+            "notional_usd": SLOT, "side": "buy", "opened_at": OPENED,
+            "fact_deadline_at": DEADLINE_24, "resolution": "1m",
+        }
+        bars = doge_bars(stored_target)
+        fact = doge_fact(entry, target_price, net)
+        assert plus.compare_control(
+            fact, plus.resolve_position(bars, **common)["control"]
+        ) == []
+        problems = broken.compare_control(
+            fact, broken.resolve_position(bars, **common)["control"]
+        )
+        assert problems, f"короткий путь не пойман на DOGE {entry}"
+        assert any("net_pnl_pct" in problem for problem in problems)
+
+
+def test_the_result_is_computed_from_the_exit_price_and_not_from_percentages() -> None:
+    """§А 2.3: итог считается ИЗ ЦЕН. Короткого пути в файле нет.
+
+    Проверка смотрит в исполняемый код, минуя пояснения: разбор дефекта в
+    заголовке файла цитирует ``target_pct − cost_pct``, и запретить объяснять,
+    что случилось, было бы неверно.
+    """
+    body = code_only(_SCRIPT.read_text(encoding="utf-8"))
+    assert "position_rules.net_pnl(entry_price, exit_price, cost_pct)" in body
+    for shortcut in ("target_pct - cost_pct", "target_pct - float(cost_pct)",
+                     "target_pct / 100.0 - cost_pct"):
+        assert shortcut not in body
 
 
 def test_control_experiment_zero_a_mutation_that_changes_nothing_fails() -> None:

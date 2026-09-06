@@ -111,6 +111,7 @@ import statistics
 import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -266,6 +267,49 @@ CONTROL_TOLERANCE = 1e-8
 
 SECONDS_IN_HOUR = 3600.0
 
+
+def to_storage(value: float, places: int) -> float:
+    """Приведение числа к точности колонки ТЕМ ЖЕ СПОСОБОМ, КАКИМ ЭТО ДЕЛАЕТ БАЗА.
+
+    ПРАВКА §А ОТ 06.09.2026, И ПРИЧИНА ЕЁ УСТАНОВЛЕНА ВОСПРОИЗВЕДЕНИЕМ, А НЕ
+    ПРЕДПОЛОЖЕНА. Боевой холостой прогон встал на трёх позициях DOGE с исходом
+    ``target``: пересчёт давал ровно ``target_pct − cost_pct``, а факт отличался
+    в шестом знаке — то в одну сторону, то в другую. Разбор:
+
+      * живой сервис при ЗАКРЫТИИ позиции берёт цель НЕ ИЗ ФОРМУЛЫ, а из
+        строки: ``check_exit(target_price=float(row["target_price"]), …)``
+        (``src/positions/runner.py``). А ``positions.target_price`` — колонка
+        NUMERIC(20,8), и записанное в неё число УЖЕ ОКРУГЛЕНО базой до восьми
+        знаков;
+      * пересчёт же считал цель формулой в ``float`` и получал неокруглённое
+        число. Оно отличается от записанного меньше чем на 1e-8 — но у монеты
+        по 0.08 доллара восьмой знак цены это порядка 1e-5 процента, и в шестом
+        знаке ``net_pnl_pct`` он ВИДЕН. У BTC по 78 000 он на семь порядков
+        меньше и невидим — потому расхождение и вышло только на DOGE;
+      * и только у исхода ``target``: там цена выхода ВЫЧИСЛЯЕТСЯ и потому
+        округляется при записи. У ``stop`` цена тоже вычислена, а у ``timeout``
+        взята из свечи; расхождение вышло на том исходе, что встретился.
+
+    СПОСОБ ОКРУГЛЕНИЯ ВЗЯТ ИЗ БАЗЫ, А НЕ ИЗ ГОЛОВЫ, и это важнее точности.
+    PostgreSQL округляет NUMERIC **половиной ОТ НУЛЯ**: проверено запросом,
+    ``0.000000005::numeric(20,8)`` даёт ``0.00000001``, а
+    ``-0.000000005`` — ``-0.00000001``. Встроенный ``round()`` Python округляет
+    ПОЛОВИНОЙ К ЧЁТНОМУ и на том же числе даёт ``0.0`` — то есть разошёлся бы с
+    базой ровно на половинах. Поэтому здесь ``Decimal`` с ``ROUND_HALF_UP``.
+
+    Путь значения повторён целиком: ``_num`` в ``src/core/db.py`` делает
+    ``Decimal(str(float(value)))``, и уже это число округляет колонка.
+    """
+    quantum = Decimal(1).scaleb(-int(places))
+    return float(
+        Decimal(str(float(value))).quantize(quantum, rounding=ROUND_HALF_UP)
+    )
+
+
+def storage_tick(places: int) -> float:
+    """Единица последнего знака хранения: 1e-8 для цены, 1e-6 для процентов."""
+    return float(Decimal(1).scaleb(-int(places)))
+
 # Порог «плоскости» выхода в безубыток. Величина сравнивается с нулём после
 # арифметики на числах порядка 10^5 (цена) — точность double здесь около 1e-11
 # относительно, и 1e-9 в процентах на порядки выше любого настоящего
@@ -301,13 +345,23 @@ def breakeven_price(
     if cost_pct < 0:
         raise ValueError(f"издержки не могут быть отрицательными: {cost_pct}")
     if gross:
+        # Валовой безубыток — сама цена входа. Она ПРИШЛА ИЗ КОЛОНКИ
+        # NUMERIC(20,8) и уже лежит в точности хранения; округлять её нечего.
         return float(entry_price)
     rate = float(cost_pct) / 100.0
     if side == position_rules.SIDE_BUY:
-        return float(entry_price) * (1.0 + rate)
-    if side == "sell":
-        return float(entry_price) * (1.0 - rate)
-    raise ValueError(f"неизвестное направление: {side!r}")
+        raw = float(entry_price) * (1.0 + rate)
+    elif side == "sell":
+        raw = float(entry_price) * (1.0 - rate)
+    else:
+        raise ValueError(f"неизвестное направление: {side!r}")
+    # ПРАВКА §А 2.2. Цена безубытка — ВЫЧИСЛЕННАЯ цена, и §3.6 основного ТЗ
+    # задавал её формулой, про округление не сказав. Ордер по цене, которой
+    # биржа не знает, не исполняется; и, что важнее для замера, цена выхода
+    # обязана лежать в той же точности, что и все прочие цены, — иначе итог
+    # ``plus_exit`` считался бы по более точной цене, чем итог ``target``, и
+    # два варианта мерились бы разными линейками.
+    return to_storage(raw, PRICE_STORAGE_PLACES)
 
 
 def phase_deadlines(
@@ -478,13 +532,33 @@ def _unmeasured(variant: str, resolution: str, bars_used: int) -> PlusOutcome:
     )
 
 
+def flat_tolerance(entry_price: float) -> float:
+    """Насколько итог выхода в безубыток вправе отличаться от нуля.
+
+    ПРАВКА §А. Цена безубытка теперь ПРИВОДИТСЯ К ТОЧНОСТИ ХРАНЕНИЯ, и потому
+    отличается от точной цены безубытка не больше чем на ПОЛОВИНУ ТИКА. В
+    процентах это ``100 × полтика / цена входа``: у монеты по 0.08 доллара —
+    около 6e-6 процента, у BTC — около 6e-12. Требовать здесь ноль значило бы
+    требовать цены, которой не бывает в базе; допускать больше — перестать
+    ловить подмену.
+
+    Величина СЧИТАЕТСЯ ОТ ЦЕНЫ ВХОДА, а не берётся константой: константа,
+    подобранная по BTC, пропустила бы DOGE, а подобранная по DOGE — не поймала
+    бы на BTC ничего.
+    """
+    half_tick = 0.5 * storage_tick(PRICE_STORAGE_PLACES)
+    return 100.0 * half_tick / float(entry_price) + FLAT_EPS
+
+
 def assert_plus_exit_is_flat(
-    outcome: PlusOutcome, *, cost_pct: float, gross: bool
+    outcome: PlusOutcome, *, entry_price: float, cost_pct: float, gross: bool
 ) -> None:
     """СЛЕДСТВИЕ ПРАВИЛА, ПРОВЕРЯЕМОЕ НА КАЖДОЙ СДЕЛКЕ (§3.6 ТЗ).
 
-    Выход по цене безубытка даёт итог РОВНО НОЛЬ — так эта цена и определена.
-    У варианта D «плюс» валовой, и итог там равен ровно минус издержкам.
+    Выход по цене безубытка даёт итог НОЛЬ — так эта цена и определена; с
+    точностью до половины тика хранения цены (см. :func:`flat_tolerance`).
+    У варианта D «плюс» валовой, и итог там равен ровно минус издержкам: цена
+    входа уже лежит в точности хранения, и округлять её нечего.
 
     Проверка ловит сразу две подмены, каждая из которых оставляет числа
     правдоподобными: цену выхода, взятую по закрытию бара вместо цены
@@ -493,11 +567,12 @@ def assert_plus_exit_is_flat(
     if outcome.exit_reason != EXIT_PLUS or outcome.net_pnl_pct is None:
         return
     expected = -float(cost_pct) if gross else 0.0
-    if abs(float(outcome.net_pnl_pct) - expected) > FLAT_EPS:
+    limit = FLAT_EPS if gross else flat_tolerance(entry_price)
+    if abs(float(outcome.net_pnl_pct) - expected) > limit:
         raise ValueError(
             f"выход в безубыток у варианта {outcome.variant} дал итог "
-            f"{outcome.net_pnl_pct:.10f}%, а обязан был дать {expected:.10f}%: "
-            "цена выхода не равна цене безубытка"
+            f"{outcome.net_pnl_pct:.10f}%, а обязан был дать {expected:.10f}% "
+            f"с точностью {limit:.3e}: цена выхода не равна цене безубытка"
         )
 
 
@@ -539,6 +614,57 @@ def _finish(
     )
 
 
+def assert_levels_match_row(
+    *,
+    entry_price: float,
+    target_pct: float,
+    stop_pct: float,
+    fact_target_price: float,
+    fact_stop_price: float,
+) -> None:
+    """ТА ЖЕ ``rules.levels`` — но ПРОВЕРКОЙ, а не источником (§А 2.4, §9.2 ТЗ).
+
+    ПОЧЕМУ УРОВНИ БЕРУТСЯ ИЗ СТРОКИ ПОЗИЦИИ, А НЕ СЧИТАЮТСЯ ЗАНОВО. Живой
+    сервис при закрытии передаёт в ``check_exit`` именно
+    ``float(row["target_price"])`` и ``float(row["stop_price"])``
+    (``src/positions/runner.py``) — числа, уже округлённые колонкой
+    NUMERIC(20,8). Это САМЫЙ ТОЧНЫЙ способ повторить случившееся, и §А 2.4 его
+    прямо предпочитает.
+
+    ПОЧЕМУ ПЕРЕСЧЁТ ЧЕРЕЗ ``levels`` ВСЁ РАВНО ДЕЛАЕТСЯ. Взять число из строки
+    и не спросить, откуда оно, значило бы принять на веру, что позицию открыло
+    ТО ЖЕ правило, которое лежит в репозитории. Здесь это утверждение
+    проверяется.
+
+    ПОЧЕМУ ДОПУСК — ОДИН ТИК ХРАНЕНИЯ, А НЕ НОЛЬ, И ПОЧЕМУ ЭТО НЕ ПОБЛАЖКА.
+    При ОТКРЫТИИ позиции ``levels`` считалась от ``float(bar["close"])``, а
+    ``ohlcv.close`` имеет тип DOUBLE PRECISION — полная точность double. В
+    ``positions.entry_price`` то же число легло уже округлённым до восьми
+    знаков (NUMERIC(20,8)). Пересчёт видит только округлённую цену входа,
+    поэтому обязан отличаться, и отличие ОГРАНИЧЕНО СВЕРХУ: сдвиг цены входа не
+    больше половины тика, множитель ``(1 ± pct/100)`` близок к единице, значит
+    сдвиг уровня не больше одного тика после округления. Разница БОЛЬШЕ тика
+    объяснения не имеет и означает, что уровень посчитан другим правилом, — и
+    тогда расчёт падает. Допуск сверки контроля (1e-8) при этом не тронут: это
+    другая величина и другой вопрос.
+    """
+    tick = storage_tick(PRICE_STORAGE_PLACES)
+    computed_target, computed_stop = position_rules.levels(
+        entry_price, target_pct, stop_pct
+    )
+    for name, computed, fact in (
+        ("цели", computed_target, fact_target_price),
+        ("предела", computed_stop, fact_stop_price),
+    ):
+        stored = to_storage(computed, PRICE_STORAGE_PLACES)
+        if abs(stored - float(fact)) > tick + CONTROL_TOLERANCE:
+            raise ValueError(
+                f"уровень {name} в строке позиции ({fact}) расходится с "
+                f"пересчётом той же rules.levels ({stored}) больше чем на один "
+                f"тик хранения ({tick}): уровень посчитан не тем правилом"
+            )
+
+
 def resolve_variant(
     bars: list[position_rules.Bar],
     *,
@@ -546,6 +672,8 @@ def resolve_variant(
     entry_price: float,
     target_pct: float,
     stop_pct: float,
+    target_price: float,
+    fact_stop_price: float,
     cost_pct: float,
     notional_usd: float,
     side: str,
@@ -577,15 +705,23 @@ def resolve_variant(
         # цены входа, а ``check_exit`` написан для покупки.
         raise ValueError(f"позиции ведутся только на покупку, получено: {side}")
 
-    # УРОВЕНЬ ЦЕЛИ СЧИТАЕТСЯ ТОЙ ЖЕ ``rules.levels``, что считала его при
-    # открытии позиции, и с ФАКТИЧЕСКИМ пределом позиции. Подставить в
-    # ``levels`` ноль ради варианта без предела нельзя: она отвергает
-    # ``stop_pct <= 0`` — и правильно делает. Отключается предел не здесь, а
-    # ценой предела (см. NO_STOP_PRICE и разбор в скрипте 9.1.4).
-    target_price, own_stop_price = position_rules.levels(
-        entry_price, target_pct, stop_pct
+    # УРОВНИ ЦЕЛИ И ПРЕДЕЛА ПРИХОДЯТ ИЗ СТРОКИ ПОЗИЦИИ — ровно те числа, что
+    # живой сервис передаёт в ``check_exit`` при закрытии, уже округлённые
+    # колонкой NUMERIC(20,8) (§А 2.4). Что они посчитаны той же
+    # ``rules.levels``, проверяется здесь же, НА ПУТИ РАСЧЁТА КАЖДОГО ВАРИАНТА,
+    # а не рядом с ним: проверка, стоящая в стороне от расчёта, однажды
+    # перестаёт вызываться и об этом никто не узнаёт.
+    assert_levels_match_row(
+        entry_price=entry_price,
+        target_pct=target_pct,
+        stop_pct=stop_pct,
+        fact_target_price=target_price,
+        fact_stop_price=fact_stop_price,
     )
-    stop_price = own_stop_price if spec.keeps_stop else NO_STOP_PRICE
+    # Отключается предел не уровнем, а ценой предела: ``levels`` отвергает
+    # ``stop_pct <= 0`` — и правильно делает (см. NO_STOP_PRICE и разбор в
+    # скрипте 9.1.4).
+    stop_price = float(fact_stop_price) if spec.keeps_stop else NO_STOP_PRICE
     plus_price = breakeven_price(
         entry_price, cost_pct, side=side, gross=spec.gross_plus
     )
@@ -698,7 +834,10 @@ def resolve_variant(
             resolution=resolution,
             bars_used=bars_used,
         )
-        assert_plus_exit_is_flat(outcome, cost_pct=cost_pct, gross=spec.gross_plus)
+        assert_plus_exit_is_flat(
+            outcome, entry_price=entry_price, cost_pct=cost_pct,
+            gross=spec.gross_plus,
+        )
         return outcome
 
     # Ни цель, ни плюс не достигнуты. Срок t0+48ч наступил — цена берётся по
@@ -797,6 +936,8 @@ def resolve_position(
     entry_price: float,
     target_pct: float,
     stop_pct: float,
+    fact_target_price: float,
+    fact_stop_price: float,
     cost_pct: float,
     notional_usd: float,
     side: str,
@@ -804,7 +945,15 @@ def resolve_position(
     fact_deadline_at: datetime,
     resolution: str,
 ) -> dict[str, PlusOutcome]:
-    """Пять исходов одной позиции на ОДНОМ и том же ряде свечей. ЧИСТАЯ функция."""
+    """Пять исходов одной позиции на ОДНОМ и том же ряде свечей. ЧИСТАЯ функция.
+
+    ``fact_target_price`` и ``fact_stop_price`` — уровни ИЗ СТРОКИ ПОЗИЦИИ
+    (§А 2.4): именно их живой сервис передаёт в ``check_exit`` при закрытии, и
+    именно они уже округлены колонкой NUMERIC(20,8). ``target_pct`` и
+    ``stop_pct`` при этом всё равно нужны — по ним
+    :func:`assert_levels_match_row` проверяет, что уровни в строке посчитаны той
+    же ``rules.levels``, а не взялись неизвестно откуда.
+    """
     assert_variant_contract()
     deadline_24, deadline_48 = phase_deadlines(opened_at, fact_deadline_at)
     assert_phase_boundary(opened_at, deadline_24, deadline_48)
@@ -818,6 +967,8 @@ def resolve_position(
             entry_price=entry_price,
             target_pct=target_pct,
             stop_pct=stop_pct,
+            target_price=float(fact_target_price),
+            fact_stop_price=float(fact_stop_price),
             cost_pct=cost_pct,
             notional_usd=notional_usd,
             side=side,
@@ -852,10 +1003,16 @@ def control_reason_of_fact(fact_reason: str) -> str:
 
 
 def _round(value: Any, places: int) -> float | None:
-    """Приведение к точности ХРАНЕНИЯ колонки. ``None`` остаётся ``None``."""
+    """Приведение к точности ХРАНЕНИЯ колонки. ``None`` остаётся ``None``.
+
+    ПРАВКА §А: приведение идёт через :func:`to_storage`, то есть тем же
+    способом, каким округляет база (половина ОТ НУЛЯ). Встроенный ``round()``
+    Python округляет половиной К ЧЁТНОМУ и разошёлся бы с базой ровно на
+    половинах — то есть дал бы ложное расхождение контроля там, где всё верно.
+    """
     if value is None:
         return None
-    return round(float(value), places)
+    return to_storage(value, places)
 
 
 def _differs(computed: Any, fact: Any, places: int) -> bool:
@@ -1486,6 +1643,8 @@ async def _run(args: argparse.Namespace, now: datetime) -> int:
                 entry_price=float(position["entry_price"]),
                 target_pct=float(position["target_pct"]),
                 stop_pct=float(position["stop_pct"]),
+                fact_target_price=float(position["target_price"]),
+                fact_stop_price=float(position["stop_price"]),
                 cost_pct=float(position["cost_pct"]),
                 notional_usd=float(position["notional_usd"]),
                 side=str(position["side"]),
