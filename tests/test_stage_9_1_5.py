@@ -50,6 +50,7 @@ import numpy as np
 import pytest
 
 import scripts.range_position_9_1_5 as rangepos
+from tests.conftest import CURRENT_LOGIC_VERSION
 from tests.schema_double import (
     SchemaPool,
     UndefinedColumn,
@@ -1308,7 +1309,7 @@ async def test_the_stage_does_not_touch_logic_version() -> None:
     """§1: LOGIC_VERSION остаётся 5 и скриптом не меняется."""
     from src.core.config import settings
 
-    assert settings.LOGIC_VERSION == 5
+    assert settings.LOGIC_VERSION == CURRENT_LOGIC_VERSION
     body = code_only(
         (_ROOT / "scripts" / "range_position_9_1_5.py").read_text(encoding="utf-8")
     )

@@ -387,7 +387,7 @@ class _Recorder:
     """Подменённый клиент листа: запоминает запросы, отвечает по сценарию."""
 
     def __init__(self, not_found: list[str] | None = None,
-                 ok: bool = True, version: str | None = "9.1.2.2",
+                 ok: bool = True, version: str | None = "9.2",
                  version_ok: bool = True) -> None:
         self.calls: list[dict[str, Any]] = []
         self.not_found = not_found or []
@@ -709,7 +709,7 @@ async def test_the_right_version_lets_the_export_through(
     никогда.
     """
     conn = _FakeConn([_position(id=1, status="open", closed_at=None)])
-    recorder = _Recorder(version="9.1.2.2")
+    recorder = _Recorder(version="9.2")
     created, updated = await _run_trades(monkeypatch, conn, recorder)
     assert (created, updated) == (1, 0)
     assert [call["mode"] for call in recorder.calls] == ["version", "table_append"]
@@ -725,13 +725,13 @@ def test_the_required_version_lives_in_one_place_and_is_compared_exactly(
     однажды ошибётся. «Ровно эта строка» ошибиться не может.
     """
     source = (_ROOT / "src" / "export_main.py").read_text(encoding="utf-8")
-    assert '_TRADES_RECEIVER_VERSION = "9.1.2.2"' in source
+    assert '_TRADES_RECEIVER_VERSION = "9.2"' in source
     assert "probe.receiver_version != _TRADES_RECEIVER_VERSION" in source
     # Версия НЕ зашита второй раз строкой рядом с запросом.
-    assert source.count('"9.1.2.2"') == 1, "версия зашита больше чем в одном месте"
+    assert source.count('"9.2"') == 1, "версия зашита больше чем в одном месте"
     # И она совпадает с той, что объявлена в приёмнике.
     receiver = (_ROOT / "deploy" / "apps_script.gs").read_text(encoding="utf-8")
-    assert "const RECEIVER_VERSION = '9.1.2.2';" in receiver
+    assert "const RECEIVER_VERSION = '9.2';" in receiver
 
 
 def test_the_version_probe_carries_nothing_and_names_the_real_sheet() -> None:
@@ -894,7 +894,7 @@ def test_the_receiver_declares_the_new_version_and_both_table_modes() -> None:
     записи не туда.
     """
     receiver = (_ROOT / "deploy" / "apps_script.gs").read_text(encoding="utf-8")
-    assert "const RECEIVER_VERSION = '9.1.2.2';" in receiver
+    assert "const RECEIVER_VERSION = '9.2';" in receiver
     assert "function tableAppend(" in receiver
     assert "function tableUpdate(" in receiver
     # Строка ищется СВЕРХУ и не ниже итогов, а не добавляется в конец листа.

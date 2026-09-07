@@ -251,10 +251,16 @@ lv_env="$(env_value LOGIC_VERSION "")"
 lv_db="$(psql_q "SELECT max(logic_version) FROM signals;")"
 # Формат с 'T' вместо пробела: psql_q сжимает пробелы, и «2026-08-21 06:30»
 # превратилось бы в «2026-08-2106:30».
-boundary="$(psql_q "SELECT to_char(started_at,'YYYY-MM-DD\"T\"HH24:MI') FROM logic_version_windows WHERE logic_version = ${lv_env:-5};")"
-[ "$lv_env" = "5" ] && ok "LOGIC_VERSION=5 в .env" \
-  || block "LOGIC_VERSION=${lv_env:-не задан}, ожидается 5 (§6)"
-[ "${lv_db:-0}" = "${lv_env:-5}" ] && ok "сигналы пишутся с logic_version=${lv_db}" \
+boundary="$(psql_q "SELECT to_char(started_at,'YYYY-MM-DD\"T\"HH24:MI') FROM logic_version_windows WHERE logic_version = ${lv_env:-6};")"
+# ЭТАП 9.2 §1.1 ПОДНЯЛ ВЕРСИЮ 5 → 6 РЕШЕНИЕМ ВЛАДЕЛЬЦА: у ПОЗИЦИИ изменилось
+# правило выхода. Проверка 8.1 требовала ровно пятёрки и с этого дня блокировала
+# бы законное состояние. Ожидаемое число вынесено в переменную: менять его
+# придётся осознанно, а не правкой условия в трёх местах.
+LOGIC_VERSION_EXPECTED="${LOGIC_VERSION_EXPECTED:-6}"
+[ "$lv_env" = "${LOGIC_VERSION_EXPECTED}" ] \
+  && ok "LOGIC_VERSION=${LOGIC_VERSION_EXPECTED} в .env" \
+  || block "LOGIC_VERSION=${lv_env:-не задан}, ожидается ${LOGIC_VERSION_EXPECTED} (§6 ТЗ 8.1, §1.1 ТЗ 9.2)"
+[ "${lv_db:-0}" = "${lv_env:-6}" ] && ok "сигналы пишутся с logic_version=${lv_db}" \
   || warn "в signals максимальная версия ${lv_db:-нет данных}, в .env ${lv_env}"
 if [ -n "$boundary" ]; then
   ok "граница версии зафиксирована: ${boundary} UTC"

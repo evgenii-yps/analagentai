@@ -45,6 +45,7 @@ from src.baseline.strategies import (
     risk_target_source,
 )
 from src.core.config import settings
+from tests.conftest import CURRENT_LOGIC_VERSION
 
 TEST_DSN = os.environ.get("AT_TEST_DSN", "")
 needs_db = pytest.mark.skipif(
@@ -191,7 +192,7 @@ def test_grid_of_an_empty_window_is_empty() -> None:
 
 def test_logic_version_is_not_raised() -> None:
     """LOGIC_VERSION остаётся 5: этап измеряет, а не меняет систему."""
-    assert settings.LOGIC_VERSION == 5
+    assert settings.LOGIC_VERSION == CURRENT_LOGIC_VERSION
 
 
 def test_stop_and_cost_are_not_duplicated_for_baselines() -> None:

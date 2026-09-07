@@ -42,6 +42,7 @@ from src.core.config import Settings, settings
 from src.core.db import DB
 from src.positions.rules import (
     EXIT_DATA_GAP,
+    EXIT_PLUS,
     EXIT_REASONS,
     REASON_NO_FREE_CAPITAL,
     REASON_NO_FRESH_BAR,
@@ -894,6 +895,26 @@ def _constraint_values(sql_text: str) -> list[str]:
     return re.findall(r"'([a-z_]+)'", block)
 
 
+def _constraint_value_blocks(sql_text: str) -> list[set[str]]:
+    """ВСЕ перечни ``positions_reason_chk`` в тексте, а не только первый.
+
+    В ``src/core/db.py`` их несколько: сервис гарантирует свою схему на чистом
+    томе (``POSITIONS_CHECKS``) и ДОПОЛНИТЕЛЬНО чинит ограничение на уже
+    существующей таблице — по одному блоку на миграцию, которая его меняла
+    (019 и 025). Брать первый попавшийся значило бы сверять действующий перечень
+    с блоком, который описывает промежуточное состояние.
+    """
+    out: list[set[str]] = []
+    for chunk in sql_text.split("positions_reason_chk")[1:]:
+        if "exit_reason IN" not in chunk:
+            continue
+        block = chunk.split("exit_reason IN", 1)[1].split(")", 1)[0]
+        values = set(re.findall(r"'([a-z_]+)'", block))
+        if values:
+            out.append(values)
+    return out
+
+
 def test_exit_reasons_are_exactly_the_constraint_of_migration_019() -> None:
     """§7.9: перечень исходов в коде и ограничение 019 — одно и то же.
 
@@ -903,21 +924,42 @@ def test_exit_reasons_are_exactly_the_constraint_of_migration_019() -> None:
     значение в ограничении так же опасно, как недостающее — оно разрешило бы
     записать причину, которой код не знает.
     """
+    # ПЕРЕЧЕНЬ РОС ДВАЖДЫ, И КАЖДАЯ МИГРАЦИЯ ОПИСЫВАЕТ СВОЁ СОСТОЯНИЕ. 019
+    # добавила data_gap к четырём значениям 018; 025 (Этап 9.2 §5.1) добавила
+    # шестое — plus_exit. Сверять сегодняшний EXIT_REASONS с текстом 019
+    # значило бы требовать от прошлой миграции знания о будущей.
     m019 = (_MIGRATIONS / "019_positions_data_gap.sql").read_text(
         encoding="utf-8"
     )
-    assert set(_constraint_values(m019)) == set(EXIT_REASONS)
+    assert set(_constraint_values(m019)) == set(EXIT_REASONS) - {EXIT_PLUS}
     assert EXIT_DATA_GAP in EXIT_REASONS
 
     # 018 описывала перечень ДО этого этапа: четыре значения, без data_gap.
     m018 = (_MIGRATIONS / "018_positions.sql").read_text(encoding="utf-8")
-    assert set(_constraint_values(m018)) == set(EXIT_REASONS) - {EXIT_DATA_GAP}
+    assert set(_constraint_values(m018)) == set(EXIT_REASONS) - {
+        EXIT_DATA_GAP, EXIT_PLUS
+    }
+
+    # 025 описывает ДЕЙСТВУЮЩИЙ перечень целиком — все шесть значений.
+    m025 = (_MIGRATIONS / "025_positions_no_stop.sql").read_text(
+        encoding="utf-8"
+    )
+    assert set(_constraint_values(m025)) == set(EXIT_REASONS)
 
     # И схема, которую сервис гарантирует при старте, знает то же самое: на
     # чистом томе миграции могли не применяться, и перечень из четырёх значений
     # отверг бы закрытие по пробелу — сервис падал бы на первой такой позиции.
     db_text = (_ROOT / "src" / "core" / "db.py").read_text(encoding="utf-8")
-    assert set(_constraint_values(db_text)) == set(EXIT_REASONS)
+    blocks = _constraint_value_blocks(db_text)
+    assert blocks, "в src/core/db.py не найдено ни одного positions_reason_chk"
+    # Хотя бы один блок описывает ДЕЙСТВУЮЩИЙ перечень целиком: именно он
+    # ставится на чистом томе. Остальные — ступени, по которым ограничение
+    # чинится на уже существующей таблице (019, затем 025), и каждая из них
+    # обязана быть подмножеством действующего перечня, а не содержать чего-то
+    # своего.
+    assert set(EXIT_REASONS) in blocks
+    for values in blocks:
+        assert values <= set(EXIT_REASONS), values - set(EXIT_REASONS)
 
 
 def test_the_rollback_of_019_restores_exactly_four_values() -> None:
@@ -932,7 +974,7 @@ def test_the_rollback_of_019_restores_exactly_four_values() -> None:
         encoding="utf-8"
     )
     assert set(_constraint_values(rollback)) == set(EXIT_REASONS) - {
-        EXIT_DATA_GAP
+        EXIT_DATA_GAP, EXIT_PLUS
     }
     assert "RAISE EXCEPTION" in rollback
     assert "data_gap" in rollback

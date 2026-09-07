@@ -23,6 +23,7 @@ import pytest
 
 from backtest.evaluate import Costs, gross_pnl_pct, net_pnl_pct
 from src.health import daily_report
+from tests.conftest import CURRENT_LOGIC_VERSION
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALL_SH = (ROOT / "deploy" / "install.sh").read_text(encoding="utf-8")
@@ -352,4 +353,4 @@ def test_decision_snapshot_is_byte_for_byte_unchanged() -> None:
 def test_logic_version_stays_at_five() -> None:
     from src.core.config import settings
 
-    assert settings.LOGIC_VERSION == 5
+    assert settings.LOGIC_VERSION == CURRENT_LOGIC_VERSION

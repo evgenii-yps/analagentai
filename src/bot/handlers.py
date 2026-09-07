@@ -617,6 +617,24 @@ def render_summary(
     return "\n".join(lines)
 
 
+# ПРИЧИНЫ ОТКАЗА ВО ВХОДЕ ЧЕЛОВЕЧЕСКИМ ЯЗЫКОМ (§7.2 ТЗ 9.2). Ключи — те же
+# машиночитаемые значения, что считает сервис позиций
+# (``src/positions/rules.REFUSAL_REASONS``); человеку показывается перевод.
+# Неизвестный ключ печатается как есть: новая причина в журнале лучше молчания.
+REFUSAL_RU: dict[str, str] = {
+    "not_buy": "решение не «покупать»",
+    "wrong_logic_version": "сигнал другой версии логики",
+    "degraded": "неполный кворум агентов",
+    "low_probability": "вероятность ниже порога",
+    "instrument_busy": "по инструменту уже есть позиция",
+    "slots_full": "все слоты заняты",
+    "signal_too_old": "сигнал устарел",
+    "no_fresh_bar": "нет свежей свечи для входа",
+    "no_frozen_target": "нет замороженной цели",
+    "no_free_capital": "не хватает свободных денег",
+}
+
+
 def render_positions(
     open_rows: list[dict[str, Any]],
     summary: dict[str, Any],
@@ -625,6 +643,8 @@ def render_positions(
     capital: dict[str, Any] | None = None,
     budget_usd: float = 0.0,
     slot_usd: float = 0.0,
+    logic_version: int | None = None,
+    refusals: dict[str, int] | None = None,
 ) -> str:
     """/positions: открытые виртуальные позиции и итог за окно (§10 ТЗ 9.1).
 
@@ -635,11 +655,21 @@ def render_positions(
     ВЫВОДА О ПРИБЫЛЬНОСТИ ЗДЕСЬ НЕТ И БЫТЬ НЕ ДОЛЖНО. На десятке позиций
     разница без доверительного интервала — впечатление, а не измерение.
     Печатаются числа; что они значат, решает не бот.
+
+    ВЕРСИИ ЛОГИКИ РАЗДЕЛЕНЫ (§1.4 ТЗ 9.2). Итог за окно считается по ОДНОЙ
+    версии, и она названа; накопленный итог печатается и общим числом, и по
+    версиям отдельно. Сложить средние двух правил выхода в одно число значило
+    бы описать смесь, а не систему.
     """
     lines = [
-        "<b>💼 Виртуальные позиции (Этап 9.1)</b>",
+        "<b>💼 Виртуальные позиции (Этап 9.2)</b>",
         "<i>Ордера на биржу не отправляются.</i>",
     ]
+    if logic_version is not None:
+        lines.append(
+            f"Версия правила выхода {logic_version}. "
+            "Прежние версии в итог за окно не входят."
+        )
 
     # ДВЕ СТРОКИ О ДЕНЬГАХ ПОД ЗАГОЛОВКОМ (Этап 9.1.1 §5.5). Занятый капитал и
     # накопленный итог стоят РАЗДЕЛЬНО и не складываются: прибыль не
@@ -654,6 +684,17 @@ def render_positions(
             f"Накопленный итог: {float(capital['realized_usd']):+.6f} USDT "
             "(не реинвестируется)"
         )
+        # РАЗБИВКА ПО ВЕРСИЯМ — И ТОЛЬКО КОГДА ВЕРСИЙ БОЛЬШЕ ОДНОЙ. При
+        # единственной версии строка «в т.ч. v6: …» повторяла бы строку выше и
+        # приучала бы не читать её вовсе.
+        by_version = capital.get("by_version") or []
+        if len(by_version) > 1:
+            parts = ", ".join(
+                f"v{int(item['logic_version'])}: "
+                f"{float(item['realized_usd']):+.6f} ({int(item['closed'])})"
+                for item in by_version
+            )
+            lines.append(f"По версиям правила (закрытых): {parts}")
     lines.append("")
 
     lines.append(f"<b>Открыто сейчас: {len(open_rows)}</b>")
@@ -678,12 +719,20 @@ def render_positions(
             "нереализованный итог с учётом издержек: "
             + (_pct(unreal) if unreal is not None else "— (нет свежей свечи)")
         )
-        lines.append(
-            f"цель {esc(_num_str(row['target_price']))} "
-            f"(+{float(row['target_pct']):.2f}%) · "
-            f"предел {esc(_num_str(row['stop_price']))} "
-            f"(−{float(row['stop_pct']):.2f}%)"
-        )
+        # У ВЕРСИИ 6 ПРЕДЕЛА НЕТ, И СТРОКА О НЁМ ИСЧЕЗАЕТ ЦЕЛИКОМ (§8.2 ТЗ
+        # 9.2). Прочерк на его месте читался бы как «предел есть, но неизвестен».
+        if row.get("stop_price") is None or row.get("stop_pct") is None:
+            lines.append(
+                f"цель {esc(_num_str(row['target_price']))} "
+                f"(+{float(row['target_pct']):.2f}%) · предела убытка нет"
+            )
+        else:
+            lines.append(
+                f"цель {esc(_num_str(row['target_price']))} "
+                f"(+{float(row['target_pct']):.2f}%) · "
+                f"предел {esc(_num_str(row['stop_price']))} "
+                f"(−{float(row['stop_pct']):.2f}%)"
+            )
         lines.append(left_txt)
 
     closed = int(summary.get("closed") or 0)
@@ -722,6 +771,19 @@ def render_positions(
             )
     else:
         lines.append("Закрытых позиций за окно нет.")
+
+    # СКОЛЬКО СИГНАЛОВ СИСТЕМА ПРОПУСТИЛА (§7.2 ТЗ 9.2). По замеру 9.1.6 слот
+    # при новом правиле занят в среднем 22.5 часа вместо 3.4, то есть отказ
+    # «слот занят» перестаёт быть редкостью. Число слотов при этом НЕ МЕНЯЕТСЯ
+    # (§7.1, §7.3 ТЗ): владелец должен увидеть цену этого решения, а не
+    # получить её молча компенсированной.
+    if refusals:
+        lines.append("")
+        lines.append(f"<b>Отказано во входе за {days} дней</b>")
+        for reason, count in sorted(
+            refusals.items(), key=lambda item: (-item[1], item[0])
+        ):
+            lines.append(f"{esc(REFUSAL_RU.get(reason, reason))}: {count}")
 
     return "\n".join(lines)
 

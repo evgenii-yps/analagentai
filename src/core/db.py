@@ -1339,6 +1339,63 @@ class DB:
             END $$;
             """
         )
+        # ШЕСТОЕ ЗНАЧЕНИЕ ПРИЧИНЫ ВЫХОДА И СНЯТОЕ NOT NULL (миграция 025) — на
+        # уже существующей таблице, по тому же образцу и по той же причине, что
+        # блок выше: миграция 025 могла быть не применена на работающем томе, и
+        # тогда версия 6 падала бы на первой же попытке открыть позицию без
+        # предела. Сервис по построению не падает — он записал бы это
+        # предупреждением в журнал, и позиций не открывалось бы НИ ОДНОЙ, а
+        # выглядело бы это как «сигналов нет».
+        #
+        # DROP NOT NULL идемпотентен: повторный вызов на колонке без NOT NULL
+        # ошибкой не является.
+        await self.pool.execute(
+            "ALTER TABLE positions ALTER COLUMN stop_pct DROP NOT NULL;"
+        )
+        await self.pool.execute(
+            "ALTER TABLE positions ALTER COLUMN stop_price DROP NOT NULL;"
+        )
+        await self.pool.execute(
+            """
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname = 'positions_reason_chk'
+                      AND conrelid = 'positions'::regclass
+                      AND pg_get_constraintdef(oid) NOT LIKE '%plus_exit%'
+                ) THEN
+                    ALTER TABLE positions DROP CONSTRAINT positions_reason_chk;
+                    ALTER TABLE positions ADD CONSTRAINT positions_reason_chk
+                        CHECK (exit_reason IS NULL OR exit_reason IN
+                               ('target', 'stop', 'timeout', 'ambiguous',
+                                'data_gap', 'plus_exit'));
+                END IF;
+                -- Прежний positions_bounds_chk требовал stop_pct > 0
+                -- безусловно. При NULL это даёт NULL, и строка версии 6 прошла
+                -- бы: CHECK отвергает только FALSE. Полагаться на трёхзначную
+                -- логику нельзя — правило, выполняющееся по случайности,
+                -- читается как ошибка и однажды будет «исправлено».
+                IF EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname = 'positions_bounds_chk'
+                      AND conrelid = 'positions'::regclass
+                      AND pg_get_constraintdef(oid) NOT LIKE '%stop_pct IS NULL%'
+                ) THEN
+                    ALTER TABLE positions DROP CONSTRAINT positions_bounds_chk;
+                    ALTER TABLE positions ADD CONSTRAINT positions_bounds_chk
+                        CHECK (horizon_h > 0 AND entry_price > 0
+                               AND signal_price > 0
+                               AND (stop_pct IS NULL OR stop_pct > 0)
+                               AND (stop_price IS NULL OR stop_price > 0)
+                               AND (exit_price IS NULL OR exit_price > 0)
+                               AND qty > 0 AND notional_usd > 0
+                               AND logic_version > 0);
+                END IF;
+            END $$;
+            """
+        )
+        await self.pool.execute(POSITIONS_CHECKS)
         # Роль только на чтение (сервис бота) должна видеть таблицу сразу:
         # её GRANT ON ALL TABLES отработал, когда таблицы ещё не было, и без
         # явного права бот молча перестал бы отвечать на /positions.
@@ -2353,8 +2410,16 @@ class DB:
         )
         return int(status.rsplit(" ", 1)[-1]) if status else 0
 
-    async def get_positions_summary(self, *, days: int = 7) -> dict[str, Any]:
+    async def get_positions_summary(
+        self, *, days: int = 7, logic_version: int | None = None
+    ) -> dict[str, Any]:
         """Итог по закрытым позициям за окно — для бота (§10) и отчёта.
+
+        ВЕРСИИ ЛОГИКИ НЕ СМЕШИВАЮТСЯ (§1.4 ТЗ 9.2). Позиции версии 5
+        закрывались по пределу убытка через сутки, позиции версии 6 — без
+        предела, с ожиданием плюса до сорока восьми часов; средний итог по обеим
+        сразу не описывает ни одну из них. ``logic_version=None`` оставлен ровно
+        для одного случая — когда версий в базе всего одна.
 
         Средний ``net_pnl_pct`` и сумма ``net_pnl_usd`` считаются по закрытым
         позициям окна, включая ``ambiguous``: у тех итог определён (он взят по
@@ -2381,9 +2446,10 @@ class DB:
                    avg(entry_lag_sec) AS avg_lag_sec
             FROM positions
             WHERE status = 'closed'
-              AND closed_at >= now() - make_interval(days => $1::int);
+              AND closed_at >= now() - make_interval(days => $1::int)
+              AND ($2::smallint IS NULL OR logic_version = $2);
             """,
-            int(days),
+            int(days), logic_version,
         )
         reasons = await self.pool.fetch(
             """
@@ -2391,15 +2457,17 @@ class DB:
             FROM positions
             WHERE status = 'closed'
               AND closed_at >= now() - make_interval(days => $1::int)
+              AND ($2::smallint IS NULL OR logic_version = $2)
             GROUP BY exit_reason
             ORDER BY n DESC;
             """,
-            int(days),
+            int(days), logic_version,
         )
         summary = dict(row) if row is not None else {}
         summary["by_reason"] = {
             str(r["exit_reason"]): int(r["n"]) for r in reasons
         }
+        summary["logic_version"] = logic_version
         return summary
 
     # --- Подвижный выход (Этап 8.10) ---
@@ -3616,8 +3684,11 @@ CREATE TABLE IF NOT EXISTS positions (
     notional_usd        NUMERIC(12,4) NOT NULL,
     target_pct          NUMERIC(10,6) NOT NULL,
     target_price        NUMERIC(20,8) NOT NULL,
-    stop_pct            NUMERIC(10,6) NOT NULL,
-    stop_price          NUMERIC(20,8) NOT NULL,
+    -- Этап 9.2 §4.2: NOT NULL снято. Пустой предел допустим ТОЛЬКО при
+    -- logic_version >= 6 — это требует positions_no_stop_chk ниже, и для
+    -- версии 5 поля остаются обязательными ровно как прежде.
+    stop_pct            NUMERIC(10,6),
+    stop_price          NUMERIC(20,8),
     cost_pct            NUMERIC(10,6) NOT NULL,
     deadline_at         TIMESTAMPTZ   NOT NULL,
     last_checked_ts     TIMESTAMPTZ,
@@ -3660,7 +3731,8 @@ BEGIN
         ALTER TABLE positions
             ADD CONSTRAINT positions_reason_chk
             CHECK (exit_reason IS NULL OR exit_reason IN
-                   ('target', 'stop', 'timeout', 'ambiguous', 'data_gap'));
+                   ('target', 'stop', 'timeout', 'ambiguous', 'data_gap',
+                    'plus_exit'));
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_constraint
                    WHERE conname = 'positions_resolution_chk') THEN
@@ -3672,9 +3744,50 @@ BEGIN
         ALTER TABLE positions
             ADD CONSTRAINT positions_bounds_chk
             CHECK (horizon_h > 0 AND entry_price > 0
-                   AND signal_price > 0 AND stop_pct > 0
+                   AND signal_price > 0
+                   AND (stop_pct IS NULL OR stop_pct > 0)
+                   AND (stop_price IS NULL OR stop_price > 0)
+                   AND (exit_price IS NULL OR exit_price > 0)
                    AND qty > 0 AND notional_usd > 0
                    AND logic_version > 0);
+    END IF;
+    -- Этап 9.2 §4.2, §4.4, §5.1, §5.3: четыре ограничения версии 6. На ЧИСТОМ
+    -- томе (миграция 025 не применялась) без них сервис записал бы позицию без
+    -- предела в таблицу, которая этого не запрещает и не требует, — и версия 6
+    -- перестала бы отличаться от версии 5 хоть чем-то, кроме числа в колонке.
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'positions_no_stop_chk') THEN
+        ALTER TABLE positions
+            ADD CONSTRAINT positions_no_stop_chk
+            CHECK (
+                CASE WHEN logic_version >= 6
+                     THEN stop_pct IS NULL AND stop_price IS NULL
+                     ELSE stop_pct IS NOT NULL AND stop_price IS NOT NULL
+                END
+            );
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'positions_v6_reason_chk') THEN
+        ALTER TABLE positions
+            ADD CONSTRAINT positions_v6_reason_chk
+            CHECK (logic_version < 6 OR exit_reason IS NULL
+                   OR exit_reason <> 'stop');
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'positions_plus_exit_chk') THEN
+        ALTER TABLE positions
+            ADD CONSTRAINT positions_plus_exit_chk
+            CHECK (exit_reason IS DISTINCT FROM 'plus_exit'
+                   OR logic_version >= 6);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'positions_exit_measured_chk') THEN
+        ALTER TABLE positions
+            ADD CONSTRAINT positions_exit_measured_chk
+            CHECK (
+                exit_reason IS NULL
+                OR (closed_at IS NOT NULL AND exit_price IS NOT NULL)
+            );
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_constraint
                    WHERE conname = 'positions_shape_chk') THEN

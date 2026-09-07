@@ -341,14 +341,37 @@ else
   echo "    открытых позиций:  ${open_n}"
   echo "    закрытых позиций:  ${closed_n}"
   if [[ "${closed_n}" != "0" ]]; then
-    echo "    по причинам выхода:"
-    psql_tbl "SELECT exit_reason, count(*) FROM positions WHERE status='closed'
-              GROUP BY exit_reason ORDER BY 2 DESC;" | sed 's/^/      /'
+    echo "    по причинам выхода (версия правила | причина | сколько):"
+    # ВЕРСИИ ЛОГИКИ НЕ СМЕШИВАЮТСЯ (§1.4 ТЗ 9.2). Позиции версии 5 закрывались
+    # по пределу убытка через сутки, позиции версии 6 — без предела, с
+    # ожиданием плюса до 48 часов. Одна разбивка на двоих описывала бы смесь,
+    # состав которой меняется каждый день просто потому, что старых сделок
+    # становится меньше.
+    psql_tbl "SELECT logic_version, exit_reason, count(*) FROM positions
+              WHERE status='closed'
+              GROUP BY logic_version, exit_reason
+              ORDER BY 1, 3 DESC;" | sed 's/^/      /'
     # СРЕДНИЕ И СУММЫ — БЕЗ ЗАКРЫТИЙ ПО ПРОБЕЛУ В ДАННЫХ (Этап 9.1.1 §6.7).
     # У них цена выхода не наблюдалась, а восстановлена; их «итог» описывает
     # длительность сбоя сбора данных, а не поведение рынка. Те же FILTER стоят
     # в src/bot/queries.positions_summary: разойдись они — бот и проверка
     # показывали бы разные средние по одной и той же таблице.
+    # ТЕ ЖЕ ЧИСЛА — ПО КАЖДОЙ ВЕРСИИ ОТДЕЛЬНО (§1.4, §1.5 ТЗ 9.2). Сумма по
+    # версии 5 — это накопленный итог, который внедрение версии 6 не имеет
+    # права сдвинуть ни на цент; печатается она поэтому ОТДЕЛЬНОЙ строкой, по
+    # которой сверку можно сделать глазом, а не запросом.
+    echo "    по версиям правила (версия | средний % | сумма $ | лаг | снос % | неопр.):"
+    psql_tbl "SELECT logic_version,
+                     round(avg(net_pnl_pct)
+                       FILTER (WHERE exit_reason <> 'data_gap'), 4),
+                     round(sum(net_pnl_usd)
+                       FILTER (WHERE exit_reason <> 'data_gap'), 5),
+                     round(avg(entry_lag_sec), 1),
+                     round(avg(entry_slippage_pct)
+                       FILTER (WHERE exit_reason <> 'data_gap'), 5),
+                     count(*) FILTER (WHERE outcome_certain = FALSE)
+              FROM positions WHERE status='closed'
+              GROUP BY logic_version ORDER BY 1;" | sed 's/^/      /'
     stat_line="$(psql_tbl "SELECT round(avg(net_pnl_pct)
                                     FILTER (WHERE exit_reason <> 'data_gap'), 4),
                                   round(sum(net_pnl_usd)
@@ -358,6 +381,10 @@ else
                                     FILTER (WHERE exit_reason <> 'data_gap'), 5),
                                   count(*) FILTER (WHERE outcome_certain = FALSE)
                            FROM positions WHERE status='closed';")"
+    # ЧИСЛА НИЖЕ — ПО ВСЕМ ВЕРСИЯМ СРАЗУ, и читать их как «результат системы»
+    # НЕЛЬЗЯ: это смесь двух разных правил выхода. Оставлены они ради одного —
+    # чтобы сумма по счёту сходилась с разбивкой выше.
+    echo "    по всем версиям СРАЗУ (смесь правил, не результат системы):"
     echo "    средний net_pnl_pct:        $(echo "${stat_line}" | cut -d'|' -f1) (без data_gap)"
     echo "    сумма net_pnl_usd:          $(echo "${stat_line}" | cut -d'|' -f2) (без data_gap)"
     echo "    средний entry_lag_sec:      $(echo "${stat_line}" | cut -d'|' -f3)"

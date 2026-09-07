@@ -59,6 +59,7 @@ import scripts.plus_exit_counterfactual_9_1_6 as plus
 from src.core.db import DB
 from src.positions import rules as position_rules
 from src.positions.rules import Bar
+from tests.conftest import CURRENT_LOGIC_VERSION
 from tests.schema_double import (
     SchemaPool,
     UndefinedColumn,
@@ -1546,22 +1547,32 @@ def test_the_measurement_never_touches_the_tables_of_fact() -> None:
 # =============================================================================
 
 def test_the_stage_changes_no_live_rule() -> None:
-    """§1.1 ТЗ: ни LOGIC_VERSION, ни пороги, ни веса, ни правило выхода."""
+    """§1.1 ТЗ 9.1.6: замер не трогает ни порогов, ни весов, ни своей таблицы.
+
+    ЧТО ЗДЕСЬ ПОМЕНЯЛОСЬ И ПОЧЕМУ (Этап 9.2). Проверки «в боевом правиле нет ни
+    слова plus_exit» стояли здесь по делу: ЭТАП 9.1.6 БЫЛ ЗАМЕРОМ, и попадание
+    его правила в бой означало бы внедрение, которого никто не заказывал.
+
+    Этап 9.2 — ВНЕДРЕНИЕ по решению владельца, и ровно этих слов в боевом коде
+    теперь ждут. Требовать их отсутствия дальше значило бы требовать, чтобы
+    принятое решение не было выполнено. Что осталось верным навсегда и потому
+    проверяется здесь по-прежнему: ЗАМЕРНЫЙ СКРИПТ пишет только в свою таблицу,
+    а боевой сервис о ней по-прежнему не знает — иначе результат замера начал
+    бы влиять на ведение живых позиций.
+    """
     from src.core.config import settings
 
-    assert settings.LOGIC_VERSION == 5
+    assert settings.LOGIC_VERSION == CURRENT_LOGIC_VERSION
     assert settings.BARRIER_STOP_PCT == 1.0
     assert settings.RISK_COST_ROUNDTRIP_PCT == 0.22
-    rules_text = (_ROOT / "src" / "positions" / "rules.py").read_text(
-        encoding="utf-8"
-    )
-    assert "plus_exit" not in rules_text
-    assert "9.1.6" not in rules_text
     runner_text = (_ROOT / "src" / "positions" / "runner.py").read_text(
         encoding="utf-8"
     )
-    assert "plus_exit" not in runner_text
     assert "position_plus_exit_shadow" not in runner_text
+    rules_text = (_ROOT / "src" / "positions" / "rules.py").read_text(
+        encoding="utf-8"
+    )
+    assert "position_plus_exit_shadow" not in rules_text
 
 
 def test_the_stage_writes_its_own_rule_nowhere() -> None:

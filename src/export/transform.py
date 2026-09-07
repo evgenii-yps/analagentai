@@ -511,6 +511,10 @@ POSITION_EXIT_RU: dict[str, str] = {
     "timeout": "истёк срок",
     "ambiguous": "задеты обе границы",
     "data_gap": "пробел в данных",
+    # Этап 9.2 §8.1: новый исход версии 6 — выход в ЧИСТЫЙ плюс после суток
+    # ожидания. Итог такой сделки равен нулю по построению: цена выхода и есть
+    # цена безубытка.
+    "plus_exit": "вышли в плюс после суток ожидания",
 }
 
 # Текст вместо итога у закрытий по пробелу в данных. Их результат НЕ ИЗМЕРЕН:
@@ -633,15 +637,30 @@ def build_position_note(row: dict[str, Any]) -> str:
     Метка — единственный способ найти строку при дозаписи закрытия: лист
     владелец правит руками, строки могут переехать, а искать сделку по дате и
     цене значило бы однажды дописать выход не в ту строку.
+
+    У ПОЗИЦИЙ БЕЗ ПРЕДЕЛА ЕГО УПОМИНАНИЕ УБРАНО (§8.2 ТЗ 9.2), а на его месте
+    названо правило, по которому сделка ведётся. В листе лежат строки ОБЕИХ
+    версий вперемешку — по времени, а не по правилу, — и человек, читающий
+    журнал сверху вниз, обязан видеть у каждой сделки, какое правило её вело.
+    Иначе он сложит их итоги, а складывать их нельзя (§1.4 ТЗ): версии 5 и 6
+    несравнимы.
     """
     probability = row.get("probability")
     prob = "—" if probability is None else f"{float(probability):.2f}"
+    stop_price = row.get("stop_price")
+    stop_pct = row.get("stop_pct")
+    if stop_price is None or stop_pct is None:
+        rule = f"без предела · правило v{int(row['logic_version'])}"
+    else:
+        rule = (
+            f"предел {_position_price(stop_price)} "
+            f"(\u2212{float(stop_pct):.2f}%)"
+        )
     return (
         f"{position_marker(row['id'])} "
         f"цель {_position_price(row['target_price'])} "
         f"(+{float(row['target_pct']):.2f}%) · "
-        f"предел {_position_price(row['stop_price'])} "
-        f"(\u2212{float(row['stop_pct']):.2f}%) · "
+        f"{rule} · "
         f"сигнал #{int(row['signal_id'])} · "
         f"вероятность {prob} · "
         f"задержка входа {int(row['entry_lag_sec'])} с"
@@ -664,6 +683,24 @@ def build_position_close_values(
     ]
 
 
+def position_hold_hours(row: dict[str, Any]) -> int | None:
+    """Срок жизни ЭТОЙ позиции в целых часах: ``deadline_at − opened_at``.
+
+    ``None`` — когда одного из моментов в строке нет или срок не выражается
+    целым числом часов. Округлять здесь нельзя: «истёк срок 24 ч» у позиции,
+    жившей 24 часа 30 минут, — неверное утверждение, а не приблизительное, и
+    молчание честнее.
+    """
+    opened_at = row.get("opened_at")
+    deadline_at = row.get("deadline_at")
+    if opened_at is None or deadline_at is None:
+        return None
+    seconds = (deadline_at - opened_at).total_seconds()
+    if seconds <= 0 or seconds % 3600 != 0:
+        return None
+    return int(seconds // 3600)
+
+
 def build_position_close_note_tail(row: dict[str, Any]) -> str:
     """ХВОСТ заметки: причина выхода и итог. Начинается с разделителя.
 
@@ -681,6 +718,18 @@ def build_position_close_note_tail(row: dict[str, Any]) -> str:
     """
     reason = str(row["exit_reason"])
     words = POSITION_EXIT_RU.get(reason, reason)
+    # СРОК У ВЕРСИЙ 5 И 6 РАЗНЫЙ, А СЛОВА ОДНИ (§5.2 ТЗ 9.2). В листе строки
+    # обеих версий лежат вперемешку, и «истёк срок» без числа заставлял бы
+    # выяснять срок по датам входа и выхода в соседних столбцах.
+    #
+    # ЧИСЛО СЧИТАЕТСЯ ПО СТРОКЕ ПОЗИЦИИ (``deadline_at − opened_at``), А НЕ
+    # БЕРЁТСЯ ИЗ НАСТРОЙКИ. Настройка отвечает на вопрос «сколько живут
+    # позиции, которые откроются сегодня»; здесь же спрашивается «сколько жила
+    # ВОТ ЭТА», и ответ на него записан в самой строке. Правка настройки не
+    # имеет права задним числом переписать журнал.
+    hours = position_hold_hours(row)
+    if reason == "timeout" and hours is not None:
+        words = f"{words} {hours} ч"
     if reason == "data_gap":
         return f" · {words} · {DATA_GAP_NOTE}"
     return (

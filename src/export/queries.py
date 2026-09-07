@@ -468,8 +468,8 @@ async def count_exported(conn: asyncpg.Connection, target: str) -> int:
 # один на две выборки: разойдись они — заметка открытия и заметка закрытия
 # считались бы по разным наборам полей, и расхождение вылезло бы в листе.
 _POSITION_COLUMNS = """
-    p.id, p.signal_id, i.symbol, p.side, p.status,
-    p.signal_ts, p.opened_at, p.entry_price, p.notional_usd,
+    p.id, p.signal_id, i.symbol, p.side, p.status, p.logic_version,
+    p.signal_ts, p.opened_at, p.deadline_at, p.entry_price, p.notional_usd,
     p.entry_lag_sec, p.target_price, p.target_pct,
     p.stop_price, p.stop_pct, p.cost_pct,
     p.closed_at, p.exit_price, p.exit_reason,
