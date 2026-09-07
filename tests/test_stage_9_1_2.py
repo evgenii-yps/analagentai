@@ -171,10 +171,10 @@ def test_prices_and_volume_are_numbers_not_strings() -> None:
     ячейке точно так же и тихо сломает формулы, которые на него ссылаются.
     """
     row = build_position_open_row(_position(), _TZ)
-    assert isinstance(row[5], (int, float)) and not isinstance(row[5], bool)
-    assert isinstance(row[6], (int, float)) and not isinstance(row[6], bool)
+    assert isinstance(row[5], int | float) and not isinstance(row[5], bool)
+    assert isinstance(row[6], int | float) and not isinstance(row[6], bool)
     close = build_position_close_values(_position(), _TZ)
-    assert isinstance(close[2], (int, float)) and not isinstance(close[2], bool)
+    assert isinstance(close[2], int | float) and not isinstance(close[2], bool)
     # А даты и время — наоборот, строки заданного вида.
     assert isinstance(row[0], str) and isinstance(row[1], str)
 
