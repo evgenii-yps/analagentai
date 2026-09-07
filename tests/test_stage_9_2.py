@@ -1159,6 +1159,144 @@ async def _constraint_exists(conn, name: str) -> bool:
     ))
 
 
+def test_the_service_waits_for_the_NET_plus_and_not_the_gross_one() -> None:
+    """Плюс в бою — ЧИСТЫЙ. Это разница между вариантами B и D замера 9.1.6.
+
+    НАЙДЕНО ПРОВЕРКОЙ ТЕСТОВ НА ПОДМЕНУ. Замените в сервисе вызов
+    ``breakeven_price(...)`` на ``breakeven_price(..., gross=True)`` — и правило
+    начнёт выходить по ЦЕНЕ ВХОДА вместо цены безубытка, то есть закрывать
+    сделку ровно в минус издержкам и называть это плюсом. Все прочие проверки
+    этого файла остались бы зелёными: главный тест §2.3 зовёт правило напрямую и
+    передаёт цену сам, а проводку сервиса не трогает.
+
+    Вариант D замера отличался от варианта B ровно этим, и заведён он был именно
+    затем, чтобы показать, сколько сделок разделяет ставка круговых издержек.
+    Проверка читает код: в проводке сервиса ``gross`` не должен появляться ни
+    разу.
+    """
+    runner_text = (_ROOT / "src" / "positions" / "runner.py").read_text(
+        encoding="utf-8"
+    )
+    assert "gross" not in runner_text, (
+        "сервис зовёт breakeven_price с валовым плюсом: он закрывал бы сделку "
+        "в минус издержкам и называл это плюсом"
+    )
+    # И цена, которую сервис получает, действительно ВЫШЕ цены входа: валовой
+    # безубыток равен ей, чистый — строго больше.
+    net = breakeven_price(_ENTRY, _COST_PCT)
+    gross = breakeven_price(_ENTRY, _COST_PCT, gross=True)
+    assert gross == _ENTRY
+    assert net > gross
+    assert net_pnl(_ENTRY, gross, _COST_PCT) == pytest.approx(-_COST_PCT)
+
+
+@needs_db
+async def test_the_service_closes_a_version_six_position_end_to_end() -> None:
+    """Сквозной прогон боевого сервиса на НАСТОЯЩЕЙ базе: от свечей до строки.
+
+    ЗАЧЕМ ОН НУЖЕН ПОВЕРХ ТЕСТА §2.3. Тот сверяет ПРАВИЛО с вариантом B, зовя
+    его напрямую и передавая цены сам. Здесь проверяется ПРОВОДКА: те ли цены
+    сервис передаёт правилу, тот ли срок берёт из строки, ту ли отметку начала
+    ожидания считает и то ли записывает в базу. Подмена чистого плюса валовым
+    живёт именно здесь — и тест §2.3 её не увидел бы.
+
+    Ряд построен так, что версия 5 закрыла бы позицию по пределу в первый же
+    час: цена уходит на −3% и стоит там сутки, а на вторых сутках один бар
+    поднимается выше цены безубытка.
+    """
+    import asyncpg
+
+    from src.core.db import db as real_db
+    from src.positions import runner as positions_runner
+
+    forward = (_MIGRATIONS / "025_positions_no_stop.sql").read_text(
+        encoding="utf-8"
+    )
+    pool = await asyncpg.create_pool(dsn=TEST_DSN, min_size=1, max_size=2)
+    original = getattr(real_db, "_pool", None)
+    notify = settings.POSITION_NOTIFY_ENABLED
+    try:
+        real_db._pool = pool  # noqa: SLF001 — подмена пула на тестовый
+        settings.POSITION_NOTIFY_ENABLED = False
+        t0 = datetime(2026, 9, 1, 0, 0, tzinfo=UTC)
+        async with pool.acquire() as conn:
+            await conn.execute(forward)
+            await _drop_planted(conn)
+            await conn.execute(
+                "DELETE FROM ohlcv WHERE instrument_id IN "
+                "(SELECT id FROM instruments WHERE symbol = $1);", _PLANTED_SYMBOL
+            )
+            instrument_id = await conn.fetchval(
+                "INSERT INTO instruments (exchange, symbol, base, quote, type) "
+                "VALUES ('okx', $1, 'TEST92', 'USDT', 'spot') "
+                "ON CONFLICT (exchange, symbol, type) DO UPDATE "
+                "SET symbol = EXCLUDED.symbol RETURNING id;", _PLANTED_SYMBOL,
+            )
+            signal_id = await conn.fetchval(
+                "INSERT INTO signals (instrument_id, ts, decision, logic_version)"
+                " VALUES ($1, $2, 'buy', 6) RETURNING id;", instrument_id, t0,
+            )
+            # Первые сутки на −3%, на вторых один бар выше цены безубытка.
+            plus_minute = 30 * 60
+            bars = [
+                (instrument_id, "1m", t0 + timedelta(minutes=m), 97.0,
+                 100.30 if m == plus_minute else 97.0, 97.0, 97.0, 1.0)
+                for m in range(1, 48 * 60 + 2)
+            ]
+            await conn.executemany(
+                "INSERT INTO ohlcv (instrument_id, timeframe, ts, open, high, "
+                "low, close, volume) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) "
+                "ON CONFLICT DO NOTHING;", bars,
+            )
+
+        position_id = await real_db.open_position({
+            "instrument_id": instrument_id, "signal_id": signal_id,
+            "logic_version": 6, "horizon_h": settings.POSITION_HORIZON_H,
+            "side": "buy", "signal_ts": t0, "signal_price": _ENTRY,
+            "opened_at": t0, "entry_price": _ENTRY, "entry_lag_sec": 20,
+            "entry_slippage_pct": 0.0, "qty": 0.02, "notional_usd": 2.0,
+            "target_pct": _TARGET_PCT,
+            "target_price": to_storage(target_price_of(_ENTRY, _TARGET_PCT)),
+            "stop_pct": None, "stop_price": None, "cost_pct": _COST_PCT,
+            "deadline_at": t0 + timedelta(hours=48),
+            "last_checked_ts": t0, "resolution": "1m",
+        })
+        assert position_id is not None
+
+        stats = await positions_runner.sync_open_positions(
+            t0 + timedelta(hours=50)
+        )
+        assert stats.closed == 1, f"позиция не закрыта: {stats.by_reason}"
+        assert stats.by_reason == {EXIT_PLUS: 1}
+
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT exit_reason, exit_price, closed_at, net_pnl_pct, "
+                "       stop_price, stop_pct, bars_held, mae_pct "
+                "FROM positions WHERE id = $1;", position_id
+            )
+        # ЦЕНА ВЫХОДА — ЧИСТЫЙ безубыток, и итог равен РОВНО нулю. Подставь
+        # сюда валовой — вышло бы −0.22%, то есть «плюс», равный убытку.
+        assert float(row["exit_price"]) == breakeven_price(_ENTRY, _COST_PCT)
+        assert float(row["net_pnl_pct"]) == 0.0
+        assert row["stop_price"] is None and row["stop_pct"] is None
+        # Закрыта НА ВТОРЫХ сутках, по бару плюса, а не на 24-часовой отметке.
+        assert row["closed_at"] == t0 + timedelta(hours=30, minutes=1)
+        # И крайнее отклонение помнит весь путь, включая первые сутки.
+        assert float(row["mae_pct"]) == pytest.approx(-3.0, abs=1e-6)
+    finally:
+        settings.POSITION_NOTIFY_ENABLED = notify
+        async with pool.acquire() as conn:
+            await _drop_planted(conn)
+            await conn.execute(
+                "DELETE FROM ohlcv WHERE instrument_id IN "
+                "(SELECT id FROM instruments WHERE symbol = $1);", _PLANTED_SYMBOL
+            )
+            await conn.execute(forward)
+        real_db._pool = original  # noqa: SLF001
+        await pool.close()
+
+
 # =============================================================================
 # §11.11 ТЗ. Имена затронутых объектов — фактические, а не придуманные
 # =============================================================================
