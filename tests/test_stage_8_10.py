@@ -49,6 +49,7 @@ from src.trailing.rule import (
     trail_price,
     variant_label,
 )
+from tests.conftest import CURRENT_LOGIC_VERSION
 
 TEST_DSN = os.environ.get("AT_TEST_DSN", "")
 needs_db = pytest.mark.skipif(
@@ -482,7 +483,7 @@ def test_later_activation_never_exits_earlier() -> None:
 
 def test_logic_version_is_not_raised() -> None:
     """LOGIC_VERSION остаётся 5: этап измеряет, а не меняет систему."""
-    assert settings.LOGIC_VERSION == 5
+    assert settings.LOGIC_VERSION == CURRENT_LOGIC_VERSION
 
 
 def test_touch_rule_is_not_reimplemented() -> None:

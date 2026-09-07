@@ -36,9 +36,15 @@ function makeSheet(name) {
     // отдаёт из getDisplayValues() посчитанное значение, а из getFormulas() —
     // текст. Двойник ничего не считает: приёмнику важно лишь, есть ли формула.
     formulas: new Map(),
+    // ЧИСЛОВОЙ ФОРМАТ ЖИВЁТ ОТДЕЛЬНО ОТ ЗНАЧЕНИЯ, как в Google (Этап 9.2
+    // §6.1). Без него стенд не смог бы проверить починку столбца времени —
+    // а именно на нём владелец и поймал ошибку.
+    numberFormats: new Map(),
     maxColumns: 26,          // столько колонок у нового листа Google Таблицы
     frozen: 0,
-    clear() { this.grid = []; this.formulas.clear(); },
+    clear() {
+      this.grid = []; this.formulas.clear(); this.numberFormats.clear();
+    },
     getLastRow() { return this.grid.length; },
     getLastColumn() {
       let width = 0;
@@ -54,6 +60,11 @@ function makeSheet(name) {
     setFrozenRows(n) { this.frozen = n; },
     key(row, col) { return `${row}:${col}`; },
     getFormulaAt(row, col) { return this.formulas.get(this.key(row, col)) || ''; },
+    getFormatAt(row, col) {
+      // Google на ячейке без заданного формата отдаёт 'Automatic', а не пустоту.
+      return this.numberFormats.get(this.key(row, col)) || 'Automatic';
+    },
+    setFormatAt(row, col, text) { this.numberFormats.set(this.key(row, col), text); },
     setFormulaAt(row, col, text) {
       if (text) this.formulas.set(this.key(row, col), text);
       else this.formulas.delete(this.key(row, col));
@@ -79,6 +90,23 @@ function makeSheet(name) {
         moved.set(`${target}:${col}`, text);
       }
       this.formulas = moved;
+      // ФОРМАТ НОВОЙ СТРОКИ НАСЛЕДУЕТСЯ ОТ СТРОКИ ВЫШЕ — так делает Google при
+      // insertRowsBefore, и ровно поэтому переполняющийся формат столбца
+      // времени приезжал в каждую созданную строку. Двойник, который этого не
+      // делает, объявил бы дефект несуществующим.
+      const movedFormats = new Map();
+      for (const [key, text] of this.numberFormats.entries()) {
+        const [row, col] = key.split(':').map(Number);
+        const target = row >= before ? row + howMany : row;
+        movedFormats.set(`${target}:${col}`, text);
+      }
+      for (let i = 0; i < howMany; i += 1) {
+        for (const [key, text] of this.numberFormats.entries()) {
+          const [row, col] = key.split(':').map(Number);
+          if (row === before - 1) movedFormats.set(`${before + i}:${col}`, text);
+        }
+      }
+      this.numberFormats = movedFormats;
     },
     appendRow(values) {
       if (values.length > this.maxColumns) this.maxColumns = values.length;
@@ -93,6 +121,8 @@ function makeSheet(name) {
         box: { row, col, numRows, numCols },
         getValue() { return self.getCell(row, col); },
         setValue(value) { self.setCell(row, col, value); },
+        getNumberFormat() { return self.getFormatAt(row, col); },
+        setNumberFormat(text) { self.setFormatAt(row, col, text); },
         getDisplayValues() {
           const out = [];
           for (let r = 0; r < numRows; r += 1) {
@@ -207,6 +237,11 @@ function makeContext() {
   // Объявления const в скрипте vm живут в лексической области, а не в глобальном
   // объекте, поэтому секрет читаем вычислением выражения в том же контексте.
   sandbox.SECRET = vm.runInContext('SECRET', sandbox);
+  // Версия приёмника читается ИЗ САМОГО ФАЙЛА, а не повторяется здесь числом:
+  // повторённая, она превращала бы каждый подъём версии в правку стенда, и
+  // однажды стенд проверял бы версию, которой уже нет.
+  sandbox.RECEIVER_VERSION = vm.runInContext('RECEIVER_VERSION', sandbox);
+  sandbox.elapsedTimeFormat = vm.runInContext('elapsedTimeFormat', sandbox);
   return sandbox;
 }
 
@@ -528,7 +563,7 @@ check('version: приёмник называет версию и НИЧЕГО �
   const before = JSON.stringify(sheet.grid);
   const res = post(ctx, { secret: ctx.SECRET, sheet: TRADES, mode: 'version' });
   assert(res.ok === true, `ok=false: ${res.error}`);
-  assert(res.version === '9.1.2.2', `version=${res.version}`);
+  assert(res.version === ctx.RECEIVER_VERSION, `version=${res.version}`);
   assert(JSON.stringify(sheet.grid) === before, 'вопрос о версии изменил лист');
   assert(res.inserted === undefined && res.updated === undefined,
          'вопрос о версии отчитался о записи');
@@ -799,8 +834,113 @@ check('выгрузка Этапа 6.6 работает по-прежнему (�
   });
   assert(res.ok === true, `ok=false: ${res.error}`);
   assert(res.inserted === 1, `inserted=${res.inserted}`);
-  assert(res.version === '9.1.2.2', `version=${res.version}`);
+  assert(res.version === ctx.RECEIVER_VERSION, `version=${res.version}`);
 });
+
+
+// =============================================================================
+// ЭТАП 9.2 §6.1. СТОЛБЕЦ ВРЕМЕНИ НЕ ПЕРЕПОЛНЯЕТСЯ НА СУТКАХ
+// =============================================================================
+//
+// СТЕНД СЧИТАЕТ ДЛИТЕЛЬНОСТЬ САМ, потому что двойник формул не считает, а
+// проверять надо именно ПОКАЗАННОЕ значение. Google хранит длительность долей
+// суток и показывает её по числовому формату; обе ветки формата воспроизведены
+// здесь дословно — с переполнением (часы по модулю 24) и без него.
+function renderDuration(days, format) {
+  const total = Math.round(days * 24 * 3600);
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  const two = (n) => String(n).padStart(2, '0');
+  const shown = /\[h+\]/i.test(format) ? hours : hours % 24;
+  return format.indexOf(':ss') >= 0
+    ? `${shown}:${two(minutes)}:${two(seconds)}`
+    : `${shown}:${two(minutes)}`;
+}
+const asDays = (h, m, sec) => (h * 3600 + m * 60 + sec) / 86400;
+
+// Четыре значения §11.6 ТЗ: до суток, находка владельца, почти двое суток и
+// ровно двое. Первое обязано не сломаться, остальные три — почина́ться.
+const DURATION_CASES = [
+  { label: '23:59:00', days: asDays(23, 59, 0), shown: '23:59:00' },
+  { label: '24:00:37', days: asDays(24, 0, 37), shown: '24:00:37' },
+  { label: '47:59:00', days: asDays(47, 59, 0), shown: '47:59:00' },
+  { label: '48:00:00', days: asDays(48, 0, 0), shown: '48:00:00' },
+];
+
+check('9.2 §6.1: часовой формат ВРЁТ на сутках — дефект воспроизведён', () => {
+  // Сначала показывается сам дефект, и показывается ЧИСЛОМ ВЛАДЕЛЬЦА. Правка,
+  // не воспроизводящая ошибку, лечит неизвестно что.
+  const broken = 'h:mm:ss';
+  assert(renderDuration(DURATION_CASES[1].days, broken) === '0:00:37',
+         'формат h:mm:ss обязан показать 24:00:37 как 0:00:37 — иначе стенд '
+         + 'не воспроизводит находку владельца от 07.09.2026');
+  assert(renderDuration(DURATION_CASES[0].days, broken) === '23:59:00',
+         'до суток прежний формат врать не обязан');
+});
+
+check('9.2 §6.1: исправленный формат верен на 23:59, 24:00:37, 47:59 и 48:00', () => {
+  const ctx = makeContext();
+  const fixed = ctx.elapsedTimeFormat('h:mm:ss');
+  assert(fixed === '[h]:mm:ss', `получен формат ${fixed}, ожидался [h]:mm:ss`);
+  for (const item of DURATION_CASES) {
+    const shown = renderDuration(item.days, fixed);
+    assert(shown === item.shown,
+           `${item.label}: показано ${shown}, ожидалось ${item.shown}`);
+  }
+});
+
+check('9.2 §6.1: формат даты и уже исправленный формат НЕ трогаются', () => {
+  const ctx = makeContext();
+  const f = ctx.elapsedTimeFormat;
+  assert(f('[h]:mm:ss') === '', 'уже исправленный формат правится второй раз');
+  assert(f('dd.MM.yyyy h:mm:ss') === '', 'формат ДАТЫ обёрнут в скобки');
+  assert(f('Automatic') === '', 'формат по умолчанию объявлен длительностью');
+  assert(f('0.00') === '', 'числовой формат объявлен длительностью');
+  assert(f('') === '', 'пустой формат объявлен длительностью');
+  assert(f('h:mm') === '[h]:mm', 'формат без секунд не исправлен');
+  assert(f('hh:mm:ss') === '[hh]:mm:ss', 'двузначные часы не исправлены');
+});
+
+check('9.2 §6.1: созданная строка получает формат без переполнения', () => {
+  const ctx = makeContext();
+  const sheet = makeTradesSheet(ctx, { blank: 3, filled: 1 });
+  // Столбец L (12) — «время в сделке» с переполняющимся форматом. В боевом
+  // листе формат стоит на ВСЕХ строках бланка, а не только на первой: бланк
+  // размечен заранее, и созданная строка садится в уже размеченную клетку.
+  for (let r = 2; r <= 4; r += 1) sheet.setFormatAt(r, 12, 'h:mm:ss');
+  const res = post(ctx, {
+    secret: ctx.SECRET, sheet: TRADES, mode: 'table_append',
+    rows: [openRow('BTC', 77602.7)],
+    notes: ['[поз. 71] цель 78000 (+0.50%) · без предела · правило v6'],
+    noteColumn: NOTE_COL, totalsMarker: 'итого:', formulaFromColumn: FORMULA_FROM,
+  });
+  assert(res.ok === true, `ok=false: ${res.error}`);
+  assert(sheet.getFormatAt(res.startRow, 12) === '[h]:mm:ss',
+         `формат созданной строки ${sheet.getFormatAt(res.startRow, 12)}, `
+         + 'ожидался [h]:mm:ss');
+  assert(res.formatsFixed >= 1, 'приёмник не сообщил о починке формата');
+});
+
+check('9.2 §6.1: дозапись закрытия чинит формат УЖЕ существующей строки', () => {
+  const ctx = makeContext();
+  const sheet = makeTradesSheet(ctx, { blank: 3, filled: 2 });
+  sheet.setCell(3, NOTE_COL, '[поз. 71] цель 78000');
+  sheet.setFormatAt(3, 12, 'h:mm:ss');
+  const res = post(ctx, {
+    secret: ctx.SECRET, sheet: TRADES, mode: 'table_update', noteColumn: NOTE_COL,
+    updates: [{
+      marker: '[поз. 71]', startColumn: 8, formulaFromColumn: FORMULA_FROM,
+      values: ['07.09.2026', '08:08:00', 77650.0],
+      noteAppend: ' · истёк срок 48 ч · итог системы −0.44%',
+    }],
+  });
+  assert(res.ok === true, `ok=false: ${res.error}`);
+  assert(res.updated === 1, `updated=${res.updated}`);
+  assert(sheet.getFormatAt(3, 12) === '[h]:mm:ss',
+         `формат строки закрытия ${sheet.getFormatAt(3, 12)}, ожидался [h]:mm:ss`);
+});
+
 
 console.log(failed === 0 ? '\nВсе сценарии стенда прошли'
 

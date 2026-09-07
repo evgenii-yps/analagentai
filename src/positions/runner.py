@@ -43,15 +43,21 @@ from src.notify.telegram import send_message
 from src.positions import messages
 from src.positions.rules import (
     EXIT_DATA_GAP,
+    PLUS_WAIT_MIN_LOGIC_VERSION,
+    REFUSAL_TTL_SEC,
     SIDE_BUY,
     Bar,
+    breakeven_price,
     check_exit,
+    check_exit_plus_wait,
     check_gap_exit,
     levels,
     net_pnl,
     qty_for_slot,
+    refusal_key,
     should_open,
     slippage_pct,
+    target_price_of,
 )
 
 _log = structlog.get_logger().bind(component="positions")
@@ -62,6 +68,55 @@ _HEARTBEAT_TTL = 300
 # Разрешение, которым ведётся позиция. Записано ограничением positions_resolution_chk
 # и здесь повторено единственной константой, а не строковым литералом в трёх местах.
 RESOLUTION = "1m"
+
+
+def without_stop(logic_version: int) -> bool:
+    """Ведётся ли позиция ЭТОЙ версии по правилу без предела убытка (Этап 9.2).
+
+    Спрашивается по СТРОКЕ позиции, а не по настройке ``LOGIC_VERSION``, и это
+    не педантизм. В таблице лежат позиции обеих версий одновременно: 88 строк
+    версии 5 с пределом и растущее число строк версии 6 без него. Ведение
+    открытых позиций обязано спрашивать правило у самой строки — иначе после
+    подъёма версии сервис попытался бы дочитать НЕДОЗАКРЫТЫЕ позиции версии 5
+    новым правилом, то есть пересчитать их (§1.2 и §9.2 ТЗ прямо запрещают).
+    """
+    return int(logic_version) >= PLUS_WAIT_MIN_LOGIC_VERSION
+
+
+def hold_hours(logic_version: int) -> int:
+    """Срок жизни позиции в часах: 48 у версии 6, горизонт сигнала у версии 5.
+
+    ГОРИЗОНТ СИГНАЛА И СРОК ЖИЗНИ ПОЗИЦИИ — РАЗНЫЕ ВЕЛИЧИНЫ (§3.3 ТЗ 9.2). До
+    версии 6 они совпадали, и оттого выглядели одним параметром;
+    ``POSITION_HORIZON_H`` этим этапом не трогается вовсе.
+    """
+    if without_stop(logic_version):
+        return int(settings.POSITION_MAX_HOLD_HOURS)
+    return int(settings.POSITION_HORIZON_H)
+
+
+def plus_start_of(row: dict[str, Any]) -> datetime:
+    """Момент, с которого у позиции версии 6 начинает проверяться условие плюса.
+
+    ОТСЧИТЫВАЕТСЯ ОТ ``opened_at`` САМОЙ ПОЗИЦИИ, а не от «сейчас» и не от срока:
+    правило §3.4 ТЗ 9.1.6 говорит именно «с отметки 24 часа ПОСЛЕ ВХОДА».
+
+    ЧЕГО ЗДЕСЬ НЕТ И ПОЧЕМУ ОБ ЭТОМ СКАЗАНО ВСЛУХ. Отдельной колонки под эту
+    отметку в ``positions`` не заведено (§9.3 ТЗ запрещает менять устройство
+    таблицы шире заказанного), поэтому число берётся из НЫНЕШНЕЙ настройки. Из
+    этого следует ровно одно неприятное свойство: правь
+    ``POSITION_PLUS_WAIT_START_HOURS`` при открытых позициях — и уже открытые
+    позиции будут дочитаны по новой отметке, а не по той, что действовала при
+    входе. Настройку поэтому меняют на пустых слотах; ограничение названо здесь,
+    а не оставлено на догадку.
+
+    ``deadline_at`` при этом берётся ИЗ СТРОКИ и настройкой не пересчитывается:
+    срок позиции — записанный факт, и подменять его сегодняшним значением
+    значило бы закрыть позицию раньше или позже, чем ей было обещано при входе.
+    """
+    return row["opened_at"] + timedelta(
+        hours=int(settings.POSITION_PLUS_WAIT_START_HOURS)
+    )
 
 
 @dataclass
@@ -128,6 +183,37 @@ async def _send(text: str) -> None:
         _log.warning("positions_notify_failed=1", error=str(exc))
 
 
+async def _count_refusals(now: datetime, refusals: dict[str, int]) -> None:
+    """Складывает отказы итерации в суточные счётчики Redis (§7.2 ТЗ 9.2).
+
+    ЗАЧЕМ ЭТО ВООБЩЕ НУЖНО. По замеру 9.1.6 слот при новом правиле занят в
+    среднем 22.5 часа вместо 3.4 — то есть отказ «слот занят» перестаёт быть
+    редкостью и становится обычным делом. Владелец обязан видеть, СКОЛЬКО
+    сигналов система пропускает, а не узнавать об этом из тишины: журнал
+    сервиса отвечает на этот вопрос только тому, кто читает журнал за сутки
+    целиком.
+
+    СЧЁТЧИК НЕ ЗАМЕНЯЕТ ЖУРНАЛ, А ДОПОЛНЯЕТ ЕГО. Каждый отказ по-прежнему
+    пишется отдельной строкой ``positions_skipped=1`` с причиной и номером
+    сигнала; счётчик отвечает на другой вопрос — «сколько их».
+
+    ОШИБКА REDIS НЕ РОНЯЕТ ИТЕРАЦИЮ. Позиции важнее счётчиков: сервис, упавший
+    из-за недоступного Redis, перестал бы ВЕСТИ открытые позиции.
+    """
+    if not refusals:
+        return
+    day = now.strftime("%Y-%m-%d")
+    version = int(settings.LOGIC_VERSION)
+    try:
+        redis = get_redis()
+        for reason, count in refusals.items():
+            key = refusal_key(version, day, reason)
+            await redis.incrby(key, int(count))
+            await redis.expire(key, REFUSAL_TTL_SEC)
+    except Exception as exc:  # noqa: BLE001 — счётчик не важнее позиции
+        _log.warning("positions_refusal_metric_failed=1", error=str(exc))
+
+
 async def sync_open_positions(now: datetime) -> ClosedStats:
     """Разбирает открытые позиции по закрытым барам (§4.4 ТЗ).
 
@@ -185,8 +271,26 @@ async def sync_open_positions(now: datetime) -> ClosedStats:
         # ПУСТОЙ РЯД БОЛЬШЕ НЕ ОЗНАЧАЕТ «идём дальше»: именно он и бывает при
         # пропаже данных. Правило выхода на пустом ряде исхода не даёт (и не
         # должно), поэтому спрашиваем его только когда есть о чём спрашивать.
-        decision = (
-            check_exit(
+        #
+        # ПРАВИЛО ВЫБИРАЕТСЯ ПО ВЕРСИИ САМОЙ СТРОКИ (Этап 9.2). Позиции версий
+        # 5 и 6 лежат в одной таблице и ведутся РАЗНЫМИ правилами; спросить
+        # правило у настройки значило бы дочитывать недозакрытые позиции
+        # версии 5 новым правилом — то есть пересчитывать их.
+        decision = None
+        if bars and without_stop(row["logic_version"]):
+            decision = check_exit_plus_wait(
+                bars=bars,
+                target_price=float(row["target_price"]),
+                plus_price=breakeven_price(
+                    entry_price, float(row["cost_pct"]), side=str(row["side"])
+                ),
+                entry_price=entry_price,
+                plus_start_at=plus_start_of(row),
+                deadline_at=deadline_at,
+                cost_pct=float(row["cost_pct"]),
+            )
+        elif bars:
+            decision = check_exit(
                 bars=bars,
                 target_price=float(row["target_price"]),
                 stop_price=float(row["stop_price"]),
@@ -194,8 +298,6 @@ async def sync_open_positions(now: datetime) -> ClosedStats:
                 deadline_at=deadline_at,
                 cost_pct=float(row["cost_pct"]),
             )
-            if bars else None
-        )
         # «Докуда разобрано»: при пустом ряде отметка остаётся на месте — ничего
         # нового мы не видели, и двигать её вперёд значило бы соврать.
         seen_until = bars[-1].ts if bars else last_checked
@@ -294,6 +396,11 @@ async def sync_open_positions(now: datetime) -> ClosedStats:
                 net_pnl_usd=pnl_usd,
                 cost_pct=float(row["cost_pct"]),
                 held_sec=(closed_at - opened_at).total_seconds(),
+                # §8 ТЗ 9.2: сообщение обязано назвать исход человеческим
+                # языком и НЕ упоминать предел убытка у версии 6 — его больше
+                # нет, и писать о нём означало бы вводить в заблуждение.
+                logic_version=int(row["logic_version"]),
+                hold_hours=hold_hours(row["logic_version"]),
             ))
     return stats
 
@@ -395,15 +502,37 @@ async def open_new_positions(now: datetime) -> OpenedStats:
         entry_price = float(bar["close"])
         signal_price = float(row["price_at_signal"])
         target_pct = float(row["target_pct"])
-        stop_pct = settings.BARRIER_STOP_PCT
-        target_price, stop_price = levels(entry_price, target_pct, stop_pct)
+        version = int(settings.LOGIC_VERSION)
+        # ПРЕДЕЛА У ВЕРСИИ 6 НЕТ, И ХРАНИТЬ ЕГО ЗАПРЕЩЕНО (§4.1 ТЗ 9.2). Не
+        # «есть, но не проверяется», а нет: ``stop_pct`` и ``stop_price``
+        # уходят в базу NULL, и это же требует ограничение
+        # ``positions_no_stop_chk``. Записать вычисленный, но никогда не
+        # срабатывающий уровень значило бы положить в таблицу число, которое
+        # любой запрос «сколько сделок закрыл предел» посчитал бы наравне с
+        # настоящими.
+        #
+        # ЦЕЛЬ ПРИ ЭТОМ СЧИТАЕТСЯ ТОЙ ЖЕ ФОРМУЛОЙ, что и у версии 5, но другой
+        # функцией: ``levels`` отвергает ``stop_pct <= 0`` — и отвергать
+        # обязана (§9.4 ТЗ), — поэтому версия 6 её просто не зовёт, а зовёт
+        # ``target_price_of``, которую ``levels`` зовёт и сама.
+        if without_stop(version):
+            stop_pct = None
+            stop_price = None
+            target_price = target_price_of(entry_price, target_pct)
+        else:
+            stop_pct = settings.BARRIER_STOP_PCT
+            target_price, stop_price = levels(entry_price, target_pct, stop_pct)
         # opened_at — время ЗАКРЫТИЯ бара входа (§4.2): по закрытию и покупаем.
         opened_at = bar["ts"] + timedelta(seconds=60)
+        # СРОК ЖИЗНИ ПОЗИЦИИ, А НЕ ГОРИЗОНТ СИГНАЛА (§3.2, §3.3 ТЗ 9.2):
+        # 48 часов у версии 6, прежние 24 у версии 5. ``horizon_h`` в строке
+        # остаётся горизонтом СИГНАЛА и не трогается.
+        deadline_at = opened_at + timedelta(hours=hold_hours(version))
 
         position_id = await db.open_position({
             "instrument_id": instrument_id,
             "signal_id": int(row["signal_id"]),
-            "logic_version": settings.LOGIC_VERSION,
+            "logic_version": version,
             "horizon_h": settings.POSITION_HORIZON_H,
             "side": SIDE_BUY,
             "signal_ts": signal_ts,
@@ -419,7 +548,7 @@ async def open_new_positions(now: datetime) -> OpenedStats:
             "stop_pct": stop_pct,
             "stop_price": stop_price,
             "cost_pct": settings.RISK_COST_ROUNDTRIP_PCT,
-            "deadline_at": opened_at + timedelta(hours=settings.POSITION_HORIZON_H),
+            "deadline_at": deadline_at,
             "last_checked_ts": bar["ts"],
             "resolution": RESOLUTION,
         })
@@ -453,11 +582,16 @@ async def open_new_positions(now: datetime) -> OpenedStats:
             target_pct=target_pct,
             stop_price=stop_price,
             stop_pct=stop_pct,
-            deadline_at=opened_at + timedelta(hours=settings.POSITION_HORIZON_H),
+            deadline_at=deadline_at,
             signal_id=int(row["signal_id"]),
             probability=None if row["probability"] is None
             else float(row["probability"]),
             entry_lag_sec=lag,
+            # §8.2 ТЗ 9.2: у версии 6 предела нет, и сообщение о нём молчит.
+            plus_price=breakeven_price(
+                entry_price, settings.RISK_COST_ROUNDTRIP_PCT
+            ) if without_stop(version) else None,
+            plus_wait_hours=int(settings.POSITION_PLUS_WAIT_START_HOURS),
         ))
     return stats
 
@@ -467,6 +601,7 @@ async def run_once(now: datetime | None = None) -> IterationStats:
     now = now or datetime.now(UTC)
     closed = await sync_open_positions(now)
     opened = await open_new_positions(now)
+    await _count_refusals(now, opened.refusals)
     return IterationStats(closed=closed, opened=opened)
 
 
@@ -479,9 +614,16 @@ async def _heartbeat() -> None:
 async def run() -> None:
     """Вечный цикл. Не падает ни при каких ошибках итерации."""
     _log.info(
-        "Сервис ведения позиций запущен (Этап 9.1, позиции ВИРТУАЛЬНЫЕ)",
+        "Сервис ведения позиций запущен (Этап 9.2, позиции ВИРТУАЛЬНЫЕ)",
         interval=settings.POSITION_INTERVAL,
+        logic_version=settings.LOGIC_VERSION,
+        # Три числа рядом намеренно: горизонт СИГНАЛА, срок жизни ПОЗИЦИИ и
+        # отметка начала ожидания плюса — разные величины, и в журнале запуска
+        # они обязаны быть видны все три, иначе первая же правка одного из них
+        # будет истолкована как правка другого.
         horizon_h=settings.POSITION_HORIZON_H,
+        max_hold_hours=settings.POSITION_MAX_HOLD_HOURS,
+        plus_wait_start_hours=settings.POSITION_PLUS_WAIT_START_HOURS,
         min_probability=settings.POSITION_MIN_PROBABILITY,
         max_open=settings.POSITION_MAX_OPEN,
         slot_usd=settings.POSITION_SLOT_USD,

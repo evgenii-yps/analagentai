@@ -32,7 +32,30 @@ EXIT_RU = {
     "timeout": "истёк срок",
     "ambiguous": "цель и предел в одной свече — итог по пределу",
     "data_gap": "пробел в данных — исход не измерен",
+    # Этап 9.2 §8.1: новый исход назван человеческим языком, а не ключом.
+    # «plus_exit» в сообщении означало бы, что человек обязан помнить перечень
+    # машиночитаемых значений колонки.
+    "plus_exit": "вышли в плюс после суток ожидания",
 }
+
+# ИСХОД ПО СРОКУ У ВЕРСИИ 6 НАЗЫВАЕТСЯ ТЕМ ЖЕ КЛЮЧОМ 'timeout', НО СРОК У НЕГО
+# ДРУГОЙ (§5.2, §8.1 ТЗ 9.2), и в сообщении это обязано быть видно: «истёк
+# срок» после сорока восьми часов ожидания и «истёк срок» после суток — разные
+# события для того, кто читает поток. Число берётся из строки позиции, а не из
+# настройки: срок записан в ней при входе.
+EXIT_RU_WITH_HOURS = {"timeout": "истёк срок {hours} ч"}
+
+
+def exit_ru(exit_reason: str, hold_hours: int | None = None) -> str:
+    """Причина выхода человеческим языком; при известном сроке — со сроком.
+
+    ``hold_hours=None`` — срок неизвестен вызывающему; тогда печатается общая
+    формулировка. Выдумывать срок нельзя: «истёк срок 24 ч» у позиции, жившей
+    сорок восемь, — это неверное утверждение, а не приблизительное.
+    """
+    if hold_hours is not None and exit_reason in EXIT_RU_WITH_HOURS:
+        return EXIT_RU_WITH_HOURS[exit_reason].format(hours=int(hold_hours))
+    return EXIT_RU.get(exit_reason, exit_reason)
 
 
 def _esc(text: Any) -> str:
@@ -91,21 +114,50 @@ def opened_text(
     notional_usd: float,
     target_price: float,
     target_pct: float,
-    stop_price: float,
-    stop_pct: float,
+    stop_price: float | None,
+    stop_pct: float | None,
     deadline_at: datetime,
     signal_id: int,
     probability: float | None,
     entry_lag_sec: int,
+    plus_price: float | None = None,
+    plus_wait_hours: int | None = None,
 ) -> str:
-    """Сообщение об открытии позиции."""
+    """Сообщение об открытии позиции.
+
+    УПОМИНАНИЕ ПРЕДЕЛА УБЫТКА У ВЕРСИИ 6 УБРАНО (§8.2 ТЗ 9.2). Не заменено на
+    «предел — нет», не оставлено с прочерком: строка исчезает целиком, а на её
+    месте появляется то, что у этой позиции ДЕЙСТВИТЕЛЬНО есть, — цена
+    безубытка и час, с которого по ней начнут выходить. Написать о пределе у
+    позиции, у которой его нет, значило бы ввести в заблуждение; написать
+    «предела нет» и на этом остановиться — оставить человека без второй
+    половины правила.
+
+    ``stop_price is None`` и есть признак версии 6: он приходит из строки
+    позиции, а не из настройки, — сообщение не обязано знать, какая версия
+    сейчас в ``.env``.
+    """
     prob = "—" if probability is None else f"{float(probability):.2f}"
+    if stop_price is None or stop_pct is None:
+        wait = "" if plus_wait_hours is None else f" с {int(plus_wait_hours)}-го часа"
+        plus = (
+            "предела убытка нет"
+            if plus_price is None
+            else f"предела убытка нет · выход в плюс от {_price(plus_price)}{wait}"
+        )
+        levels_line = (
+            f"Цель {_price(target_price)} (+{float(target_pct):.2f}%) · {plus}"
+        )
+    else:
+        levels_line = (
+            f"Цель {_price(target_price)} (+{float(target_pct):.2f}%) · "
+            f"предел {_price(stop_price)} (−{float(stop_pct):.2f}%)"
+        )
     return (
         "🟢 <b>Открыта позиция (виртуально)</b>\n"
         f"{_esc(symbol)} · вход {_price(entry_price)} · "
         f"${float(notional_usd):.2f}\n"
-        f"Цель {_price(target_price)} (+{float(target_pct):.2f}%) · "
-        f"предел {_price(stop_price)} (−{float(stop_pct):.2f}%)\n"
+        f"{levels_line}\n"
         f"Срок до {_msk(deadline_at)}\n"
         f"Сигнал #{int(signal_id)}, вероятность {prob}, "
         f"задержка входа {int(entry_lag_sec)} с"
@@ -122,14 +174,23 @@ def closed_text(
     net_pnl_usd: float,
     cost_pct: float,
     held_sec: float,
+    logic_version: int | None = None,
+    hold_hours: int | None = None,
 ) -> str:
     """Сообщение о закрытии позиции.
 
     Издержки названы в тексте числом намеренно: итог показан УЖЕ за их вычетом,
     и без этой строки человек, сверяющий числа с ценами входа и выхода, каждый
     раз обнаруживал бы недостачу и искал ошибку.
+
+    ``hold_hours`` — срок ЭТОЙ позиции; при исходе ``timeout`` он попадает в
+    текст («истёк срок 48 ч»), потому что у версий 5 и 6 сроки разные, а слова
+    одни (§5.2, §8.1 ТЗ 9.2). ``logic_version`` печатается отдельной пометкой:
+    позиции двух версий идут в одном потоке сообщений, и человек, читающий
+    поток, обязан видеть, по какому правилу закрыта каждая, — иначе он сложит
+    их результаты в уме, а складывать их нельзя (§1.4 ТЗ).
     """
-    reason = EXIT_RU.get(exit_reason, exit_reason)
+    reason = exit_ru(exit_reason, hold_hours)
     return (
         "🔵 <b>Закрыта позиция (виртуально)</b>\n"
         f"{_esc(symbol)} · {_esc(reason)}\n"
@@ -137,6 +198,7 @@ def closed_text(
         f"Итог {float(net_pnl_pct):+.2f}% (${float(net_pnl_usd):+.3f}) "
         f"с учётом издержек {float(cost_pct):.2f}%\n"
         f"В позиции {held_ru(held_sec)}"
+        + ("" if logic_version is None else f" · правило v{int(logic_version)}")
     )
 
 

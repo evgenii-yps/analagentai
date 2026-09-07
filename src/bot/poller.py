@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -25,6 +25,7 @@ from src.core.redis_client import get_redis
 from src.core.user_settings import UserSettings, default_settings
 from src.notify.agent import AGENT_ORDER
 from src.notify.telegram import send_message
+from src.positions.rules import REFUSAL_REASONS, refusal_key
 
 # TTL heartbeat-ключа (секунды) — как у остальных сервисов.
 _HEARTBEAT_TTL = 300
@@ -462,15 +463,55 @@ class BotPoller:
         единственное — таблица ``user_settings``, — и этот этап его не
         расширяет: команда ничего не открывает и не закрывает.
         """
+        version = int(settings.LOGIC_VERSION)
         open_rows = await self.queries.positions_open()
-        summary = await self.queries.positions_summary(days=7)
+        # ИТОГ ЗА ОКНО — ПО ТЕКУЩЕЙ ВЕРСИИ ПРАВИЛА, А НЕ ПО ВСЕМ СРАЗУ (§1.4
+        # ТЗ 9.2): позиции версий 5 и 6 закрывались разными правилами выхода и
+        # несравнимы. Накопленный итог при этом показывается и общий (деньги на
+        # счёте общие), и по версиям отдельно — это разные вопросы.
+        summary = await self.queries.positions_summary(
+            days=7, logic_version=version
+        )
         capital = await self.queries.positions_capital()
         return handlers.render_positions(
             open_rows, summary, now, days=7,
             capital=capital,
             budget_usd=settings.POSITION_BUDGET_USD,
             slot_usd=settings.POSITION_SLOT_USD,
+            logic_version=version,
+            refusals=await self._read_refusals(now, version, days=7),
         )
+
+    async def _read_refusals(
+        self, now: datetime, logic_version: int, days: int
+    ) -> dict[str, int]:
+        """Суточные счётчики отказов во входе из Redis (§7.2 ТЗ 9.2).
+
+        КЛЮЧИ ПИШЕТ СЕРВИС ПОЗИЦИЙ (``src/positions/runner._count_refusals``),
+        и имя ключа собирается ТОЙ ЖЕ функцией ``refusal_key``, а не повторено
+        здесь строкой: две одинаковые строки в разных файлах однажды разошлись
+        бы, и счётчики просто перестали бы находиться — молча, без единой
+        ошибки, показывая честный ноль.
+
+        ОШИБКА REDIS НЕ ЛОМАЕТ КОМАНДУ: /positions отвечает и без счётчиков.
+        Позиции — это база, а счётчики — удобство, и терять первое из-за
+        второго нельзя.
+        """
+        out: dict[str, int] = {}
+        try:
+            for offset in range(int(days)):
+                day = (now - timedelta(days=offset)).strftime("%Y-%m-%d")
+                for reason in REFUSAL_REASONS:
+                    raw = await self.redis.get(
+                        refusal_key(logic_version, day, reason)
+                    )
+                    if raw is None:
+                        continue
+                    out[reason] = out.get(reason, 0) + int(raw)
+        except Exception as exc:  # noqa: BLE001 — счётчик не важнее ответа
+            self._log.warning("bot_refusals_read_failed=1", error=str(exc))
+            return {}
+        return out
 
     async def _heartbeat(self) -> None:
         """Пишет в Redis отметку живости бота (bot:heartbeat, ISO, TTL 300)."""

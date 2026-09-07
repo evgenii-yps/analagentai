@@ -155,7 +155,7 @@ class _Recorder:
         *,
         ambiguous: list[dict[str, Any]] | None = None,
         not_found: list[str] | None = None,
-        version: str | None = "9.1.2.2",
+        version: str | None = "9.2",
     ) -> None:
         self.calls: list[dict[str, Any]] = []
         self.ambiguous = ambiguous or []
@@ -877,8 +877,8 @@ def test_the_receiver_declares_the_new_version_everywhere_it_is_named() -> None:
     """
     receiver = (_ROOT / "deploy" / "apps_script.gs").read_text(encoding="utf-8")
     client = (_ROOT / "src" / "export_main.py").read_text(encoding="utf-8")
-    assert "const RECEIVER_VERSION = '9.1.2.2';" in receiver
-    assert '_TRADES_RECEIVER_VERSION = "9.1.2.2"' in client
+    assert "const RECEIVER_VERSION = '9.2';" in receiver
+    assert '_TRADES_RECEIVER_VERSION = "9.2"' in client
     # Инструкция обновления называет ту же версию — по ней владелец проверяет,
     # что переразвернул скрипт.
-    assert "receiver_version=9.1.2.2" in receiver
+    assert "receiver_version=9.2" in receiver

@@ -560,15 +560,19 @@ def test_exit_reasons_match_the_database_constraint() -> None:
 
     Расхождение проявилось бы отказом вставки в проде, а не здесь.
 
-    ЧИТАЮТСЯ ОБЕ МИГРАЦИИ. Ограничение ``positions_reason_chk`` завела 018, а
-    Этап 9.1.1 §6 пересоздал его миграцией 019 с пятым значением ``data_gap``:
-    искать все причины в одной 018 значило бы искать их там, где их уже нет.
-    Строгую сверку СОСТАВА (ровно те значения и ни одним больше) делает
-    ``tests/test_stage_9_1_1.py``.
+    ЧИТАЮТСЯ ВСЕ ТРИ МИГРАЦИИ. Ограничение ``positions_reason_chk`` завела 018,
+    Этап 9.1.1 §6 пересоздал его миграцией 019 с пятым значением ``data_gap``, а
+    Этап 9.2 §5.1 — миграцией 025 с шестым, ``plus_exit``: искать все причины в
+    одной 018 значило бы искать их там, где их уже нет. Строгую сверку СОСТАВА
+    (ровно те значения и ни одним больше) делает ``tests/test_stage_9_1_1.py``.
     """
     migrations = "".join(
         (_ROOT / "db" / "migrations" / name).read_text(encoding="utf-8")
-        for name in ("018_positions.sql", "019_positions_data_gap.sql")
+        for name in (
+            "018_positions.sql",
+            "019_positions_data_gap.sql",
+            "025_positions_no_stop.sql",
+        )
     )
     for reason in EXIT_REASONS:
         assert f"'{reason}'" in migrations, reason

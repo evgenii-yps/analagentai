@@ -107,7 +107,13 @@ class _Log:
 
 
 class _Sheet:
-    """Двойник листа с ПРАВИЛОМ ЗАНЯТОЙ МЕТКИ приёмника 9.1.2.2.
+    """Двойник листа с ПРАВИЛОМ ЗАНЯТОЙ МЕТКИ приёмника 9.1.2.2 и новее.
+
+    ВЕРСИЯ, КОТОРОЙ ОН ПРЕДСТАВЛЯЕТСЯ, БЕРЁТСЯ У КЛИЕНТА
+    (``export_main._TRADES_RECEIVER_VERSION``), а не вписана сюда числом.
+    Вписанная, она превращала бы каждый подъём версии приёмника в отказ всех
+    опытов этого файла с сообщением «обновите скрипт в Google» — и опыт про
+    занятую метку падал бы по причине, к занятой метке отношения не имеющей.
 
     Он повторяет ровно то, что делает ``deploy/apps_script.gs``, и ровно в той
     части, которая для этих проверок существенна:
@@ -151,7 +157,10 @@ class _Sheet:
     ) -> sheets.SheetsResult:
         self.calls.append({"sheet": sheet, "mode": mode, "rows": rows, **kw})
         if mode == "version":
-            return sheets.SheetsResult(ok=True, receiver_version="9.1.2.2")
+            return sheets.SheetsResult(
+                ok=True,
+                receiver_version=export_main._TRADES_RECEIVER_VERSION,
+            )
         if mode == "table_append":
             return self._append(rows, kw.get("notes") or [])
         if mode == "table_update":
@@ -185,7 +194,7 @@ class _Sheet:
             inserted += 1
         return sheets.SheetsResult(
             ok=True, inserted=inserted, start_row=start_row,
-            receiver_version="9.1.2.2", ambiguous=ambiguous,
+            receiver_version=export_main._TRADES_RECEIVER_VERSION, ambiguous=ambiguous,
         )
 
     def _update(self, updates: list[dict[str, Any]]) -> sheets.SheetsResult:
@@ -206,14 +215,14 @@ class _Sheet:
             row["note"] = str(row["note"]) + str(item.get("noteAppend") or "")
             updated += 1
         return sheets.SheetsResult(
-            ok=True, updated=updated, receiver_version="9.1.2.2",
+            ok=True, updated=updated, receiver_version=export_main._TRADES_RECEIVER_VERSION,
             not_found=not_found, ambiguous=ambiguous,
         )
 
 
 def _result(**over: Any) -> sheets.SheetsResult:
     """Ответ приёмника с ok=true и заданными полями — для проверок разбора."""
-    fields: dict[str, Any] = {"ok": True, "receiver_version": "9.1.2.2"}
+    fields: dict[str, Any] = {"ok": True, "receiver_version": export_main._TRADES_RECEIVER_VERSION}
     fields.update(over)
     return sheets.SheetsResult(**fields)
 
@@ -325,18 +334,27 @@ def test_a_marker_outside_the_batch_is_a_refusal_with_no_position() -> None:
     assert log.of("error")[0]["position_id"] is None
 
 
-def test_the_receiver_version_requirement_is_untouched() -> None:
-    """§4: требуемая версия приёмника осталась 9.1.2.2, и приёмник не менялся.
+def test_the_receiver_version_requirement_matches_the_receiver() -> None:
+    """§4: требуемая версия приёмника и объявленная им — одна и та же строка.
 
-    Этап правит ТОЛЬКО клиента. Поднять требование к версии значило бы
-    потребовать развернуть в Google скрипт, которого этот этап не писал, и
-    остановить выгрузку до тех пор, пока этого не сделают.
+    ЧТО ЭТОТ ТЕСТ ПРОВЕРЯЛ ИЗНАЧАЛЬНО И ПОЧЕМУ ПЕРЕПИСАН. Этап 9.1.2.3 правил
+    ТОЛЬКО клиента, и тест закреплял именно это: требование к версии осталось
+    9.1.2.2, приёмник не тронут. Этап 9.2 §6.1 приёмник ТРОНУЛ — починил
+    переполнение столбца времени на сутках — и поднял версию до 9.2, а вместе с
+    ней требование клиента. Оставить здесь строку «9.1.2.2» значило бы
+    требовать, чтобы будущее не наступало.
+
+    А ВОТ ЧТО ОСТАЁТСЯ ВЕРНЫМ НАВСЕГДА и потому проверяется теперь: две версии
+    — требуемая клиентом и объявленная приёмником — обязаны совпадать. Их
+    расхождение самый тихий из возможных отказов: выгрузка встаёт целиком, а
+    выглядит это как «Google не отвечает».
     """
-    assert export_main._TRADES_RECEIVER_VERSION == "9.1.2.2"
     receiver = (_ROOT / "deploy" / "apps_script.gs").read_text(encoding="utf-8")
-    assert "var RECEIVER_VERSION = '9.1.2.2'" in receiver or (
-        "RECEIVER_VERSION = '9.1.2.2'" in receiver
-    ), "версия приёмника в deploy/apps_script.gs изменилась"
+    declared = re.search(
+        r"RECEIVER_VERSION = '([^']+)'", receiver
+    )
+    assert declared is not None, "приёмник не объявляет версию вовсе"
+    assert export_main._TRADES_RECEIVER_VERSION == declared.group(1)
 
 
 # =============================================================================

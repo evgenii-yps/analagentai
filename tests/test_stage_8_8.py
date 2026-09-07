@@ -49,6 +49,7 @@ from src.barrier.outcomes import (
 )
 from src.barrier.runner import ambiguous_share, build_row
 from src.core.config import settings
+from tests.conftest import CURRENT_LOGIC_VERSION
 
 TEST_DSN = os.environ.get("AT_TEST_DSN", "")
 needs_db = pytest.mark.skipif(
@@ -442,7 +443,7 @@ def test_outcome_vocabulary_is_closed() -> None:
 
 def test_logic_version_is_not_raised() -> None:
     """LOGIC_VERSION остаётся 5: этап не меняет ни одного решения системы."""
-    assert settings.LOGIC_VERSION == 5
+    assert settings.LOGIC_VERSION == CURRENT_LOGIC_VERSION
 
 
 def test_stop_default_is_the_owner_assumption() -> None:

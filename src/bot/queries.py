@@ -596,14 +596,47 @@ class BotQueries:
             FROM positions;
             """
         )
+        # НАКОПЛЕННЫЙ ИТОГ — ЕЩЁ И ПО ВЕРСИЯМ ОТДЕЛЬНО (§1.4 ТЗ 9.2). Общая
+        # сумма остаётся: деньги на счёте общие, и вопрос «сколько система
+        # заработала всего» законен. Но версии 5 и 6 ведутся РАЗНЫМИ правилами
+        # выхода и потому несравнимы, и одна сумма на двоих скрывала бы ровно
+        # то, ради чего этап затеян: чем новое правило отличается от старого.
+        # Поэтому рядом печатается разбивка, а не вместо.
+        by_version = await self._pool.fetch(
+            """
+            SELECT logic_version,
+                   count(*) FILTER (WHERE status = 'closed'
+                                    AND exit_reason <> 'data_gap') AS closed,
+                   COALESCE(sum(net_pnl_usd)
+                       FILTER (WHERE status = 'closed'
+                               AND exit_reason <> 'data_gap'), 0)
+                       AS realized_usd
+            FROM positions
+            GROUP BY logic_version
+            ORDER BY logic_version;
+            """
+        )
+        versions = [
+            {
+                "logic_version": int(r["logic_version"]),
+                "closed": int(r["closed"]),
+                "realized_usd": float(r["realized_usd"]),
+            }
+            for r in by_version
+        ]
         if row is None:
-            return {"committed_usd": 0.0, "realized_usd": 0.0}
+            return {
+                "committed_usd": 0.0, "realized_usd": 0.0, "by_version": versions,
+            }
         return {
             "committed_usd": float(row["committed_usd"]),
             "realized_usd": float(row["realized_usd"]),
+            "by_version": versions,
         }
 
-    async def positions_summary(self, days: int = 7) -> dict[str, Any]:
+    async def positions_summary(
+        self, days: int = 7, logic_version: int | None = None
+    ) -> dict[str, Any]:
         """Итог по закрытым позициям за окно: счёт, разбивка, средние.
 
         Число закрытий с ``outcome_certain = FALSE`` считается ОТДЕЛЬНО и
@@ -611,6 +644,17 @@ class BotQueries:
         (пессимистично), потому что порядок событий внутри минуты неизвестен, —
         и знать их долю нужно, иначе средний итог читался бы как измеренный,
         а он частично оценочный.
+
+        ВЕРСИИ ЛОГИКИ НЕ СМЕШИВАЮТСЯ (§1.4 ТЗ 9.2), и это не оформление, а
+        правило проекта. Позиции версии 5 закрывались по пределу убытка через
+        сутки, позиции версии 6 — без предела, с ожиданием плюса до сорока
+        восьми часов. Средний итог по обеим версиям сразу не описывает ни одну
+        из них: он описывает смесь, состав которой меняется каждый день просто
+        потому, что старых сделок в окне становится меньше.
+
+        ``logic_version=None`` — без фильтра; так эта функция и вела себя до
+        Этапа 9.2, и такой вызов остаётся законным ровно для одного случая:
+        когда версий в базе всего одна.
         """
         # СРЕДНИЕ И СУММЫ СЧИТАЮТСЯ БЕЗ ЗАКРЫТИЙ ПО ПРОБЕЛУ (§6.7 ТЗ 9.1.1).
         # У них цена выхода не наблюдалась, а восстановлена: их итог описывает
@@ -633,9 +677,10 @@ class BotQueries:
                        AS avg_slippage_pct
             FROM positions
             WHERE status = 'closed'
-              AND closed_at >= now() - make_interval(days => $1::int);
+              AND closed_at >= now() - make_interval(days => $1::int)
+              AND ($2::smallint IS NULL OR logic_version = $2);
             """,
-            int(days),
+            int(days), logic_version,
         )
         reasons = await self._pool.fetch(
             """
@@ -643,13 +688,15 @@ class BotQueries:
             FROM positions
             WHERE status = 'closed'
               AND closed_at >= now() - make_interval(days => $1::int)
+              AND ($2::smallint IS NULL OR logic_version = $2)
             GROUP BY exit_reason
             ORDER BY n DESC;
             """,
-            int(days),
+            int(days), logic_version,
         )
         summary = dict(row) if row is not None else {}
         summary["by_reason"] = [
             (str(r["exit_reason"]), int(r["n"])) for r in reasons
         ]
+        summary["logic_version"] = logic_version
         return summary
