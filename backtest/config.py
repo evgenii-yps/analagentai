@@ -233,6 +233,19 @@ def _parse_env_file(path: Path) -> dict[str, str]:
     return values
 
 
+def read_env_file(path: Path) -> dict[str, str]:
+    """Публичное чтение ``backtest/.env.backtest`` для потребителей вне прогона.
+
+    Замер 0 читает из того же файла СВОИ ключи (``BT_HTF_BARS``,
+    ``BT_HTF_INSTRUMENTS``), но полную конфигурацию прогона не загружает: ему
+    не нужны ни горизонты, ни состав агентов, ни издержки, а
+    :func:`load_config` без них не собирается. Второй разбор того же формата
+    завёл бы вторую трактовку одних и тех же строк — в том числе диагностику
+    дефекта D-9 («на месте файла КАТАЛОГ»), которую пришлось бы помнить дважды.
+    """
+    return _parse_env_file(path)
+
+
 def _require(values: dict[str, str], key: str) -> str:
     value = values.get(key, "").strip()
     if not value:
