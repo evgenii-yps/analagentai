@@ -325,6 +325,16 @@ async def main() -> int:
     parser.add_argument("--config", default=str(CONFIG_PATH))
     parser.add_argument("--page-limit", type=int, default=DEFAULT_PAGE_LIMIT,
                         help="страница загрузки старших баров; максимум измеряется зондом")
+    parser.add_argument(
+        "--steps", choices=("all", "hourly", "htf"), default="all",
+        help=(
+            "какие шаги выполнять: all — оба (по умолчанию), hourly — только "
+            "часовой ряд (шаг 2), htf — только старшие ряды (шаг 3). Разделение "
+            "нужно затем, чтобы между ними лёг слепок целей "
+            "(scripts/risk_targets_parity_z0.py --snapshot): иначе расхождение "
+            "целей нельзя будет отличить от влияния свежих часовых свечей"
+        ),
+    )
     args = parser.parse_args()
 
     setup_logging()
@@ -365,16 +375,36 @@ async def main() -> int:
         before = await db.production_row_counts()
         print_counts("Счётчики продакшн-таблиц ДО (§13.10 ТЗ):", before)
 
-        hourly_appended = await load_hourly(
-            instruments, since, until, apply=args.apply
-        )
-        gaps = await check_gaps(instruments, since, until)
-        results = await load_htf(
-            instruments, bars, pause_ms=settings["pause_ms"],
-            page_limit=args.page_limit, apply=args.apply,
-        )
-        chain_pairs = await verify_chains(instruments, bars) if args.apply else 0
-        if not args.apply:
+        do_hourly = args.steps in ("all", "hourly")
+        do_htf = args.steps in ("all", "htf")
+
+        hourly_appended = 0
+        gaps = 0
+        if do_hourly:
+            hourly_appended = await load_hourly(
+                instruments, since, until, apply=args.apply
+            )
+            gaps = await check_gaps(instruments, since, until)
+        else:
+            print("\n=== Шаг 2 ПРОПУЩЕН (--steps htf) ===", flush=True)
+            print("  Часовой ряд не трогался. Числа z0_hourly_appended и "
+                  "z0_hourly_gaps ниже — нули ПОТОМУ ЧТО ШАГ НЕ ВЫПОЛНЯЛСЯ, а "
+                  "не потому, что дописывать было нечего.", flush=True)
+
+        results: list[HtfLoadResult] = []
+        chain_pairs = 0
+        if do_htf:
+            results = await load_htf(
+                instruments, bars, pause_ms=settings["pause_ms"],
+                page_limit=args.page_limit, apply=args.apply,
+            )
+            chain_pairs = await verify_chains(instruments, bars) if args.apply else 0
+        else:
+            print("\n=== Шаг 3 ПРОПУЩЕН (--steps hourly) ===", flush=True)
+            print("  Старшие ряды не грузились. САМОЕ ВРЕМЯ снять слепок целей: "
+                  "python scripts/risk_targets_parity_z0.py --snapshot "
+                  "/opt/agent-trade/analysis_out/z0_targets.json", flush=True)
+        if do_htf and not args.apply:
             print("\n=== Шаг 3. Проверка календаря пропущена ===", flush=True)
             print("  Без --apply новые бары в базу не попали, и проверять "
                   "нечего. Это НЕ «проверка прошла».", flush=True)
@@ -401,11 +431,15 @@ async def main() -> int:
         print("\n" + "=" * 100, flush=True)
         print(" ИТОГ ШАГОВ 2–3", flush=True)
         print("=" * 100, flush=True)
-        print(f"  часовых баров дописано:        {hourly_appended}", flush=True)
-        print(f"  пропущено часов (не латано):   {gaps}", flush=True)
-        print(f"  старших баров записано:        {htf_written}", flush=True)
+        print(f"  выполнены шаги:                {args.steps}", flush=True)
+        print(f"  часовых баров дописано:        {hourly_appended}"
+              + ("" if do_hourly else "   (ШАГ НЕ ВЫПОЛНЯЛСЯ)"), flush=True)
+        print(f"  пропущено часов (не латано):   {gaps}"
+              + ("" if do_hourly else "   (ШАГ НЕ ВЫПОЛНЯЛСЯ)"), flush=True)
+        print(f"  старших баров записано:        {htf_written}"
+              + ("" if do_htf else "   (ШАГ НЕ ВЫПОЛНЯЛСЯ)"), flush=True)
         print(f"  незакрытых баров отброшено:    {dropped}", flush=True)
-        if dropped == 0:
+        if dropped == 0 and do_htf:
             print("  ⚠ НОЛЬ ОТБРОШЕННЫХ — ПОДОЗРИТЕЛЬНО (§8 ТЗ). Это доклад, а не "
                   "успех: проверьте, что свежий край брался с /market/candles.",
                   flush=True)

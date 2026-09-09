@@ -855,3 +855,208 @@ async def test_calendar_chain_is_verified_on_stored_series(bt_pool) -> None:
     )
     with pytest.raises(HtfError, match="конец бара"):
         await verify_stored_chain(INST, "1Dutc")
+
+
+# ---------------------------------------------------------------------------
+# Цели по вероятности до и после загрузки старших рядов
+# ---------------------------------------------------------------------------
+#
+# Замер 0 кладёт старшие бары в ТУ ЖЕ таблицу, из которой продакшн считает цели.
+# Решение опиралось на утверждение «все читатели фильтруют по bar», проверенное
+# ЧТЕНИЕМ КОДА. Проверки ниже закрепляют ИЗМЕРЕНИЕ этого утверждения — и, что
+# важнее, доказывают, что измерение способно поймать нарушение.
+
+
+def _hourly_rows(count: int, start: datetime) -> list[dict[str, Any]]:
+    """Часовые строки в том виде, в каком их отдаёт db.get_backtest_candles."""
+    rows: list[dict[str, Any]] = []
+    for index in range(count):
+        price = Decimal("30000") + Decimal(index % 173)
+        rows.append({
+            "open_time": start + timedelta(hours=index),
+            "open": price,
+            "high": price + Decimal("12"),
+            "low": price - Decimal("9"),
+            "close": price + Decimal("3"),
+        })
+    return rows
+
+
+def _daily_rows_same_table(hours: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Дневные бары, подмешанные в тот же ответ, — так выглядел бы ответ
+    запроса, забывшего фильтр по ``bar``."""
+    extra: list[dict[str, Any]] = []
+    for row in hours:
+        if row["open_time"].hour == 0:
+            extra.append({
+                "open_time": row["open_time"],
+                "open": Decimal("30000"), "high": Decimal("31000"),
+                "low": Decimal("29000"), "close": Decimal("30500"),
+            })
+    return sorted(hours + extra, key=lambda item: item["open_time"])
+
+
+def test_window_arithmetic_copy_matches_production() -> None:
+    """Копия оконной арифметики не разошлась с ``src/risk/runner.py``.
+
+    ЗАЧЕМ ЭТА ПРОВЕРКА СУЩЕСТВУЕТ. §1 ТЗ Замера 0 запрещает менять
+    ``src/risk/*``, поэтому вынести общую функцию нельзя, и три строки расчёта
+    окна пришлось повторить в ``scripts/risk_targets_parity_z0.py``. Копия без
+    присмотра однажды разойдётся с оригиналом, и разойдётся МОЛЧА: слепок
+    считался бы по другому окну, чем продакшн, а выглядело бы это как
+    расхождение целей. Проверка привязывает копию к исходнику.
+    """
+    production = (ROOT / "src" / "risk" / "runner.py").read_text(encoding="utf-8")
+    expected = (
+        "    hour_now = now.replace(minute=0, second=0, microsecond=0)\n"
+        "    window_from = hour_now - timedelta(days=settings.RISK_WINDOW_DAYS)\n",
+        "    read_from = hour_now - timedelta(\n"
+        "        days=settings.RISK_WINDOW_DAYS + settings.RISK_BACKFILL_MARGIN_DAYS\n"
+        "    )\n",
+    )
+    for fragment in expected:
+        assert fragment in production, (
+            "оконная арифметика в src/risk/runner.py изменилась. Приведите "
+            "scripts/risk_targets_parity_z0.py:target_windows в соответствие — "
+            "или, если запрет §1 снят, вынесите общую функцию и удалите копию"
+        )
+
+
+def test_targets_are_unchanged_by_higher_timeframe_rows() -> None:
+    """Старшие бары в общей таблице на цели НЕ влияют — при чтении с фильтром.
+
+    Считается продакшн-кодом (``build_rows``, ``check_series``) на одном и том
+    же замороженном моменте: разница между двумя расчётами может быть только в
+    данных.
+    """
+    from scripts.risk_targets_parity_z0 import compare, compute_targets
+
+    now = datetime(2026, 9, 9, 13, 0, tzinfo=UTC)
+    hours = _hourly_rows(24 * 95, now - timedelta(days=95))
+
+    async def reader(_inst_id: str, read_from: datetime) -> list[dict[str, Any]]:
+        return [row for row in hours if row["open_time"] >= read_from]
+
+    import asyncio
+
+    before = asyncio.run(compute_targets(now, reader=reader))
+    after = asyncio.run(compute_targets(now, reader=reader))
+    assert compare(before, after) == []
+    assert before["instruments"], "не посчитано ни одного инструмента"
+
+
+def test_targets_comparison_catches_a_missing_bar_filter() -> None:
+    """КОНТРОЛЬНЫЙ ОПЫТ: чтение БЕЗ фильтра по ``bar`` обязано уронить сравнение.
+
+    Без него проверка выше проходила бы и в мире, где цели вообще не зависят от
+    содержимого таблицы, — то есть не доказывала бы ничего. Здесь показано, что
+    случилось бы, если бы читатель свечей забыл про масштаб: посторонние строки
+    меняют и предпроверку ряда, и сами цели.
+    """
+    import asyncio
+
+    from scripts.risk_targets_parity_z0 import compare, compute_targets
+
+    now = datetime(2026, 9, 9, 13, 0, tzinfo=UTC)
+    hours = _hourly_rows(24 * 95, now - timedelta(days=95))
+    mixed = _daily_rows_same_table(hours)
+
+    async def good(_inst_id: str, read_from: datetime) -> list[dict[str, Any]]:
+        return [row for row in hours if row["open_time"] >= read_from]
+
+    async def broken(_inst_id: str, read_from: datetime) -> list[dict[str, Any]]:
+        return [row for row in mixed if row["open_time"] >= read_from]
+
+    before = asyncio.run(compute_targets(now, reader=good))
+    spoiled = asyncio.run(compute_targets(now, reader=broken))
+    diffs = compare(before, spoiled)
+    assert diffs, "посторонние строки на цели не повлияли — сравнение нечувствительно"
+    assert any("duplicates" in line for line in diffs), (
+        "дубли меток не замечены предпроверкой ряда"
+    )
+
+
+def test_fingerprint_notices_a_changed_value_not_only_a_new_row() -> None:
+    """Отпечаток часового ряда ловит ИСПРАВЛЕННУЮ свечу, а не только дописанную.
+
+    Счётчик строк заметил бы дописанную и пропустил бы исправленную, а вторая
+    опаснее: она меняет цели, не меняя ни одной границы ряда. Контрольный опыт
+    встроен: неизменный ряд обязан давать тот же хеш.
+    """
+    from scripts.risk_targets_parity_z0 import fingerprint
+
+    rows = _hourly_rows(50, datetime(2026, 9, 1, tzinfo=UTC))
+    same = fingerprint(rows)
+    assert fingerprint(list(rows)) == same
+
+    edited = [dict(row) for row in rows]
+    edited[10]["high"] = edited[10]["high"] + Decimal("500")
+    changed = fingerprint(edited)
+    assert changed["rows"] == same["rows"]
+    assert changed["first"] == same["first"] and changed["last"] == same["last"]
+    assert changed["sha256"] != same["sha256"], (
+        "исправленная свеча не изменила отпечаток — он ловил бы только "
+        "дописанные строки"
+    )
+
+
+def test_compare_names_the_differing_row_not_just_the_fact() -> None:
+    """Расхождение печатается СТРОКОЙ с именем поля и обоими значениями.
+
+    «Слепки не совпали» отправило бы человека сравнивать два json-файла
+    глазами. Контрольный опыт: одинаковые слепки дают пустой перечень.
+    """
+    from scripts.risk_targets_parity_z0 import compare
+
+    def snapshot(target_pct: float) -> dict[str, Any]:
+        return {
+            "risk_bar": "1H", "window_days": 90, "backfill_margin_days": 5,
+            "cost_roundtrip_pct": 0.22, "min_observations": 500,
+            "targets_version": 1, "horizons": [1, 4],
+            "hour_now": "h", "window_from": "f", "read_from": "r",
+            "instruments": {
+                "BTC-USDT": {
+                    "precheck": {"candles": 10, "max_run_hours": 10,
+                                 "bad_invariants": 0, "flat": 0,
+                                 "duplicates": 0, "failures": []},
+                    "targets": {
+                        "4|buy": {field: None for field in
+                                  ("n_observations", "hit_rate", "mfe_p25",
+                                   "mfe_p50", "mfe_p75", "covers_fees",
+                                   "no_target_reason", "skipped_gap",
+                                   "skipped_tail")}
+                        | {"target_pct": target_pct},
+                    },
+                    "hourly": {"rows": 10, "first": "a", "last": "b",
+                               "sha256": "x"},
+                }
+            },
+        }
+
+    assert compare(snapshot(1.5), snapshot(1.5)) == []
+    diffs = compare(snapshot(1.5), snapshot(1.75))
+    assert len(diffs) == 1
+    assert "BTC-USDT" in diffs[0] and "горизонт 4ч" in diffs[0]
+    assert "buy" in diffs[0] and "target_pct" in diffs[0]
+    assert "1.5" in diffs[0] and "1.75" in diffs[0]
+
+
+def test_compare_catches_a_changed_setting_not_only_changed_data() -> None:
+    """Изменившийся порог расчёта — тоже расхождение, и названо отдельно.
+
+    Иначе сравнение целей, посчитанных при РАЗНЫХ настройках, молча выдавалось
+    бы за сравнение данных.
+    """
+    from scripts.risk_targets_parity_z0 import compare
+
+    base: dict[str, Any] = {
+        "risk_bar": "1H", "window_days": 90, "backfill_margin_days": 5,
+        "cost_roundtrip_pct": 0.22, "min_observations": 500,
+        "targets_version": 1, "horizons": [1, 4],
+        "hour_now": "h", "window_from": "f", "read_from": "r",
+        "instruments": {},
+    }
+    changed = dict(base, cost_roundtrip_pct=0.30)
+    diffs = compare(base, changed)
+    assert len(diffs) == 1
+    assert diffs[0].startswith("НАСТРОЙКА cost_roundtrip_pct")
