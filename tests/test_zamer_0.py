@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import re
 import tracemalloc
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -1060,3 +1061,200 @@ def test_compare_catches_a_changed_setting_not_only_changed_data() -> None:
     diffs = compare(base, changed)
     assert len(diffs) == 1
     assert diffs[0].startswith("НАСТРОЙКА cost_roundtrip_pct")
+
+
+# ---------------------------------------------------------------------------
+# Фильтр по масштабу: сторож на будущее, а не разовая сверка
+# ---------------------------------------------------------------------------
+#
+# ЗАЧЕМ ЭТО ЗДЕСЬ. Решение класть старшие бары в общую backtest.candles держится
+# на том, что КАЖДЫЙ читатель фильтрует по bar. На день Замера 0 это проверено
+# поимённо — восемь мест, перечень в заголовке миграции 026. Но проверка,
+# сделанная один раз, защищает один день. Риск живой с момента первой
+# загруженной дневной свечи и остаётся живым для КАЖДОГО запроса, который
+# кто-нибудь напишет завтра.
+#
+# Проверки ниже читают исходники репозитория и падают на запросе без фильтра.
+# Они не заменяют сверку целей (scripts/risk_targets_parity_z0.py) — та
+# измеряет последствия, а эти не дают им появиться.
+
+# Файлы, где обращение к таблице разрешено БЕЗ фильтра по масштабу, и причина.
+# Перечень намеренно короткий и требует причины на каждую строку: «добавить в
+# исключения» должно быть заметнее, чем «дописать WHERE».
+BAR_FILTER_EXEMPT: dict[str, str] = {
+    # Заведомо неправильное чтение, существующее РАДИ контрольного опыта: оно
+    # показывает, что случилось бы, если бы читатель забыл про масштаб.
+    # Вызывается только из режима --control.
+    "read_candles_without_bar_filter":
+        "контрольный опыт §1.5 отчёта: чтение без фильтра — его предмет",
+}
+
+# Как выглядит фильтр по масштабу в этом проекте. Формы перечислены, потому что
+# запросы пишутся и одной строкой, и склейкой, и через список условий.
+BAR_FILTER_FORMS = (
+    "bar = $", "bar=$", "bar = ANY(", "bar IN (", "bar='", 'bar = "',
+    "AND bar", "WHERE bar",
+)
+
+
+def _enclosing_def(text: str, position: int) -> str:
+    """Имя функции, внутри которой находится ``position``. Пусто — если вне функции.
+
+    Нужно поблажке ``BAR_FILTER_EXEMPT``: она обязана действовать на ОДНУ
+    названную функцию, а не на весь файл и не на «сколько-то символов назад».
+    Первая редакция искала имя в окне перед запросом и промахивалась, стоило
+    функции обзавестись длинным описанием, — а промах поблажки в эту сторону
+    означал бы ложное обвинение исправного кода.
+    """
+    found = ""
+    for match in re.finditer(r"^\s*(?:async\s+)?def\s+([a-z_][a-z_0-9]*)",
+                             text[:position], re.MULTILINE):
+        found = match.group(1)
+    return found
+
+
+def _candles_statements(text: str) -> list[tuple[str, str, int]]:
+    """Обращения к таблице как ``(операция, текст запроса, положение в файле)``.
+
+    ОКНО БЕРЁТСЯ И НАЗАД, И ВПЕРЁД, и это не мелочь: ``SELECT`` стоит ПЕРЕД
+    ``FROM backtest.candles``. Первая редакция этой функции читала только
+    вперёд от имени таблицы, не находила в куске ни одного ``SELECT`` и потому
+    объявляла, что запросов на чтение в проекте нет вовсе. Поймал это не
+    человек, а собственная проверка на пустой разбор — она для того и написана.
+
+    Операция определяется БЛИЖАЙШИМ назад ключевым словом, а не первым
+    попавшимся: перед ``INSERT INTO backtest.candles`` в тексте вполне может
+    оказаться чужой ``SELECT``, и без этого правила вставка считалась бы
+    чтением.
+    """
+    out: list[tuple[str, str, int]] = []
+    for match in re.finditer(r"backtest\.candles", text):
+        start = match.start()
+        head = text[max(0, start - 400):start]
+        tail = text[start:start + 600]
+        end = tail.find(";")
+        statement = head + (tail if end < 0 else tail[: end + 1])
+
+        operation = "?"
+        position = -1
+        for word in ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE"):
+            found = head.upper().rfind(word)
+            if found > position:
+                operation, position = word, found
+        out.append((operation, statement, start))
+    return out
+
+
+def test_every_candles_query_filters_by_bar() -> None:
+    """Ни один запрос к ``backtest.candles`` не читает таблицу без масштаба.
+
+    Читает ИСХОДНИКИ, а не список из головы: список разошёлся бы с кодом на
+    первом же новом запросе, и разошёлся бы молча.
+    """
+    offenders: list[str] = []
+    checked = 0
+    for path in sorted(ROOT.glob("**/*.py")):
+        if any(part in {".git", "tests"} for part in path.parts):
+            continue
+        text = path.read_text(encoding="utf-8")
+        for operation, statement, position in _candles_statements(text):
+            # Только ЧТЕНИЕ: у вставки масштаб стоит в списке колонок, и
+            # фильтра там быть не может.
+            if operation != "SELECT":
+                continue
+            checked += 1
+            if any(form in statement for form in BAR_FILTER_FORMS):
+                continue
+            # Поблажка действует на ОДНУ названную функцию, а не на весь файл.
+            if _enclosing_def(text, position) in BAR_FILTER_EXEMPT:
+                continue
+            offenders.append(
+                f"{path.relative_to(ROOT)}: {' '.join(statement.split())[-160:]}"
+            )
+    assert checked >= 6, (
+        f"разбор нашёл всего {checked} запросов на чтение backtest.candles — "
+        "он сломался, и проверка молча ничего не проверяет"
+    )
+    assert not offenders, (
+        "запрос к backtest.candles без фильтра по масштабу:\n  "
+        + "\n  ".join(offenders)
+        + "\n\nС Замера 0 в этой таблице рядом с 1H лежат 1Dutc, 1Wutc и 1Mutc. "
+        "Запрос без фильтра вернёт их вперемешку."
+    )
+
+
+def test_bar_filter_guard_catches_a_query_that_forgets_it() -> None:
+    """КОНТРОЛЬНЫЙ ОПЫТ к сторожу: запрос без фильтра обязан быть найден.
+
+    Без него проверка выше проходила бы и при сломанном разборе — ровно тот
+    способ, которым на Этапе 9.1.3 три проверки прошли, ничего не проверив.
+    """
+    good = (
+        "SELECT open_time, close FROM backtest.candles "
+        "WHERE inst_id = $1 AND bar = $2 ORDER BY open_time;"
+    )
+    bad = (
+        "SELECT open_time, close FROM backtest.candles "
+        "WHERE inst_id = $1 ORDER BY open_time;"
+    )
+    insert = (
+        "INSERT INTO backtest.candles (inst_id, bar, open_time) "
+        "VALUES ($1,$2,$3);"
+    )
+
+    good_op, good_sql, _ = _candles_statements(good)[0]
+    bad_op, bad_sql, _ = _candles_statements(bad)[0]
+    insert_op, _, _ = _candles_statements(insert)[0]
+
+    assert good_op == "SELECT" and bad_op == "SELECT"
+    assert insert_op == "INSERT", "вставка принята за чтение — сторож ругался бы на неё"
+    assert any(form in good_sql for form in BAR_FILTER_FORMS)
+    assert not any(form in bad_sql for form in BAR_FILTER_FORMS), (
+        "запрос БЕЗ фильтра признан отфильтрованным — сторож слеп"
+    )
+
+
+def test_reading_candles_has_no_default_scale() -> None:
+    """У аргумента масштаба нет значения по умолчанию НИ В ОДНОМ читателе.
+
+    Значение по умолчанию опаснее отсутствующего фильтра тем, что выглядит
+    исправным кодом: вызов молча получает отчёт про часовой ряд на вопрос про
+    дневной, и «пропусков нет» означает «я смотрел не туда».
+
+    Проверяются оба читателя, у которых масштаб — параметр:
+    ``db.get_backtest_candles`` (продакшн, цели по вероятности) и
+    ``integrity.check_continuity`` (непрерывность рядов).
+    """
+    import inspect
+
+    from backtest.integrity import check_continuity
+    from src.core.db import DB
+
+    production = inspect.signature(DB.get_backtest_candles).parameters["bar"]
+    assert production.default is inspect.Parameter.empty, (
+        "у bar в db.get_backtest_candles появилось значение по умолчанию — "
+        "запрос целей молча читал бы один масштаб вместо запрошенного"
+    )
+
+    continuity = inspect.signature(check_continuity).parameters["bar"]
+    assert continuity.default is inspect.Parameter.empty, (
+        "у bar в check_continuity появилось значение по умолчанию — отчёт о "
+        "непрерывности дневного ряда молча считался бы по часовому"
+    )
+
+
+async def test_continuity_refuses_candles_without_a_scale() -> None:
+    """Ряд свечей без масштаба — отказ, а не молчаливый выбор часового.
+
+    Контрольный опыт встроен: тот же вызов С масштабом обязан работать, иначе
+    проверка запрещала бы законное обращение.
+    """
+    from backtest.integrity import SERIES_CANDLES, SERIES_FUNDING, check_continuity
+
+    with pytest.raises(ValueError, match="масштаб обязателен"):
+        await check_continuity(
+            INST, SERIES_CANDLES, DAY, DAY + timedelta(days=1), bar=None
+        )
+    # У funding масштаба не существует, и bar=None там законен: проверка не
+    # должна мешать обращению, ради которого поблажка и оставлена.
+    assert SERIES_FUNDING != SERIES_CANDLES

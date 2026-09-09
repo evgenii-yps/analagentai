@@ -154,7 +154,11 @@ async def _integrity(cfg: BacktestConfig) -> dict[str, list[tuple]]:
         funding = None
         if cfg.with_futures and pair.swap:
             funding = await integrity.check_continuity(
-                pair.swap, integrity.SERIES_FUNDING, cfg.period_from, cfg.period_to
+                # bar=None — у ставок финансирования масштаба не существует.
+                # Написано явно: значения по умолчанию у bar больше нет, и
+                # промолчать здесь нельзя.
+                pair.swap, integrity.SERIES_FUNDING, cfg.period_from,
+                cfg.period_to, bar=None,
             )
             await integrity.save_gaps(funding)
         _log.info(
