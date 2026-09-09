@@ -1,0 +1,251 @@
+# Runbook: прогон Замера 0 на сервере
+
+Одна команда на строку. Под каждой — строка **✅** (что должно появиться, если
+всё хорошо) и **❌** (что означает другое).
+
+Имена взяты **из `docker-compose.yml`**, а не из текста задания:
+**служба `backtest`, профиль `backtest`, `mem_limit: 1g`.**
+
+**Оценки времени — ОЦЕНКИ, а не замеры.** Со стенда биржа недоступна, ни один
+сетевой шаг не хронометрировался. Реальные числа зависят от измеренного зондом
+`limit` и от того, сколько истории уже лежит в базе (это печатает `already_in_db`).
+
+`Ctrl+C` при `docker compose run` **не останавливает контейнер**, а только
+отсоединяет окно. Остановка — `docker rm -f <имя>`.
+
+---
+
+## 1. Бэкап базы  ⏱ 1–5 мин
+
+```bash
+cd /opt/agent-trade && sudo -u agent bash scripts/backup_db.sh
+```
+✅ `Бэкап готов: /opt/agent-trade/backups/agenttrade_<дата>.dump.gz (<размер>)` — ❌ `не удалось создать дамп БД (pg_dump)` означает, что контейнер `postgres` не отвечает; дальше не идти, восстанавливаться будет не из чего.
+
+## 2. Обновление кода  ⏱ секунды
+
+```bash
+cd /opt/agent-trade && sudo -u agent git pull
+```
+✅ строки `create mode … scripts/probe_htf_depth.py`, `… scripts/risk_targets_parity_z0.py`, `… db/migrations/026_backtest_candles_htf.sql` — ❌ `Already up to date.` при отсутствии этих файлов означает, что ветка не та: проверьте `git log --oneline -1`.
+
+```bash
+cd /opt/agent-trade && sudo -u agent git log --oneline -1
+```
+✅ верхний коммит содержит «Замер 0» или «масштаб чтения backtest.candles» — ❌ другой коммит: `git pull` не довёл ветку, повторите.
+
+## 3. Миграция 026  ⏱ секунды
+
+```bash
+cd /opt/agent-trade && sudo -u agent docker compose exec -T postgres psql -U agenttrade -d agenttrade < db/migrations/026_backtest_candles_htf.sql
+```
+✅ `BEGIN … ALTER TABLE … CREATE INDEX … COMMIT` (при повторном применении — `NOTICE … skipping`, это норма, миграция идемпотентна) — ❌ `ERROR: relation "backtest.candles" does not exist` означает, что не применена миграция 008; примените её первой.
+
+```bash
+cd /opt/agent-trade && sudo -u agent docker compose exec -T postgres psql -U agenttrade -d agenttrade -c "SELECT count(*) FROM pg_constraint WHERE conname LIKE 'candles_htf%';"
+```
+✅ `3` — ❌ `0` или `1`/`2`: миграция не применилась или применилась частично, повторите предыдущую команду и прочтите её вывод целиком.
+
+## 4. Правка `backtest/.env.backtest`  ⏱ 1 мин
+
+Файла **нет в репозитории**, он правится вручную. На Этапе 8.7 из-за этого
+`BT_FEE_ROUNDTRIP_PCT` остался неисправленным: правку внесли в файл-образец, а в
+рабочий — нет. Правьте **рабочий** файл.
+
+```bash
+cd /opt/agent-trade && sudo -u agent nano backtest/.env.backtest
+```
+
+Привести к этим значениям (ключ есть — **изменить**, ключа нет — дописать):
+
+```
+BT_PERIOD_FROM=2022-02-01T00:00:00Z
+BT_HTF_BARS=1Dutc,1Wutc,1Mutc
+BT_HTF_INSTRUMENTS=BTC-USDT,ETH-USDT,SOL-USDT,XRP-USDT,DOGE-USDT
+```
+
+`BT_REQUEST_PAUSE_MS` **пока не трогайте** — его значение даёт зонд (шаг 7),
+и вписывается оно на шаге 8. `BT_PERIOD_TO` Замер 0 не читает вовсе: конец
+периода — последний закрытый час на момент запуска.
+
+```bash
+cd /opt/agent-trade && sudo -u agent grep -E "^BT_(PERIOD_FROM|HTF_BARS|HTF_INSTRUMENTS|REQUEST_PAUSE_MS)=" backtest/.env.backtest
+```
+✅ четыре строки, `BT_HTF_BARS` — **только** значения с суффиксом `utc` — ❌ `1D`, `1W` или `1M` без суффикса: это гонконгский календарь (UTC+8), контроль §7 не сойдётся никогда, а причину будут искать в арифметике сборки.
+
+```bash
+cd /opt/agent-trade && sudo -u agent mkdir -p analysis_out && ls -ld analysis_out
+```
+✅ каталог существует и принадлежит `agent` — ❌ владелец `root`: слепок целей писать будет некуда, `sudo chown agent:agent analysis_out`.
+
+## 5. Пересборка образов  ⏱ 5–15 мин
+
+Флаг `--profile` стоит **ДО** слова `build`: 31.08.2026 команда
+`docker compose build --profile "*"` ответила `unknown flag`, пересборка не
+выполнилась вовсе, а `up -d` поднял старые образы.
+
+```bash
+cd /opt/agent-trade && sudo -u agent docker compose --profile "*" build --no-cache
+```
+✅ последние строки — `naming to docker.io/library/agent-trade-backtest` и подобные по каждой службе — ❌ `unknown flag: --profile` означает, что флаг оказался после `build`; ❌ `no space left on device` — освободите место, иначе соберётся половина образов.
+
+## 6. Подъём сервисов  ⏱ 1–2 мин
+
+```bash
+cd /opt/agent-trade && sudo -u agent docker compose up -d
+```
+✅ `Started` по каждой службе — ❌ `Recreated` с последующим `Exited (1)`: смотрите `docker compose logs --tail 50 <служба>`, продакшн не поднялся.
+
+## 7. Зонд глубины (БЛОКИРУЮЩИЙ, первым)  ⏱ 15–45 мин
+
+Обходит 5 инструментов × 4 масштаба на всю глубину; время определяет часовой
+ряд (~40 000 баров на инструмент).
+
+```bash
+cd /opt/agent-trade && sudo -u agent docker compose --profile backtest run -d --name z0_probe -e PYTHONUNBUFFERED=1 --no-deps backtest python scripts/probe_htf_depth.py
+```
+✅ печатается идентификатор контейнера — ❌ `no such service: backtest`: имя службы изменилось, возьмите его из `docker-compose.yml`.
+
+```bash
+docker logs -f z0_probe
+```
+✅ по ходу: `подпись клиента (User-Agent): Mozilla/5.0 …`, затем `РАЗНИЦА (1D минус 1Dutc): +8.00 ч`, `1Wutc: недельный бар начинается в ['понедельник']`, `1Mutc: месячный бар начинается [1]-го числа`, `ФАКТИЧЕСКИЙ МАКСИМУМ = …`, `БЕЗОПАСНОЕ значение с запасом ×2: BT_REQUEST_PAUSE_MS=…`, в конце `ЗОНД ЗАВЕРШЁН УСПЕШНО` — ❌ `ВНИМАНИЕ: биржа не пустила` означает отказ по подписи клиента (403/1010), а НЕ отсутствие истории; ❌ `РАЗНИЦА (1D минус 1Dutc): +0.00 ч` означает, что поведение биржи изменилось — **доложить, а не подгонять код под ожидание**.
+
+```bash
+docker inspect -f '{{.State.ExitCode}}' z0_probe && docker rm -f z0_probe
+```
+✅ `0` — ❌ `5`: зонд не получил ни одного бара, дальше идти бессмысленно.
+
+**Выпишите из вывода два числа:** `БЕЗОПАСНОЕ значение … BT_REQUEST_PAUSE_MS=<P>`
+и `ФАКТИЧЕСКИЙ МАКСИМУМ` для `1Dutc` (это `<L>` для шага 11).
+
+## 8. Пауза из зонда — в конфигурацию  ⏱ 1 мин
+
+Конфигурация проброшена томом, а не запечена в образ: **пересборка не нужна.**
+
+```bash
+cd /opt/agent-trade && sudo -u agent sed -i "s/^BT_REQUEST_PAUSE_MS=.*/BT_REQUEST_PAUSE_MS=<P>/" backtest/.env.backtest && grep ^BT_REQUEST_PAUSE_MS= backtest/.env.backtest
+```
+✅ `BT_REQUEST_PAUSE_MS=<P>` с числом из зонда — ❌ пусто: ключа в файле не было, допишите строку руками. Значение «по памяти» не подставлять.
+
+## 9. Загрузка часового ряда  ⏱ 20–60 мин
+
+Сначала вхолостую — ни одного запроса на запись:
+
+```bash
+cd /opt/agent-trade && sudo -u agent docker compose --profile backtest run --rm -T -e PYTHONUNBUFFERED=1 backtest python scripts/load_htf_z0.py --steps hourly
+```
+✅ в шапке `Режим:` со значением `ТОЛЬКО ЧТЕНИЕ`, по каждому инструменту строка `already_in_db=…  appended=      0   (без --apply запись не выполнялась)`, в конце `код возврата 0` — ❌ `ОТКАЗ КОНФИГУРАЦИИ: …` называет незаполненный ключ шага 4 или 8.
+
+Затем с записью, в фоне:
+
+```bash
+cd /opt/agent-trade && sudo -u agent docker compose --profile backtest run -d --name z0_load_hourly -e PYTHONUNBUFFERED=1 backtest python scripts/load_htf_z0.py --apply --steps hourly
+```
+✅ печатается идентификатор контейнера — ❌ ошибка запуска: см. шаг 7.
+
+```bash
+docker logs -f z0_load_hourly
+```
+✅ `already_in_db=… appended=…` по каждому из пяти инструментов, затем `ПРОПУЩЕНО ВСЕГО …`, `Шаг 3 ПРОПУЩЕН (--steps hourly)`, `Счётчики продакшн-таблиц СОВПАЛИ до и после`, `код возврата 0` — ❌ `🔴 ПРОДАКШН-ТАБЛИЦЫ ИЗМЕНИЛИСЬ` означает нарушение границы этапа, остановитесь и откатывайтесь; ❌ `ЗАГРУЗКА ОСТАНОВЛЕНА: … 403 Forbidden` — биржа не пустила, ряд загружен частично.
+
+**`--page-limit` здесь НЕ помогает и указывать его бессмысленно:** часовой
+загрузчик Этапа 7.4 ходит страницами по 100 жёстко, ключ влияет только на
+старшие бары (шаг 11). Отсюда и верхняя граница оценки времени.
+
+```bash
+docker inspect -f '{{.State.ExitCode}}' z0_load_hourly && docker rm -f z0_load_hourly
+```
+✅ `0` — ❌ `6`: загрузка сорвалась, причина названа последней строкой лога; ❌ `5`: пустая выборка.
+
+## 10. Слепок целей — СТРОГО между шагом 9 и шагом 11  ⏱ < 1 мин
+
+Раньше — и в слепок не войдут свежие часовые свечи, расхождение придётся
+объяснять ими. Позже — и доказывать станет нечего: **слепок задним числом не
+снимается.**
+
+```bash
+cd /opt/agent-trade && sudo -u agent docker compose --profile backtest run --rm -T -e PYTHONUNBUFFERED=1 backtest python scripts/risk_targets_parity_z0.py --snapshot /opt/agent-trade/analysis_out/z0_targets.json
+```
+✅ `Старших баров в backtest.candles: 0`, строка на каждый инструмент с `предпроверка ok`, затем `Слепок сохранён: … (<N> строк целей)` — где `<N>` = инструментов × горизонтов × 2, при штатном `EVAL_HORIZONS=1,4,12,24` это 40 — и `СЛЕПОК СНЯТ, код возврата 0` — ❌ `Старших баров … : <не 0>` означает, что старшие ряды уже загружены и слепок опоздал; ❌ `предпроверка ['short_series', …]` — часовой ряд короче 90 суток, цели и так не считаются, но слепок всё равно годен как точка отсчёта.
+
+```bash
+cd /opt/agent-trade && sudo -u agent ls -l analysis_out/z0_targets.json
+```
+✅ файл существует, размер десятки килобайт — ❌ файла нет: каталог `analysis_out` не смонтирован, вернитесь к шагу 4.
+
+## 11. Загрузка старших рядов  ⏱ 2–10 мин
+
+`<L>` — фактический максимум `limit`, измеренный зондом на шаге 7.
+
+```bash
+cd /opt/agent-trade && sudo -u agent docker compose --profile backtest run -d --name z0_load_htf -e PYTHONUNBUFFERED=1 backtest python scripts/load_htf_z0.py --apply --steps htf --page-limit <L>
+```
+✅ печатается идентификатор контейнера — ❌ ошибка запуска: см. шаг 7.
+
+```bash
+docker logs -f z0_load_htf
+```
+✅ `Шаг 2 ПРОПУЩЕН (--steps htf)`, по каждой паре «инструмент × масштаб» строка `already_in_db=… appended=… незакрытых отброшено=…`, затем `пар «конец = начало» сверено: <не 0>`, `Счётчики продакшн-таблиц СОВПАЛИ до и после`, `код возврата 0` — ❌ `⚠ НОЛЬ ОТБРОШЕННЫХ — ПОДОЗРИТЕЛЬНО` означает, что биржа не вернула ни одного незакрытого бара: это **доклад, а не успех**; ❌ `календарное правило разошлось с рядом биржи` останавливает этап здесь — границы недели или месяца не те, что измерил зонд.
+
+```bash
+docker inspect -f '{{.State.ExitCode}}' z0_load_htf && docker rm -f z0_load_htf
+```
+✅ `0` — ❌ `6`: загрузка сорвалась либо нарушена посылка календаря.
+
+## 12. Сверка целей (БЛОКИРУЮЩАЯ)  ⏱ < 1 мин
+
+```bash
+cd /opt/agent-trade && sudo -u agent docker compose --profile backtest run --rm -T -e PYTHONUNBUFFERED=1 backtest python scripts/risk_targets_parity_z0.py --compare /opt/agent-trade/analysis_out/z0_targets.json
+```
+✅ `Часовой ряд НЕ ИЗМЕНИЛСЯ`, `различающихся строк` = **0**, `🟢 цели совпали до последнего знака`, `код возврата 0` — ❌ `код возврата 2` означает, что загрузка старших рядов изменила продакшн-величину, которую система называет человеку: **это нарушение границы этапа**, откатывайтесь; ❌ `🟡 ЧАСОВОЙ РЯД ИЗМЕНИЛСЯ` — расхождение объясняется свежими часовыми свечами, а не старшими барами: слепок сняли не между шагами 9 и 11.
+
+## 13. Контрольный опыт к сверке целей (БЛОКИРУЮЩИЙ)  ⏱ < 1 мин
+
+```bash
+cd /opt/agent-trade && sudo -u agent docker compose --profile backtest run --rm -T -e PYTHONUNBUFFERED=1 backtest python scripts/risk_targets_parity_z0.py --control /opt/agent-trade/analysis_out/z0_targets.json
+```
+✅ `различающихся строк при чтении без фильтра:` — число **не 0**, затем `🟢 контрольный опыт УПАЛ, как и обязан` и `код возврата 0` — ❌ `код возврата 4` означает, что сравнение шага 12 **слепо** и его «совпало» ничего не доказывает; ❌ `КОНТРОЛЬ НЕПРИМЕНИМ: старших баров в таблице нет` — шаг 11 не выполнился.
+
+## 14. Парный контроль свечей и незакрытых баров (БЛОКИРУЮЩИЙ)  ⏱ 2–6 мин
+
+Сеть не нужна: обе сравниваемые стороны уже в базе.
+
+```bash
+cd /opt/agent-trade && sudo -u agent docker compose --profile backtest run --rm -T -e PYTHONUNBUFFERED=1 backtest python scripts/htf_parity_z0.py
+```
+✅ в итоговом блоке: `z0_parity_ohlc_mismatches` = **0**, `z0_unclosed_rows` = **0**, `контрольный опыт §7 (сдвиг окна)` = **не 0** расхождений, `контрольный опыт §8 (незакрытый)` = **1**, `peak_rss_mb` заметно меньше 1024, последняя строка `код возврата 0` (ключи выровнены пробелами — ищите по имени ключа, не по точной строке) — ❌ `код возврата 2`: **первым делом проверять часовой пояс (§3), а не арифметику сборки**; ❌ `3` — незакрытые бары в хранилище; ❌ `4` — контрольный опыт не упал, проверка слепа; ❌ `5` — выборка пуста.
+
+**Выпишите отсюда** `z0_parity_volume_max_dev` и медианное отклонение объёма:
+порог по объёму назначается по этой измеренной величине, а не угадывается.
+
+## 15. Проверка развёртывания  ⏱ 2–4 мин
+
+```bash
+cd /opt/agent-trade && sudo -u agent bash deploy/verify_z0.sh
+```
+✅ последняя строка `ДЕЙСТВИЕ: не требуется. Старшие ряды загружены, собранная свеча совпала с биржевой…` и код выхода `0` — ❌ код выхода `1` с разделом `ОТКАТ ОБЯЗАТЕЛЕН` означает нарушенную границу этапа, команды отката напечатаны там же; ❌ строки `⚪ НЕ ПРОВЕРЕНО` — это **не** «всё хорошо», такую строку нельзя засчитывать за пройденную проверку.
+
+---
+
+## Что перенести в отчёт (§13 ТЗ)
+
+| откуда | что |
+|---|---|
+| шаг 7 | таблица глубины 5 × 4; разница `1D`/`1Dutc`; границы недели и месяца; фактический `limit`; безопасная пауза |
+| шаг 9 | `already_in_db` и `appended` по каждому инструменту; число пропущенных часов |
+| шаг 11 | `z0_htf_rows_written`, `z0_htf_dropped_unconfirmed` |
+| шаг 14 | `z0_parity_*`, `z0_unclosed_rows`, `peak_rss_mb`, предложенный порог по объёму |
+| шаги 12–13 | коды возврата обоих прогонов |
+
+Рядом с каждым числом указывайте, где оно снято: на стенде или на сервере.
+
+## Аварийный откат
+
+```bash
+cd /opt/agent-trade && sudo -u agent docker compose exec -T postgres psql -U agenttrade -d agenttrade < db/migrations/026_backtest_candles_htf_rollback.sql
+```
+Откат схемы **не удаляет** загруженные строки — это отдельное решение:
+```sql
+DELETE FROM backtest.candles WHERE bar IN ('1Dutc','1Wutc','1Mutc');
+```
