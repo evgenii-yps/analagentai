@@ -2156,8 +2156,11 @@ async def test_report_names_every_finding_with_ticker_scale_date_and_field(
     code, out = await _run_measure(monkeypatch, verbose=False)
 
     assert "Всего баров сверено: 32" in out, out[:2000]
-    assert "Расхождений найдено: 2" in out
+    assert "Расхождений найдено: 2 полей в 2 барах" in out
     assert re.search(r"Поглощено допуском: 1\s+\(из них: точность записи — 1\)", out)
+    assert (
+        "Затронутые бары: SOL-USDT 1Dutc 2019-12-25; BTC-USDT 1Wutc 2019-12-30"
+    ) in out
 
     assert (
         "BTC-USDT 1Wutc 2019-12-30 open: наша=7388.50000000 биржа=7131.90000000 | "
@@ -2194,7 +2197,8 @@ async def test_absorbed_are_counted_not_printed_unless_verbose(
     assert absorbed_line not in quiet, "поглощённое напечатано без --verbose"
     assert absorbed_line in loud, "--verbose не печатает поглощённые отклонения"
     # Число при этом одно и то же: флаг меняет ПОДРОБНОСТЬ, а не результат.
-    assert "Расхождений найдено: 2" in quiet and "Расхождений найдено: 2" in loud
+    summary = "Расхождений найдено: 2 полей в 2 барах"
+    assert summary in quiet and summary in loud
 
 
 async def test_year_turn_block_prints_the_chain_as_facts(
@@ -2229,6 +2233,47 @@ async def test_categories_do_not_hide_anything_from_the_list(
     assert len(named) == 2
     assert sum(1 for line in named if "BOUNDARY_ANOMALY" in line) == 1
     assert sum(1 for line in named if "категория=REAL" in line) == 1
+
+
+def test_summary_counts_fields_and_bars_separately() -> None:
+    """Две мерки рядом: поля (правило 0.2) и бары (мерка отчёта Замера 0.1).
+
+    Бар, у которого разошлись ДВА поля, даёт два расхождения и ОДИН затронутый
+    бар. Если бы сводка печатала одно число, сверить результат с ожиданием «7»,
+    взятым из отчёта, считавшего бары, было бы нечем.
+
+    КОНТРОЛЬНЫЙ ОПЫТ — вторая половина проверки: у двух РАЗНЫХ баров числа
+    обязаны совпасть. Функция, всегда возвращающая один элемент, прошла бы
+    первую половину и упала бы здесь.
+    """
+    from scripts.htf_parity_z0 import CATEGORY_REAL, Finding, affected_bars
+
+    def finding(inst: str, bar: str, moment: datetime, field: str) -> Finding:
+        return Finding(
+            deviation=Deviation(
+                inst_id=inst, bar=bar, open_time=moment, field=field,
+                assembled=Decimal("2.00000000"), stored=Decimal("1.00000000"),
+            ),
+            category=CATEGORY_REAL,
+        )
+
+    one_bar = [
+        finding("ETH-USDT", "1Wutc", YEAR_TURN_WEEK, "open"),
+        finding("ETH-USDT", "1Wutc", YEAR_TURN_WEEK, "low"),
+    ]
+    assert affected_bars(one_bar) == ["ETH-USDT 1Wutc 2019-12-30"]
+    assert len(one_bar) == 2
+
+    two_bars = [
+        finding("ETH-USDT", "1Wutc", YEAR_TURN_WEEK, "open"),
+        finding("ETH-USDT", "1Mutc", datetime(2019, 12, 1, tzinfo=UTC), "open"),
+    ]
+    assert affected_bars(two_bars) == [
+        "ETH-USDT 1Wutc 2019-12-30", "ETH-USDT 1Mutc 2019-12-01",
+    ]
+    # Тот же инструмент и та же дата на РАЗНЫХ таймфреймах — разные бары.
+    assert len(affected_bars(two_bars)) == 2
+    assert affected_bars([]) == []
 
 
 def test_category_marks_only_the_year_turn_of_btc_and_eth() -> None:
