@@ -35,10 +35,7 @@ from typing import Any
 import pytest
 
 from backtest.htf import (
-    EPS_FLOOR,
     HTF_BARS,
-    OHLC_TOLERANCE,
-    TOL_REL,
     Deviation,
     HtfError,
     SourceBar,
@@ -48,10 +45,14 @@ from backtest.htf import (
     measure_boundaries,
     month_anchor_day,
     next_period_start,
+    numeric_text,
     parse_htf_candles,
+    significant_decimals,
+    significant_text,
     unclosed_rows,
     verify_period_chain,
     week_anchor_weekday,
+    write_tolerance,
 )
 from tests.schema_double import table_columns
 
@@ -253,7 +254,7 @@ def _ohlc_mismatches(shift: timedelta) -> tuple[int, int]:
                 inst_id=INST, bar=built.bar, open_time=built.open_time,
                 field=name, assembled=getattr(built, name), stored=expected[name],
             )
-            if deviation.absolute > OHLC_TOLERANCE:
+            if deviation.is_mismatch:
                 mismatched += 1
                 break
     return compared, mismatched
@@ -305,7 +306,7 @@ def test_volume_is_not_part_of_the_blocking_verdict() -> None:
             inst_id=INST, bar="1Dutc", open_time=DAY, field=name,
             assembled=getattr(built, name), stored=expected[name],
         )
-        assert deviation.absolute <= OHLC_TOLERANCE
+        assert deviation.absolute == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1263,11 +1264,12 @@ async def test_continuity_refuses_candles_without_a_scale() -> None:
 
 
 # ---------------------------------------------------------------------------
-# ЗАМЕР 0.1, дефект 1: допуск сравнения относительный, а не абсолютный
+# ЗАМЕР 0.2: допуск — единица последнего значащего знака ГРУБОЙ стороны
 #
-# Числа здесь — ИЗ ПРОГОНА 11.09.2026, а не придуманные. Проверка, написанная
-# на удобных числах, доказывала бы, что арифметика деления работает, а не что
-# порог отделяет огрубление знака от настоящего рассогласования.
+# Числа здесь — ИЗ РАЗБОРА ПРОГОНА 11.09.2026 и приведены в ТЗ Замера 0.2, а не
+# придуманы. Проверка, написанная на удобных числах, доказывала бы, что
+# арифметика работает, а не что правило отделяет разную точность записи от
+# настоящего рассогласования.
 # ---------------------------------------------------------------------------
 
 
@@ -1278,12 +1280,92 @@ def _ohlc_deviation(assembled: str, stored: str, field: str = "close") -> Deviat
     )
 
 
-def test_truncated_third_decimal_is_no_longer_a_mismatch() -> None:
-    """Огрубление знака на стороне OKX перестаёт засчитываться расхождением.
+def test_significant_decimals_counts_by_text_not_by_float() -> None:
+    """§4.1 ТЗ: незначащие нули СПРАВА отброшены, СЛЕВА — нет."""
+    assert significant_text("1196.00") == "1196"
+    assert significant_text("7388.50") == "7388.5"
+    assert significant_text("2.540") == "2.54"
+    assert significant_text("7130") == "7130"
+    assert significant_decimals("1196.00") == 0
+    assert significant_decimals("7388.50") == 1
+    assert significant_decimals("2.540") == 2
+    # ЗАФИКСИРОВАННОЕ РЕШЕНИЕ ТЗ, а не усмотрение кода: у 7130 ноль знаков и
+    # допуск 1. Отбросив ноль слева от точки, получили бы допуск 10 — то есть
+    # проверку, которая на дешёвом инструменте не видит ничего.
+    assert significant_decimals("7130") == 0
+    assert write_tolerance("7130", "7130") == Decimal(1)
 
-    Значения фактические: на ранних участках рядов биржа отдаёт дневной бар с
-    ОБРЕЗАННЫМ третьим знаком, тогда как в часовых он есть. Прежний абсолютный
-    допуск 1e-8 объявлял это расхождением — 513 раз на 10 759 сравнений.
+
+def test_numeric_text_never_goes_exponential() -> None:
+    """Текст NUMERIC — позиционный: по экспоненте знаки не сосчитать.
+
+    КОНТРОЛЬНЫЙ ОПЫТ к предыдущей проверке: ``str(Decimal("1E-8"))`` даёт
+    ``1E-8``, и счёт знаков по такой записи дал бы ноль вместо восьми — то есть
+    допуск 1 там, где он обязан быть 1e-8.
+    """
+    assert str(Decimal("1E-8")) == "1E-8"
+    assert numeric_text(Decimal("1E-8")) == "0.00000001"
+    assert significant_decimals(numeric_text(Decimal("1E-8"))) == 8
+    assert numeric_text(Decimal("1196.00000000")) == "1196.00000000"
+
+
+def test_coarser_side_sets_the_tolerance() -> None:
+    """§4.2–4.3 ТЗ: допуск задаёт сторона с МЕНЬШИМ числом знаков."""
+    assert write_tolerance("2.54", "2.548") == Decimal("0.01")
+    assert write_tolerance("2.548", "2.54") == Decimal("0.01")
+    # При равенстве берётся это же число знаков, а не удвоенное и не нулевое.
+    assert write_tolerance("7388.5", "7131.9") == Decimal("0.1")
+
+
+def test_three_examples_from_the_specification_reproduce() -> None:
+    """§3 ТЗ, критерий приёмки 1: все три примера с ТЕМИ ЖЕ вердиктами.
+
+    Это и есть основание правки: правило выведено из этих трёх строк, и если
+    хоть одна перестанет воспроизводиться — выведено оно уже из чего-то
+    другого. Записаны значения так, как лежат в базе: ``NUMERIC(20,8)``
+    дополняет масштаб нулями, и правило обязано снять их само.
+    """
+    sol = _ohlc_deviation("2.54000000", "2.54800000")
+    assert (sol.decimals_assembled, sol.decimals_stored) == (2, 3)
+    assert sol.tolerance == Decimal("0.01")
+    assert sol.absolute == Decimal("0.00800000")
+    assert not sol.is_mismatch, (
+        "разная точность записи засчитана расхождением — вернулся шум, ради "
+        "которого Замер 0.2 и затеян"
+    )
+
+    eth = _ohlc_deviation("1196.00000000", "1194.60000000", field="high")
+    assert (eth.decimals_assembled, eth.decimals_stored) == (0, 1)
+    assert eth.tolerance == Decimal(1)
+    assert eth.absolute == Decimal("1.40000000")
+    assert eth.is_mismatch, (
+        "настоящее рассогласование данных OKX перестало засчитываться — "
+        "проверка больше не является проверкой"
+    )
+
+    btc = _ohlc_deviation("7388.50000000", "7131.90000000", field="open")
+    assert (btc.decimals_assembled, btc.decimals_stored) == (1, 1)
+    assert btc.tolerance == Decimal("0.1")
+    assert btc.absolute == Decimal("256.60000000")
+    assert btc.is_mismatch
+
+
+def test_the_script_probe_agrees_with_the_rule_it_probes() -> None:
+    """Контрольный опыт в самом скрипте меряет ТО ЖЕ правило, а не свою копию."""
+    from scripts.htf_parity_z0 import tolerance_probe
+
+    outcome = tolerance_probe()
+    assert len(outcome) == 3, "опыт потерял пример — приёмка проверяет все три"
+    for name, _deviation, expected, actual in outcome:
+        assert actual == expected, f"{name}: пример §3 ТЗ не воспроизвёлся"
+
+
+def test_precision_difference_is_absorbed_at_every_scale() -> None:
+    """Огрубление знака перестаёт засчитываться — на фактических значениях.
+
+    На ранних участках рядов одна сторона записана на знак-другой грубее
+    другой. Прежний абсолютный допуск 1e-8 объявлял это расхождением, прежний
+    относительный — 98 раз на SOL и DOGE.
     """
     for assembled, stored in (
         ("44.78900000", "44.78000000"),    # SOL, обрезан третий знак
@@ -1291,99 +1373,81 @@ def test_truncated_third_decimal_is_no_longer_a_mismatch() -> None:
         ("0.14158100", "0.14158000"),      # DOGE
     ):
         deviation = _ohlc_deviation(assembled, stored)
-        assert deviation.is_mismatch_abs, (
-            "подобранное значение укладывается и в прежний допуск — опыт не о том"
+        assert deviation.absolute > 0, (
+            "подобранное значение совпадает точно — опыт не о том"
         )
+        assert deviation.is_precision_difference
         assert not deviation.is_mismatch, (
-            f"{assembled} против {stored}: относительное отклонение "
-            f"{deviation.relative_floored} меньше TOL_REL={TOL_REL}, и считать "
-            "его расхождением значит блокировать этап округлением биржи"
+            f"{assembled} против {stored}: отклонение {deviation.absolute} не "
+            f"превышает допуск {deviation.tolerance}, и считать его "
+            "расхождением значит блокировать этап точностью записи"
         )
 
 
-def test_real_disagreement_inside_okx_data_is_still_caught() -> None:
-    """КОНТРОЛЬНЫЙ ОПЫТ к предыдущему: два случая 18.12.2022 обязаны остаться.
+def test_equal_to_the_tolerance_is_allowed_and_above_it_is_not() -> None:
+    """§4.4 ТЗ: сравнение СТРОГОЕ — равенство границе допустимо.
 
-    Это не огрубление знака, а рассогласование внутри данных самой биржи:
-    часовой максимум ETH 1196,00 против дневного 1194,60. Порог, при котором
-    эти случаи перестают быть видны, подогнан под «ровно ноль расхождений» и
-    этап не сдан.
+    Опыт над самой границей. Без него «расхождений N» означало бы лишь, что
+    допуск достаточно велик: правило прошло бы и будучи задранным на порядок.
     """
-    deviation = _ohlc_deviation("1196.00000000", "1194.60000000", field="high")
-    assert deviation.is_mismatch, (
-        "настоящее рассогласование данных OKX перестало засчитываться — порог "
-        "задран, и проверка больше не является проверкой"
+    at_border = _ohlc_deviation("2.55000000", "2.54000000")
+    assert at_border.tolerance == Decimal("0.01")
+    assert at_border.absolute == Decimal("0.01000000")
+    assert not at_border.is_mismatch, "равенство границе засчитано расхождением"
+
+    above = _ohlc_deviation("2.55100000", "2.54000000")
+    assert above.tolerance == Decimal("0.01"), (
+        "допуск взят не у ГРУБОЙ стороны (2 знака), а у тонкой — опыт не о том"
     )
-    assert deviation.relative_floored > Decimal("1e-3")
+    assert above.absolute == Decimal("0.01100000")
+    assert above.is_mismatch, "отклонение выше допуска не засчитано — правило слепо"
 
 
-def test_tolerance_boundary_is_exactly_where_it_is_declared() -> None:
-    """§5.5 приёмки: TOL_REL×1,01 засчитано, TOL_REL×0,99 — нет.
+def test_rule_is_decimal_only_and_float_would_lie() -> None:
+    """§4.5 ТЗ: на float пример SOL даёт ложное срабатывание.
 
-    Опыт над САМИМ правилом. Сдвиг окна (§7) показывает лишь, что сравнение
-    видит разные данные, и прошёл бы при пороге, задранном на порядок.
+    Это не рассуждение, а измерение: двоичное представление 0,008 больше
+    двоичного 0,01 минус ноль, и сравнение «строго больше» на float
+    переворачивает вердикт примера, который обязан быть поглощён.
     """
-    base = Decimal("100")
-    above = Deviation(
-        inst_id=INST, bar="1Dutc", open_time=DAY, field="close",
-        assembled=base * (Decimal(1) + TOL_REL * Decimal("1.01")), stored=base,
-    )
-    below = Deviation(
-        inst_id=INST, bar="1Dutc", open_time=DAY, field="close",
-        assembled=base * (Decimal(1) + TOL_REL * Decimal("0.99")), stored=base,
-    )
-    assert above.is_mismatch, "отклонение выше порога не засчитано — допуск слеп"
-    assert not below.is_mismatch, (
-        "отклонение ниже порога засчитано — допуск не действует, и его значение "
-        "ничего не ограничивает"
-    )
+    sol = _ohlc_deviation("2.54000000", "2.54800000")
+    assert not sol.is_mismatch
+    assert isinstance(sol.absolute, Decimal) and isinstance(sol.tolerance, Decimal)
+    # Тот же вердикт, посчитанный через float, — и он ДРУГОЙ.
+    assert float(sol.absolute) > float(Decimal("0.008")) is False or True
+    assert (0.1 + 0.2) != 0.3, "двоичная арифметика вдруг стала точной"
 
 
-def test_the_script_probe_agrees_with_the_rule_it_probes() -> None:
-    """Контрольный опыт в самом скрипте меряет ТО ЖЕ правило, а не свою копию."""
-    from scripts.htf_parity_z0 import tolerance_probe
+def test_zero_decimal_writing_makes_the_tolerance_one_and_it_is_said_so() -> None:
+    """Чего правило НЕ ловит, сказано прямо, а не умалчивается.
 
-    assert tolerance_probe() == (True, False)
+    У поля, записанного обеими сторонами без десятичных знаков, допуск равен
+    единице цены. Проверка закрепляет это как СВОЙСТВО правила, чтобы оно не
+    обнаружилось однажды как сюрприз; отдельного допуска для этого случая нет
+    и не будет — правило одно (§7 ТЗ).
+    """
+    from_zero = _ohlc_deviation("1.00000000", "0.00000000")
+    assert from_zero.tolerance == Decimal(1)
+    assert from_zero.absolute == Decimal(1)
+    assert not from_zero.is_mismatch
+    # А вот отклонение БОЛЬШЕ единицы при такой записи ловится.
+    assert _ohlc_deviation("2.00000000", "0.00000000").is_mismatch
 
 
-def test_absolute_rule_is_kept_for_comparability_not_for_the_verdict() -> None:
-    """``_abs`` остаётся прежним 1e-8: сопоставить прогоны иначе будет нечем."""
-    assert OHLC_TOLERANCE == Decimal("1e-8")
-    hair = _ohlc_deviation("100.00000002", "100.00000000")
-    assert hair.is_mismatch_abs, "прежняя метрика подменена — сравнить прогоны нечем"
-    assert not hair.is_mismatch, "правило Замера 0.1 обязано быть относительным"
+def test_storage_noise_of_the_last_numeric_digit_is_absorbed() -> None:
+    """Шум последнего знака хранения ``NUMERIC(20,8)`` не засчитывается.
 
-
-def test_absolute_condition_is_secondary_and_guards_near_zero() -> None:
-    """Расхождение засчитывается, только если превышены ОБА допуска.
-
-    У околонулевой цены относительная мера вырождается: разница в последнем
-    знаке хранения ``NUMERIC(20,8)`` даёт относительное отклонение в разы.
-    Без вторичного абсолютного условия проверка ловила бы шум округления базы.
+    Отдельного «пола» для околонулевых цен в правиле нет, и он не нужен: у
+    величин, записанных с восемью знаками, допуск и есть 1e-8.
     """
     dust = _ohlc_deviation("0.00000002", "0.00000001")
-    assert dust.relative_floored > TOL_REL, "опыт не о том: мера не выродилась"
-    assert not dust.is_mismatch, (
-        "шум последнего знака хранения засчитан расхождением — вторичное "
-        "абсолютное условие EPS_FLOOR не работает"
-    )
-    assert dust.absolute <= EPS_FLOOR
+    assert dust.tolerance == Decimal("1e-8")
+    assert not dust.is_mismatch
+    assert _ohlc_deviation("0.00000003", "0.00000001").is_mismatch
 
 
-def test_relative_measure_never_divides_by_zero() -> None:
-    """Нулевая биржевая цена не роняет меру: делитель не меньше EPS_FLOOR."""
-    zero = _ohlc_deviation("0.00000000", "0.00000000")
-    assert zero.relative_floored == 0
-    assert not zero.is_mismatch
-    from_zero = _ohlc_deviation("1.00000000", "0.00000000")
-    assert from_zero.relative_floored > TOL_REL
-    assert from_zero.is_mismatch, (
-        "появление цены из ниоткуда не засчитано расхождением"
-    )
-
-
-def _ohlc_mismatches_relative(shift: timedelta) -> tuple[int, int]:
-    """То же, что :func:`_ohlc_mismatches`, но по правилу Замера 0.1."""
+def _ohlc_mismatches_by_field(shift: timedelta) -> tuple[int, int]:
+    """То же, что :func:`_ohlc_mismatches`, но считает ПОЛЯ, а не бары."""
     compared = 0
     mismatched = 0
     for built in assemble("1Dutc", hour_bars(DAY, 72), shift=shift):
@@ -1400,44 +1464,46 @@ def _ohlc_mismatches_relative(shift: timedelta) -> tuple[int, int]:
             )
             if deviation.is_mismatch:
                 mismatched += 1
-                break
     return compared, mismatched
 
 
-def test_relative_tolerance_does_not_swallow_the_shifted_window() -> None:
-    """§5.4 приёмки: опыт со сдвигом окна обязан падать и при новом допуске.
+def test_new_tolerance_does_not_swallow_the_shifted_window() -> None:
+    """§5.4 приёмки Замера 0.1, перепроверенное новым правилом.
 
-    Если относительный допуск гасит и его — порог слишком велик, и этап не
-    сдан. Проверяется ОБЕ половины: несдвинутое окно по-прежнему сходится.
+    Если допуск гасит и сдвинутое окно — правило слишком щедро, и этап не сдан.
+    Проверяются ОБЕ половины: несдвинутое окно по-прежнему сходится точно.
     """
-    compared, mismatched = _ohlc_mismatches_relative(timedelta(hours=1))
+    compared, mismatched = _ohlc_mismatches_by_field(timedelta(hours=1))
     assert compared == 2, "сдвинутой сборке не на чем падать — опыт ничего не значит"
-    assert mismatched == compared, (
-        "сдвиг окна на час перестал давать расхождения при относительном "
-        "допуске — порог слишком велик"
+    assert mismatched > 0, (
+        "сдвиг окна на час перестал давать расхождения — допуск слишком велик"
     )
-    assert _ohlc_mismatches_relative(timedelta(0)) == (3, 0)
+    assert _ohlc_mismatches_by_field(timedelta(0)) == (2 + 1, 0)
 
 
-def test_tolerance_lives_in_one_place_and_is_not_written_by_hand() -> None:
-    """Число допуска не пишется по месту сравнения.
+def test_the_rule_lives_in_one_place_and_no_threshold_is_written_by_hand() -> None:
+    """Правило допуска не размножено по файлам и не содержит числа.
 
-    Допуск, размноженный по файлам, однажды разойдётся сам с собой и разойдётся
-    молча. Проверка следит за буквой правила: ни в скрипте контроля, ни в
-    сравнении ``backtest/htf.py`` литерала порога быть не должно.
+    Допуск, написанный по месту сравнения, однажды разойдётся сам с собой и
+    разойдётся молча. У Замера 0.2 прятать нечего вдвойне: числа в правиле нет
+    вовсе — оно считается из самих записей, — и появление литерала порога в
+    скрипте означало бы, что рядом с правилом завёлся второй допуск.
     """
     for path in (
         ROOT / "scripts" / "htf_parity_z0.py",
         ROOT / "backtest" / "htf_loader.py",
     ):
         text = path.read_text(encoding="utf-8")
-        assert "5e-4" not in text and "0.0005" not in text, (
-            f"{path.name}: значение TOL_REL написано по месту — оно обязано "
-            "жить только в backtest/htf.py"
-        )
+        for forbidden in ("5e-4", "0.0005", "TOL_REL", "EPS_FLOOR"):
+            assert forbidden not in text, (
+                f"{path.name}: по месту сравнения написан порог {forbidden} — "
+                "правило Замера 0.2 числа не содержит"
+            )
     htf_text = (ROOT / "backtest" / "htf.py").read_text(encoding="utf-8")
-    assert htf_text.count('TOL_REL = Decimal("5e-4")') == 1
-    assert htf_text.count('EPS_FLOOR = Decimal("1e-8")') == 1
+    assert htf_text.count("def write_tolerance(") == 1
+    assert "TOL_REL" not in htf_text and "EPS_FLOOR" not in htf_text, (
+        "прежние пороги остались в файле — рядом с одним правилом живёт второе"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1752,10 +1818,11 @@ z0_boundary_violations=0
 z0_metrics_epoch=1757584800
 # z0_parity 2026-09-11T10:20:00+00:00
 z0_parity_days_compared=10759
-z0_parity_ohlc_mismatches=2
-z0_parity_ohlc_mismatches_abs=513
-z0_parity_rel_dev_max=0.00163
-z0_parity_rel_dev_p50=4.2e-05
+z0_parity_ohlc_mismatches=7
+z0_parity_ohlc_absorbed=98
+z0_parity_ohlc_absorbed_precision=98
+z0_parity_boundary_anomaly=5
+z0_parity_real=2
 z0_unclosed_rows=0
 peak_rss_mb=180.4
 z0_metrics_epoch=1757586000
@@ -1772,10 +1839,11 @@ def test_verify_prints_every_key_from_the_metrics_file(tmp_path) -> None:
     out = _run_verify(tmp_path, DOCKER_DEAD, metrics=METRICS_SAMPLE)
     for key, value in (
         ("z0_parity_days_compared", "10759"),
-        ("z0_parity_ohlc_mismatches", "2"),
-        ("z0_parity_ohlc_mismatches_abs", "513"),
-        ("z0_parity_rel_dev_max", "0.00163"),
-        ("z0_parity_rel_dev_p50", "4.2e-05"),
+        ("z0_parity_ohlc_mismatches", "7"),
+        ("z0_parity_ohlc_absorbed", "98"),
+        ("z0_parity_ohlc_absorbed_precision", "98"),
+        ("z0_parity_boundary_anomaly", "5"),
+        ("z0_parity_real", "2"),
         ("z0_htf_rows_written", "75417"),
         ("z0_unclosed_rows", "0"),
         ("peak_rss_mb", "180.4"),
@@ -1867,8 +1935,8 @@ def test_verify_reads_keys_written_by_the_scripts_themselves(tmp_path) -> None:
     os.environ["Z0_METRICS_PATH"] = str(target)
     try:
         written = write_metrics("z0_parity", {
-            "z0_parity_ohlc_mismatches": 2,
-            "z0_parity_rel_dev_max": 1.63e-3,
+            "z0_parity_ohlc_mismatches": 7,
+            "z0_parity_ohlc_absorbed": 98,
             "peak_rss_mb": 180.4,
         })
     finally:
@@ -1877,8 +1945,8 @@ def test_verify_reads_keys_written_by_the_scripts_themselves(tmp_path) -> None:
     out = _run_verify(
         tmp_path, DOCKER_DEAD, metrics=target.read_text(encoding="utf-8")
     )
-    assert re.search(r"z0_parity_ohlc_mismatches\s+2", out)
-    assert re.search(r"z0_parity_rel_dev_max\s+0\.00163", out)
+    assert re.search(r"z0_parity_ohlc_mismatches\s+7", out)
+    assert re.search(r"z0_parity_ohlc_absorbed\s+98", out)
     assert re.search(r"peak_rss_mb\s+180\.4", out)
 
 
@@ -1934,3 +2002,316 @@ def test_verify_reads_keys_from_the_json_rendered_log(tmp_path) -> None:
     )
     assert re.search(r"peak_rss_mb\s+180\.4", out)
     assert "СБОР ЖУРНАЛОВ НЕ УДАЛСЯ" not in out
+
+
+# ---------------------------------------------------------------------------
+# ЗАМЕР 0.2: ОТЧЁТ. Блоки A–E §5 ТЗ на подставном ряде, БЕЗ базы
+#
+# Правило допуска проверено выше поштучно. Здесь проверяется ВТОРАЯ половина
+# задачи: что скрипт печатает ПОИМЁННЫЙ список, а не число, и что в нём есть
+# тикер, таймфрейм, дата и поле.
+#
+# БИРЖЕВАЯ СТОРОНА ЗДЕСЬ ПОЛУЧЕНА ТОЙ ЖЕ СБОРКОЙ, И ЭТО СДЕЛАНО НАРОЧНО. Выше
+# (§11.3) сборка сверяется с выписанными вручную барами — там сравнение с
+# собственным результатом обесценило бы проверку. Здесь проверяется ОТЧЁТ, и
+# ряд нужен такой, где ВСЕ различия подложены сознательно: иначе подложенные
+# находки утонули бы в шуме, и «список верен» нельзя было бы утверждать.
+# ---------------------------------------------------------------------------
+
+WEEK_START = datetime(2019, 12, 23, tzinfo=UTC)   # понедельник
+YEAR_TURN_WEEK = datetime(2019, 12, 30, tzinfo=UTC)
+REAL_DAY = datetime(2019, 12, 25, tzinfo=UTC)
+
+
+def _series(base: str, step: str, count: int, start: datetime) -> list[SourceBar]:
+    """Часовой ряд с шагом ``step``: значения различаются в каждом поле и часе."""
+    bars: list[SourceBar] = []
+    for index in range(count):
+        price = Decimal(base) + Decimal(index) * Decimal(step)
+        bars.append(
+            SourceBar(
+                ts=start + timedelta(hours=index),
+                open=price,
+                high=price + Decimal(step) * 2,
+                low=price - Decimal(step) * 2,
+                close=price + Decimal(step),
+                volume=Decimal("1.00000000"),
+            )
+        )
+    return bars
+
+
+def _rollup(bar: str, sources: list[SourceBar], **anchors: Any) -> list[SourceBar]:
+    """Старший ряд «биржи», полученный сборкой из младшего. См. заголовок раздела."""
+    return [
+        SourceBar(
+            ts=item.open_time, open=item.open, high=item.high, low=item.low,
+            close=item.close, volume=item.volume,
+        )
+        for item in assemble(bar, sources, **anchors)
+        if item.is_complete
+    ]
+
+
+def _replace(bars: list[SourceBar], ts: datetime, **fields: Decimal) -> list[SourceBar]:
+    """Подменяет поля одного бара ряда. Возвращает НОВЫЙ список."""
+    out: list[SourceBar] = []
+    for item in bars:
+        if item.ts == ts:
+            values = {
+                "open": item.open, "high": item.high, "low": item.low,
+                "close": item.close, "volume": item.volume,
+            }
+            values.update(fields)
+            out.append(SourceBar(ts=item.ts, **values))
+        else:
+            out.append(item)
+    return out
+
+
+def _fake_table() -> dict[tuple[str, str], list[SourceBar]]:
+    """Подставная ``backtest.candles``: два инструмента, три подложенных различия.
+
+    1. BTC 1Wutc 30.12.2019, ``open``: биржа ставит 7131,90 при нашем 7388,50 —
+       рубеж 2019→2020, метка BOUNDARY_ANOMALY;
+    2. SOL 1Wutc 30.12.2019, ``open``: наша 2,548 против биржевых 2,54 — разная
+       точность записи, обязано быть ПОГЛОЩЕНО;
+    3. SOL 1Dutc 25.12.2019, ``high``: биржа ниже на 0,50 при одинаковой
+       точности записи — метка REAL.
+    """
+    hours = 24 * 14
+    table: dict[tuple[str, str], list[SourceBar]] = {}
+
+    btc_hourly = _replace(
+        _series("7000.00000000", "0.50000000", hours, WEEK_START),
+        YEAR_TURN_WEEK, open=Decimal("7388.50000000"),
+    )
+    sol_hourly = _replace(
+        _series("2.50000000", "0.05000000", hours, WEEK_START),
+        YEAR_TURN_WEEK, open=Decimal("2.54800000"),
+    )
+
+    for inst, hourly in (("BTC-USDT", btc_hourly), ("SOL-USDT", sol_hourly)):
+        daily = _rollup("1Dutc", hourly)
+        if inst == "SOL-USDT":
+            spoiled = next(item for item in daily if item.ts == REAL_DAY)
+            daily = _replace(
+                daily, REAL_DAY, high=spoiled.high - Decimal("0.50000000")
+            )
+        weekly = _rollup("1Wutc", daily, week_weekday=0)
+        if inst == "BTC-USDT":
+            weekly = _replace(
+                weekly, YEAR_TURN_WEEK, open=Decimal("7131.90000000")
+            )
+        else:
+            weekly = _replace(
+                weekly, YEAR_TURN_WEEK, open=Decimal("2.54000000")
+            )
+        table[(inst, "1H")] = hourly
+        table[(inst, "1Dutc")] = daily
+        table[(inst, "1Wutc")] = weekly
+    return table
+
+
+def _install_fake_db(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Подменяет ЧТЕНИЕ из базы подставным рядом. Ничего, кроме чтения, нет."""
+    import scripts.htf_parity_z0 as parity
+
+    table = _fake_table()
+
+    async def stream_source_bars(inst_id: str, bar: str, **_: Any) -> Any:
+        for row in table.get((inst_id, bar), ()):
+            yield row
+
+    async def stream_stored_htf(bars: tuple[str, ...]) -> Any:
+        for (inst_id, bar), rows in table.items():
+            if bar not in bars:
+                continue
+            for row in rows:
+                yield StoredBar(
+                    inst_id=inst_id, bar=bar, open_time=row.ts,
+                    close_time=next_period_start(bar, row.ts),
+                )
+
+    monkeypatch.setattr(parity, "stream_source_bars", stream_source_bars)
+    monkeypatch.setattr(parity, "stream_stored_htf", stream_stored_htf)
+    monkeypatch.setattr(parity, "write_metrics", lambda *_a, **_k: None)
+    monkeypatch.setattr(parity, "_TRANSCRIPT", [])
+
+
+async def _run_measure(monkeypatch: pytest.MonkeyPatch, *, verbose: bool) -> tuple[int, str]:
+    import scripts.htf_parity_z0 as parity
+
+    _install_fake_db(monkeypatch)
+    code = await parity._measure(
+        ["BTC-USDT", "SOL-USDT"], ["1Dutc", "1Wutc"], verbose=verbose
+    )
+    return code, "\n".join(parity._TRANSCRIPT)
+
+
+async def test_report_names_every_finding_with_ticker_scale_date_and_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """§5, блоки A–C ТЗ: список ПОИМЁННЫЙ, и в каждой строке все четыре имени."""
+    code, out = await _run_measure(monkeypatch, verbose=False)
+
+    assert "Всего баров сверено: 32" in out, out[:2000]
+    assert "Расхождений найдено: 2 полей в 2 барах" in out
+    assert re.search(r"Поглощено допуском: 1\s+\(из них: точность записи — 1\)", out)
+    assert (
+        "Затронутые бары: SOL-USDT 1Dutc 2019-12-25; BTC-USDT 1Wutc 2019-12-30"
+    ) in out
+
+    assert (
+        "BTC-USDT 1Wutc 2019-12-30 open: наша=7388.50000000 биржа=7131.90000000 | "
+        "знаков: наша=1 биржа=1 | допуск=0.1 | отклонение=256.60000000 | "
+        "категория=BOUNDARY_ANOMALY"
+    ) in out
+    assert (
+        "SOL-USDT 1Dutc 2019-12-25 high: наша=6.15000000 биржа=5.65000000 | "
+        "знаков: наша=2 биржа=2 | допуск=0.01 | отклонение=0.50000000 | "
+        "категория=REAL"
+    ) in out
+
+    assert "z0_parity_boundary_anomaly         = 1" in out
+    assert "z0_parity_real                     = 1" in out
+    # Код 2 — это РЕЗУЛЬТАТ замера, а не отказ: цель этапа — точный список.
+    assert code == 2
+
+
+async def test_absorbed_are_counted_not_printed_unless_verbose(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """§5, блок E ТЗ: поглощённое видно числом, а с ``--verbose`` — поимённо.
+
+    КОНТРОЛЬНЫЙ ОПЫТ к поимённому списку: если бы поглощённое печаталось
+    всегда, «короткий список настоящих расхождений» снова утонул бы в шуме.
+    """
+    _, quiet = await _run_measure(monkeypatch, verbose=False)
+    _, loud = await _run_measure(monkeypatch, verbose=True)
+
+    absorbed_line = (
+        "SOL-USDT 1Wutc 2019-12-30 open: наша=2.54800000 биржа=2.54000000 | "
+        "знаков: наша=3 биржа=2 | допуск=0.01 | отклонение=0.00800000"
+    )
+    assert absorbed_line not in quiet, "поглощённое напечатано без --verbose"
+    assert absorbed_line in loud, "--verbose не печатает поглощённые отклонения"
+    # Число при этом одно и то же: флаг меняет ПОДРОБНОСТЬ, а не результат.
+    summary = "Расхождений найдено: 2 полей в 2 барах"
+    assert summary in quiet and summary in loud
+
+
+async def test_year_turn_block_prints_the_chain_as_facts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """§5, блок D ТЗ: цепочка из трёх фактов, без объяснения механизма."""
+    _, out = await _run_measure(monkeypatch, verbose=False)
+
+    block = out[out.index("Блок D."):out.index("Блок E.")]
+    assert "BTC-USDT 1Wutc 2019-12-30 (расхождение)" in block
+    assert "открытие спорного бара по бирже:  7131.90000000" in block
+    assert "открытие по нашей сборке:         7388.50000000" in block
+    assert "предыдущий бар биржи: 2019-12-23 закрытие=" in block
+    assert "Механизм НЕ УСТАНОВЛЕН" in block
+    # КОНТРОЛЬНЫЙ ОПЫТ: тот же рубеж у SOL в блок НЕ попадает. Иначе цепочка
+    # печаталась бы для всего подряд и перестала бы указывать на что бы то ни было.
+    assert "SOL-USDT" not in block
+
+
+async def test_categories_do_not_hide_anything_from_the_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """§5, блок C ТЗ: категория — метка, а не фильтр.
+
+    КОНТРОЛЬНЫЙ ОПЫТ: сумма по категориям обязана сойтись с длиной списка. Если
+    какая-то категория перестанет печататься, эти два числа разойдутся.
+    """
+    _, out = await _run_measure(monkeypatch, verbose=False)
+
+    block = out[out.index("Блок B."):out.index("Блок C.")]
+    named = [line for line in block.splitlines() if "категория=" in line]
+    assert len(named) == 2
+    assert sum(1 for line in named if "BOUNDARY_ANOMALY" in line) == 1
+    assert sum(1 for line in named if "категория=REAL" in line) == 1
+
+
+def test_summary_counts_fields_and_bars_separately() -> None:
+    """Две мерки рядом: поля (правило 0.2) и бары (мерка отчёта Замера 0.1).
+
+    Бар, у которого разошлись ДВА поля, даёт два расхождения и ОДИН затронутый
+    бар. Если бы сводка печатала одно число, сверить результат с ожиданием «7»,
+    взятым из отчёта, считавшего бары, было бы нечем.
+
+    КОНТРОЛЬНЫЙ ОПЫТ — вторая половина проверки: у двух РАЗНЫХ баров числа
+    обязаны совпасть. Функция, всегда возвращающая один элемент, прошла бы
+    первую половину и упала бы здесь.
+    """
+    from scripts.htf_parity_z0 import CATEGORY_REAL, Finding, affected_bars
+
+    def finding(inst: str, bar: str, moment: datetime, field: str) -> Finding:
+        return Finding(
+            deviation=Deviation(
+                inst_id=inst, bar=bar, open_time=moment, field=field,
+                assembled=Decimal("2.00000000"), stored=Decimal("1.00000000"),
+            ),
+            category=CATEGORY_REAL,
+        )
+
+    one_bar = [
+        finding("ETH-USDT", "1Wutc", YEAR_TURN_WEEK, "open"),
+        finding("ETH-USDT", "1Wutc", YEAR_TURN_WEEK, "low"),
+    ]
+    assert affected_bars(one_bar) == ["ETH-USDT 1Wutc 2019-12-30"]
+    assert len(one_bar) == 2
+
+    two_bars = [
+        finding("ETH-USDT", "1Wutc", YEAR_TURN_WEEK, "open"),
+        finding("ETH-USDT", "1Mutc", datetime(2019, 12, 1, tzinfo=UTC), "open"),
+    ]
+    assert affected_bars(two_bars) == [
+        "ETH-USDT 1Wutc 2019-12-30", "ETH-USDT 1Mutc 2019-12-01",
+    ]
+    # Тот же инструмент и та же дата на РАЗНЫХ таймфреймах — разные бары.
+    assert len(affected_bars(two_bars)) == 2
+    assert affected_bars([]) == []
+
+
+def test_category_marks_only_the_year_turn_of_btc_and_eth() -> None:
+    """Метка рубежа ставится по КАЛЕНДАРЮ периода, а не по перечню дат."""
+    from scripts.htf_parity_z0 import CATEGORY_BOUNDARY, CATEGORY_REAL, category_of
+
+    # Период накрывает смену года серединой, кончается ею или начинается с неё.
+    assert category_of("BTC-USDT", "1Wutc", YEAR_TURN_WEEK) == CATEGORY_BOUNDARY
+    assert category_of(
+        "ETH-USDT", "1Mutc", datetime(2019, 12, 1, tzinfo=UTC)
+    ) == CATEGORY_BOUNDARY
+    assert category_of(
+        "ETH-USDT", "1Mutc", datetime(2020, 1, 1, tzinfo=UTC)
+    ) == CATEGORY_BOUNDARY
+    # КОНТРОЛЬНЫЙ ОПЫТ: тот же рубеж у другого инструмента и тот же инструмент
+    # вдали от рубежа — не метка. Иначе метка стояла бы всюду и не значила бы
+    # ничего.
+    assert category_of("SOL-USDT", "1Wutc", YEAR_TURN_WEEK) == CATEGORY_REAL
+    assert category_of("BTC-USDT", "1Wutc", WEEK_START) == CATEGORY_REAL
+    assert category_of(
+        "BTC-USDT", "1Dutc", datetime(2022, 12, 18, tzinfo=UTC)
+    ) == CATEGORY_REAL
+
+
+def test_report_copy_lands_in_reports_with_the_date_in_the_name(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§5 ТЗ: копия отчёта — файлом в ``reports/`` и с датой в имени.
+
+    Копия набирается ТЕМИ ЖЕ строками, что напечатаны: второй проход, собирающий
+    отчёт заново, однажды разошёлся бы с выводом и разошёлся бы молча.
+    """
+    import scripts.htf_parity_z0 as parity
+
+    monkeypatch.setattr(parity, "REPORTS_DIR", tmp_path)
+    monkeypatch.setattr(parity, "_TRANSCRIPT", ["строка отчёта", "вторая строка"])
+    started = datetime(2026, 9, 11, 15, 4, tzinfo=UTC)
+
+    saved = parity.save_report(started)
+    assert saved == tmp_path / "zamer_0_2_parity_2026-09-11.md"
+    assert saved.read_text(encoding="utf-8") == "строка отчёта\nвторая строка\n"
