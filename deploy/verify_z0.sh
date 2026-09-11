@@ -286,8 +286,8 @@ for key in z0_hourly_appended z0_hourly_gaps z0_htf_rows_written \
            z0_htf_dropped_unconfirmed z0_boundary_violations \
            z0_parity_days_compared \
            z0_parity_days_skipped_incomplete z0_parity_ohlc_mismatches \
-           z0_parity_ohlc_mismatches_abs z0_parity_rel_dev_max \
-           z0_parity_rel_dev_p50 \
+           z0_parity_ohlc_absorbed z0_parity_ohlc_absorbed_precision \
+           z0_parity_boundary_anomaly z0_parity_real \
            z0_parity_volume_max_dev z0_unclosed_rows peak_rss_mb; do
   value="$(key_value "${key}")"
   if [[ -n "${value}" ]]; then
@@ -311,19 +311,20 @@ if [[ "${FOUND_ANY}" == "0" ]]; then
   fi
 else
   MISMATCH="$(key_value z0_parity_ohlc_mismatches)"
-  MISMATCH_ABS="$(key_value z0_parity_ohlc_mismatches_abs)"
-  REL_MAX="$(key_value z0_parity_rel_dev_max)"
+  ABSORBED="$(key_value z0_parity_ohlc_absorbed)"
+  BOUNDARY_ANOMALY="$(key_value z0_parity_boundary_anomaly)"
   UNCLOSED="$(key_value z0_unclosed_rows)"
   DROPPED="$(key_value z0_htf_dropped_unconfirmed)"
   BOUNDARY="$(key_value z0_boundary_violations)"
   PEAK="$(key_value peak_rss_mb)"
-  # Расхождение по ОТНОСИТЕЛЬНОМУ правилу (Замер 0.1) остаётся блокирующим:
-  # проверка обязана ловить настоящее рассогласование, а не быть смягчённой до
-  # молчания. Рядом печатается число по прежнему абсолютному правилу и
-  # максимум относительного отклонения — чтобы огрубление знака в данных биржи
-  # не отправляло человека искать часовой пояс, которого он не менял.
+  # Расхождение по правилу Замера 0.2 остаётся блокирующим: проверка обязана
+  # ловить настоящее рассогласование, а не быть смягчённой до молчания. Рядом
+  # называется, сколько отклонений допуск поглотил и сколько находок помечено
+  # аномалией рубежа 2019→2020, — чтобы человека не отправляло искать часовой
+  # пояс, которого он не менял. ПОИМЁННЫЙ СПИСОК находок — в блоке B отчёта
+  # прогона и в его копии в reports/; здесь только число.
   [[ -n "${MISMATCH}" && "${MISMATCH}" != "0" ]] && \
-    note_block "z0_parity_ohlc_mismatches=${MISMATCH}: собранная свеча не совпала с биржевой (по прежнему абсолютному правилу их было бы ${MISMATCH_ABS:-?}, максимум относительного отклонения ${REL_MAX:-?}). ПЕРВЫМ ДЕЛОМ проверять часовой пояс (§3), а не арифметику сборки"
+    note_block "z0_parity_ohlc_mismatches=${MISMATCH}: собранная свеча не совпала с биржевой (поглощено допуском ${ABSORBED:-?}, из находок помечено аномалией рубежа 2019→2020 ${BOUNDARY_ANOMALY:-?}). Поимённый список — блок B отчёта прогона; допуск под «ровно ноль» не подкручивается"
   [[ -n "${BOUNDARY}" && "${BOUNDARY}" != "0" ]] && \
     note_block "z0_boundary_violations=${BOUNDARY}: загрузчик нашёл в продакшн-таблице строки, которые мог записать только этот этап"
   [[ -n "${UNCLOSED}" && "${UNCLOSED}" != "0" ]] && \
