@@ -13,8 +13,21 @@
 ЧЕГО ОН НЕ ДЕЛАЕТ. Он не латает пропуски, не собирает старшие бары из часовых и
 не пишет ни одной строки вне схемы ``backtest``. Пропуск — это ФАКТ, который
 обязан дойти до Замера 1; подстановка синтетики превратила бы измерение в
-измерение собственных допущений. Счётчики строк продакшн-таблиц снимаются ДО и
-ПОСЛЕ и печатаются — это доказательство, а не обещание.
+измерение собственных допущений.
+
+КАК ПРОВЕРЯЕТСЯ ГРАНИЦА ЭТАПА (§13.10 ТЗ; переделано Замером 0.1). ПО СУЩЕСТВУ:
+в продакшн-таблице свечей ``public.ohlcv`` нет и не может быть старших
+масштабов — продакшн собирает только 1m/5m/15m/1h. Такую строку мог записать
+ТОЛЬКО этот этап, и её появление есть запись вне схемы ``backtest``.
+
+Прежняя проверка сравнивала ``count(*)`` продакшн-таблиц до и после, и на
+боевой машине она не могла пройти НИКОГДА: продакшн работает 24/7 и пишет
+параллельно. Оба прогона 11.09.2026 закончились кодом 6 с «продакшн-таблицы
+изменились», и оба раза ложно — за 60 секунд ПОКОЯ счётчики прирастали на
++5/+15/+5/+5, тогда как загрузчик записал 75 417 строк в свою схему. Разница в
+три порядка. Счётчики по-прежнему снимаются и печатаются, но это НАБЛЮДЕНИЕ, а
+не вердикт, и код возврата от них больше не зависит: код 6 обязан означать
+нарушение границы этапа, а не «продакшн работал».
 
 ОСОЗНАННОЕ ИЗМЕНЕНИЕ ПРОТИВ ТЗ 7.4 (§5 ТЗ Замера 0). Там ``BT_PERIOD_TO``
 стояло на 01.08.2026, чтобы результат нельзя было подогнать под известное
@@ -33,7 +46,9 @@
 только там могут возникнуть все пять условий. Здесь:
   0 — загрузка дошла до конца;
   5 — выборка пуста: ни одного бара ни по одному инструменту;
-  6 — загрузка сорвалась (отказ биржи, разошедшийся календарь ряда).
+  6 — загрузка сорвалась (отказ биржи, разошедшийся календарь ряда) ЛИБО
+      нарушена граница этапа: в продакшн-таблице появились строки, которые мог
+      записать только он.
 
 ЗАПУСК (внутри собранного образа; имена профиля и службы печатает
 ``deploy/verify_z0.sh``, они взяты из ``docker-compose.yml``):
@@ -68,7 +83,13 @@ import structlog  # noqa: E402
 
 from backtest import db  # noqa: E402
 from backtest.config import ConfigError, read_env_file  # noqa: E402
-from backtest.htf import BAR_HOURLY, HTF_BARS, HtfError  # noqa: E402
+from backtest.htf import (  # noqa: E402
+    BAR_HOURLY,
+    HTF_BARS,
+    PRODUCTION_FORBIDDEN_TIMEFRAMES,
+    HtfError,
+    boundary_violation_reasons,
+)
 from backtest.htf_loader import (  # noqa: E402
     HtfHistory,
     HtfLoadResult,
@@ -81,6 +102,7 @@ from backtest.loader import (  # noqa: E402
     backfill_candles,
     create_http_client,
 )
+from backtest.z0_metrics import metrics_path, write_metrics  # noqa: E402
 from scripts.probe_htf_depth import compose_target  # noqa: E402
 from scripts.stop_counterfactual_9_1_4 import peak_rss_mb  # noqa: E402
 from src.core.logging import setup_logging  # noqa: E402
@@ -315,6 +337,62 @@ def print_counts(title: str, counts: dict[str, int]) -> None:
         print(f"    public.{table:<22} {value}", flush=True)
 
 
+def print_count_drift(before: dict[str, int], after: dict[str, int]) -> None:
+    """Прирост счётчиков продакшн-таблиц. НАБЛЮДЕНИЕ, А НЕ ВЕРДИКТ.
+
+    Печатается именно как наблюдение, и это сказано прямо в самом выводе: на
+    боевой машине продакшн пишет 24/7, и прирост здесь означает «система
+    живёт». Вердикт даёт :func:`check_stage_boundary` — по признаку
+    происхождения строки, а не по её количеству.
+    """
+    drift = {
+        table: value - before.get(table, 0)
+        for table, value in after.items()
+        if value != before.get(table, 0)
+    }
+    if not drift:
+        print("\n  Прирост счётчиков продакшн-таблиц: нулевой. Это НЕ вердикт "
+              "о границе этапа — значит лишь, что за время прогона продакшн "
+              "ничего не записал.", flush=True)
+        return
+    print("\n  Прирост счётчиков продакшн-таблиц за время прогона:", flush=True)
+    for table, value in sorted(drift.items()):
+        print(f"    public.{table:<22} {value:+d}", flush=True)
+    print("  Это НАБЛЮДЕНИЕ, а не находка: продакшн работает параллельно и "
+          "пишет в свои таблицы сам (измерено 11.09.2026: за 60 секунд покоя "
+          "signals +5, agent_outputs +15, ohlcv +5, open_interest +5). Границу "
+          "этапа проверяет раздел ниже.", flush=True)
+
+
+async def check_stage_boundary(before: dict[str, int] | None) -> tuple[int, list[str]]:
+    """Граница этапа по существу (§13.10 ТЗ). Возвращает (код, причины).
+
+    Проверяется не число строк, а их ПРОИСХОЖДЕНИЕ: старший масштаб в
+    ``public.ohlcv`` мог записать только этот этап. Образец взят из пункта 7
+    deploy/verify_z0.sh, где он уже работает.
+    """
+    after = await db.production_boundary_violations()
+    print("\n=== Граница этапа: продакшн не тронут (§13.10 ТЗ) ===", flush=True)
+    print("  Проверяется НЕ число строк (продакшн пишет параллельно), а их "
+          "происхождение: масштабов "
+          f"{', '.join(PRODUCTION_FORBIDDEN_TIMEFRAMES)} в public.ohlcv быть "
+          "не может — продакшн собирает только 1m/5m/15m/1h.", flush=True)
+    if after is None:
+        print("  ⚪ НЕ ПРОВЕРЕНО: таблицы public.ohlcv нет. Это НЕ «нарушений "
+              "нет».", flush=True)
+    else:
+        print(f"  строк со старшим масштабом в public.ohlcv: ДО {before or {}}, "
+              f"ПОСЛЕ {after}", flush=True)
+    reasons = boundary_violation_reasons(before=before, after=after)
+    if not reasons:
+        print("  🟢 граница этапа не нарушена: ни одной строки, которую мог бы "
+              "записать только этот этап, в продакшн-таблице нет.", flush=True)
+        return 0, []
+    for reason in reasons:
+        print(f"  🔴 {reason}", flush=True)
+    return 6, reasons
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser(
         description="Замер 0, шаги 2–3: часовой ряд и старшие ряды. "
@@ -373,7 +451,12 @@ async def main() -> int:
                   flush=True)
             return 6
         before = await db.production_row_counts()
-        print_counts("Счётчики продакшн-таблиц ДО (§13.10 ТЗ):", before)
+        print_counts("Счётчики продакшн-таблиц ДО (наблюдение, не вердикт):",
+                     before)
+        # Снимок ДО — чтобы отличить строку, появившуюся В ЭТОМ прогоне, от
+        # нарушения границы, случившегося раньше. Оба исхода блокирующие, но
+        # называются они по-разному, и смешивать их нельзя.
+        boundary_before = await db.production_boundary_violations()
 
         do_hourly = args.steps in ("all", "hourly")
         do_htf = args.steps in ("all", "htf")
@@ -410,18 +493,13 @@ async def main() -> int:
                   "нечего. Это НЕ «проверка прошла».", flush=True)
 
         after = await db.production_row_counts()
-        print_counts("Счётчики продакшн-таблиц ПОСЛЕ (§13.10 ТЗ):", after)
-        changed = {
-            table: (before.get(table), value)
-            for table, value in after.items()
-            if before.get(table) != value
-        }
-        if changed:
-            print(f"\n  🔴 ПРОДАКШН-ТАБЛИЦЫ ИЗМЕНИЛИСЬ: {changed}", flush=True)
-            exit_code = 6
-        else:
-            print("\n  Счётчики продакшн-таблиц СОВПАЛИ до и после: "
-                  "ни одной записи вне схемы backtest.", flush=True)
+        print_counts("Счётчики продакшн-таблиц ПОСЛЕ (наблюдение, не вердикт):",
+                     after)
+        print_count_drift(before, after)
+        boundary_code, boundary_reasons = await check_stage_boundary(
+            boundary_before
+        )
+        exit_code = exit_code or boundary_code
 
         htf_written = sum(item.appended for item in results)
         dropped = sum(item.dropped_unconfirmed for item in results)
@@ -444,6 +522,12 @@ async def main() -> int:
                   "успех: проверьте, что свежий край брался с /market/candles.",
                   flush=True)
         print(f"  пар «конец = начало» сверено:  {chain_pairs}", flush=True)
+        # «Находок», а не «нарушений»: одна из них — «проверить было нечем»,
+        # и выдать её за нарушение значило бы соврать в другую сторону.
+        # Существо каждой находки названо разделом выше.
+        print(f"  находок по границе этапа:      {len(boundary_reasons)}"
+              + ("   (старших масштабов в public.ohlcv нет)"
+                 if not boundary_reasons else ""), flush=True)
         if empty:
             print(f"  🔴 ПУСТЫЕ РЯДЫ: {empty}", flush=True)
             exit_code = exit_code or 5
@@ -451,14 +535,26 @@ async def main() -> int:
         peak = peak_rss_mb()
         print(f"  пиковая память:                {peak:,.0f} МБ "
               f"(потолок {MEMORY_CAP_MB:,.0f} МБ)", flush=True)
-        _log.info(
-            "Замер 0: загрузка завершена",
-            z0_hourly_appended=hourly_appended,
-            z0_hourly_gaps=gaps,
-            z0_htf_rows_written=htf_written,
-            z0_htf_dropped_unconfirmed=dropped,
-            peak_rss_mb=round(peak, 1),
-        )
+        keys: dict[str, Any] = {
+            "z0_hourly_appended": hourly_appended,
+            "z0_hourly_gaps": gaps,
+            "z0_htf_rows_written": htf_written,
+            "z0_htf_dropped_unconfirmed": dropped,
+            "z0_boundary_violations": len(boundary_reasons),
+            "peak_rss_mb": round(peak, 1),
+        }
+        _log.info("Замер 0: загрузка завершена", **keys)
+
+        # Ключи пишутся ЕЩЁ И В ФАЙЛ: журнал контейнера вытесняется по объёму и
+        # исчезает вместе с контейнером, а файл в analysis_out переживает и то,
+        # и другое. Пункт 5 verify_z0.sh читает файл, журнал — запасной путь.
+        written = write_metrics(f"z0_load_{args.steps}", keys)
+        if written is None:
+            print(f"  🟡 ключи НЕ записаны в {metrics_path()}: каталог "
+                  "недоступен на запись. Загрузку это не отменяет, но "
+                  "verify_z0.sh придётся читать журнал контейнера.", flush=True)
+        else:
+            print(f"  машиночитаемые ключи дописаны в {written}", flush=True)
     except (HtfError, ConfigError, LoaderError) as exc:
         # Отказ биржи и нарушенная посылка — это НАЗВАННАЯ причина и код 6, а
         # не трассировка стека: причину читает человек. Дефект D-8 состоял ровно

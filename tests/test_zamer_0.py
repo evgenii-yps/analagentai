@@ -35,8 +35,10 @@ from typing import Any
 import pytest
 
 from backtest.htf import (
+    EPS_FLOOR,
     HTF_BARS,
     OHLC_TOLERANCE,
+    TOL_REL,
     Deviation,
     HtfError,
     SourceBar,
@@ -1258,3 +1260,677 @@ async def test_continuity_refuses_candles_without_a_scale() -> None:
     # У funding масштаба не существует, и bar=None там законен: проверка не
     # должна мешать обращению, ради которого поблажка и оставлена.
     assert SERIES_FUNDING != SERIES_CANDLES
+
+
+# ---------------------------------------------------------------------------
+# ЗАМЕР 0.1, дефект 1: допуск сравнения относительный, а не абсолютный
+#
+# Числа здесь — ИЗ ПРОГОНА 11.09.2026, а не придуманные. Проверка, написанная
+# на удобных числах, доказывала бы, что арифметика деления работает, а не что
+# порог отделяет огрубление знака от настоящего рассогласования.
+# ---------------------------------------------------------------------------
+
+
+def _ohlc_deviation(assembled: str, stored: str, field: str = "close") -> Deviation:
+    return Deviation(
+        inst_id=INST, bar="1Dutc", open_time=DAY, field=field,
+        assembled=Decimal(assembled), stored=Decimal(stored),
+    )
+
+
+def test_truncated_third_decimal_is_no_longer_a_mismatch() -> None:
+    """Огрубление знака на стороне OKX перестаёт засчитываться расхождением.
+
+    Значения фактические: на ранних участках рядов биржа отдаёт дневной бар с
+    ОБРЕЗАННЫМ третьим знаком, тогда как в часовых он есть. Прежний абсолютный
+    допуск 1e-8 объявлял это расхождением — 513 раз на 10 759 сравнений.
+    """
+    for assembled, stored in (
+        ("44.78900000", "44.78000000"),    # SOL, обрезан третий знак
+        ("49.12900000", "49.12000000"),    # SOL
+        ("0.14158100", "0.14158000"),      # DOGE
+    ):
+        deviation = _ohlc_deviation(assembled, stored)
+        assert deviation.is_mismatch_abs, (
+            "подобранное значение укладывается и в прежний допуск — опыт не о том"
+        )
+        assert not deviation.is_mismatch, (
+            f"{assembled} против {stored}: относительное отклонение "
+            f"{deviation.relative_floored} меньше TOL_REL={TOL_REL}, и считать "
+            "его расхождением значит блокировать этап округлением биржи"
+        )
+
+
+def test_real_disagreement_inside_okx_data_is_still_caught() -> None:
+    """КОНТРОЛЬНЫЙ ОПЫТ к предыдущему: два случая 18.12.2022 обязаны остаться.
+
+    Это не огрубление знака, а рассогласование внутри данных самой биржи:
+    часовой максимум ETH 1196,00 против дневного 1194,60. Порог, при котором
+    эти случаи перестают быть видны, подогнан под «ровно ноль расхождений» и
+    этап не сдан.
+    """
+    deviation = _ohlc_deviation("1196.00000000", "1194.60000000", field="high")
+    assert deviation.is_mismatch, (
+        "настоящее рассогласование данных OKX перестало засчитываться — порог "
+        "задран, и проверка больше не является проверкой"
+    )
+    assert deviation.relative_floored > Decimal("1e-3")
+
+
+def test_tolerance_boundary_is_exactly_where_it_is_declared() -> None:
+    """§5.5 приёмки: TOL_REL×1,01 засчитано, TOL_REL×0,99 — нет.
+
+    Опыт над САМИМ правилом. Сдвиг окна (§7) показывает лишь, что сравнение
+    видит разные данные, и прошёл бы при пороге, задранном на порядок.
+    """
+    base = Decimal("100")
+    above = Deviation(
+        inst_id=INST, bar="1Dutc", open_time=DAY, field="close",
+        assembled=base * (Decimal(1) + TOL_REL * Decimal("1.01")), stored=base,
+    )
+    below = Deviation(
+        inst_id=INST, bar="1Dutc", open_time=DAY, field="close",
+        assembled=base * (Decimal(1) + TOL_REL * Decimal("0.99")), stored=base,
+    )
+    assert above.is_mismatch, "отклонение выше порога не засчитано — допуск слеп"
+    assert not below.is_mismatch, (
+        "отклонение ниже порога засчитано — допуск не действует, и его значение "
+        "ничего не ограничивает"
+    )
+
+
+def test_the_script_probe_agrees_with_the_rule_it_probes() -> None:
+    """Контрольный опыт в самом скрипте меряет ТО ЖЕ правило, а не свою копию."""
+    from scripts.htf_parity_z0 import tolerance_probe
+
+    assert tolerance_probe() == (True, False)
+
+
+def test_absolute_rule_is_kept_for_comparability_not_for_the_verdict() -> None:
+    """``_abs`` остаётся прежним 1e-8: сопоставить прогоны иначе будет нечем."""
+    assert OHLC_TOLERANCE == Decimal("1e-8")
+    hair = _ohlc_deviation("100.00000002", "100.00000000")
+    assert hair.is_mismatch_abs, "прежняя метрика подменена — сравнить прогоны нечем"
+    assert not hair.is_mismatch, "правило Замера 0.1 обязано быть относительным"
+
+
+def test_absolute_condition_is_secondary_and_guards_near_zero() -> None:
+    """Расхождение засчитывается, только если превышены ОБА допуска.
+
+    У околонулевой цены относительная мера вырождается: разница в последнем
+    знаке хранения ``NUMERIC(20,8)`` даёт относительное отклонение в разы.
+    Без вторичного абсолютного условия проверка ловила бы шум округления базы.
+    """
+    dust = _ohlc_deviation("0.00000002", "0.00000001")
+    assert dust.relative_floored > TOL_REL, "опыт не о том: мера не выродилась"
+    assert not dust.is_mismatch, (
+        "шум последнего знака хранения засчитан расхождением — вторичное "
+        "абсолютное условие EPS_FLOOR не работает"
+    )
+    assert dust.absolute <= EPS_FLOOR
+
+
+def test_relative_measure_never_divides_by_zero() -> None:
+    """Нулевая биржевая цена не роняет меру: делитель не меньше EPS_FLOOR."""
+    zero = _ohlc_deviation("0.00000000", "0.00000000")
+    assert zero.relative_floored == 0
+    assert not zero.is_mismatch
+    from_zero = _ohlc_deviation("1.00000000", "0.00000000")
+    assert from_zero.relative_floored > TOL_REL
+    assert from_zero.is_mismatch, (
+        "появление цены из ниоткуда не засчитано расхождением"
+    )
+
+
+def _ohlc_mismatches_relative(shift: timedelta) -> tuple[int, int]:
+    """То же, что :func:`_ohlc_mismatches`, но по правилу Замера 0.1."""
+    compared = 0
+    mismatched = 0
+    for built in assemble("1Dutc", hour_bars(DAY, 72), shift=shift):
+        if not built.is_complete:
+            continue
+        expected = EXCHANGE_DAYS.get(built.open_time)
+        if expected is None:
+            continue
+        compared += 1
+        for name in ("open", "high", "low", "close"):
+            deviation = Deviation(
+                inst_id=INST, bar=built.bar, open_time=built.open_time,
+                field=name, assembled=getattr(built, name), stored=expected[name],
+            )
+            if deviation.is_mismatch:
+                mismatched += 1
+                break
+    return compared, mismatched
+
+
+def test_relative_tolerance_does_not_swallow_the_shifted_window() -> None:
+    """§5.4 приёмки: опыт со сдвигом окна обязан падать и при новом допуске.
+
+    Если относительный допуск гасит и его — порог слишком велик, и этап не
+    сдан. Проверяется ОБЕ половины: несдвинутое окно по-прежнему сходится.
+    """
+    compared, mismatched = _ohlc_mismatches_relative(timedelta(hours=1))
+    assert compared == 2, "сдвинутой сборке не на чем падать — опыт ничего не значит"
+    assert mismatched == compared, (
+        "сдвиг окна на час перестал давать расхождения при относительном "
+        "допуске — порог слишком велик"
+    )
+    assert _ohlc_mismatches_relative(timedelta(0)) == (3, 0)
+
+
+def test_tolerance_lives_in_one_place_and_is_not_written_by_hand() -> None:
+    """Число допуска не пишется по месту сравнения.
+
+    Допуск, размноженный по файлам, однажды разойдётся сам с собой и разойдётся
+    молча. Проверка следит за буквой правила: ни в скрипте контроля, ни в
+    сравнении ``backtest/htf.py`` литерала порога быть не должно.
+    """
+    for path in (
+        ROOT / "scripts" / "htf_parity_z0.py",
+        ROOT / "backtest" / "htf_loader.py",
+    ):
+        text = path.read_text(encoding="utf-8")
+        assert "5e-4" not in text and "0.0005" not in text, (
+            f"{path.name}: значение TOL_REL написано по месту — оно обязано "
+            "жить только в backtest/htf.py"
+        )
+    htf_text = (ROOT / "backtest" / "htf.py").read_text(encoding="utf-8")
+    assert htf_text.count('TOL_REL = Decimal("5e-4")') == 1
+    assert htf_text.count('EPS_FLOOR = Decimal("1e-8")') == 1
+
+
+# ---------------------------------------------------------------------------
+# ЗАМЕР 0.1, дефект 2: граница этапа проверяется по существу, а не по счётчикам
+#
+# Прежняя проверка сравнивала count(*) продакшн-таблиц до и после. На боевой
+# машине продакшн работает 24/7, и она срабатывала ВСЕГДА: оба прогона
+# 11.09.2026 закончились кодом 6 «продакшн-таблицы изменились», и оба раза
+# ложно. Здесь оба случая разыгрываются двойником базы: система, которая
+# ЖИВЁТ, и загрузчик, который ЗАЛЕЗ НЕ ТУДА, обязаны различаться.
+# ---------------------------------------------------------------------------
+
+
+class LiveProductionDb:
+    """Двойник базы, в которой продакшн пишет ПАРАЛЛЕЛЬНО с прогоном.
+
+    Счётчики строк растут при каждом обращении — ровно как на боевой машине,
+    где за 60 секунд покоя signals прирастало на 5, agent_outputs на 15.
+    Содержимое ``public.ohlcv`` при этом задаётся отдельно: «система живёт» и
+    «в продакшн-таблице появился старший масштаб» — разные события, и двойник
+    обязан уметь показать их по отдельности.
+    """
+
+    def __init__(self, *, timeframes: list[str] | None = None,
+                 has_ohlcv: bool = True) -> None:
+        self.timeframes = list(timeframes or [])
+        self.has_ohlcv = has_ohlcv
+        self.ticks = 0
+        self.queries: list[str] = []
+
+    def _note(self, sql: str) -> None:
+        self.queries.append(" ".join(sql.split()))
+
+    async def fetchval(self, sql: str, *args: Any) -> Any:
+        self._note(sql)
+        if "information_schema.tables" in sql:
+            if "'ohlcv'" in sql or args[:1] == ("ohlcv",):
+                return 1 if self.has_ohlcv else None
+            return 1
+        if "count(*)" in sql:
+            # Продакшн пишет сам по себе: каждое обращение видит больше строк.
+            self.ticks += 1
+            return 1000 + self.ticks * 5
+        return None
+
+    async def fetch(self, sql: str, *args: Any) -> Any:
+        self._note(sql)
+        wanted = set(args[0]) if args else set()
+        counts: dict[str, int] = {}
+        for scale in self.timeframes:
+            if scale in wanted:
+                counts[scale] = counts.get(scale, 0) + 1
+        return [{"timeframe": k, "rows": v} for k, v in sorted(counts.items())]
+
+
+@pytest.fixture
+def live_production(monkeypatch):
+    """Подменяет пул базы двойником живого продакшна."""
+    from backtest import db as bt_db
+
+    def _install(**kwargs: Any) -> LiveProductionDb:
+        fake = LiveProductionDb(**kwargs)
+        monkeypatch.setattr(bt_db, "_pool", fake)
+        return fake
+
+    return _install
+
+
+async def test_parallel_production_writes_are_not_a_boundary_violation(
+    live_production,
+) -> None:
+    """КОНТРОЛЬНЫЙ ОПЫТ дефекта 2: живой продакшн не роняет проверку.
+
+    Счётчики строк растут между снимками ДО и ПОСЛЕ — и это НЕ находка. Именно
+    на этом прежняя проверка давала код 6 каждый раз.
+    """
+    from backtest import db as bt_db
+    from scripts.load_htf_z0 import check_stage_boundary
+
+    fake = live_production(timeframes=["1m"] * 5 + ["1h"] * 3)
+    before_counts = await bt_db.production_row_counts()
+    boundary_before = await bt_db.production_boundary_violations()
+    after_counts = await bt_db.production_row_counts()
+    assert after_counts != before_counts, (
+        "двойник не воспроизвёл параллельную запись продакшна — опыт не о том"
+    )
+
+    code, reasons = await check_stage_boundary(boundary_before)
+    assert (code, reasons) == (0, []), (
+        "рост счётчиков продакшн-таблиц засчитан нарушением границы этапа — "
+        "проверка снова не отличает «система живёт» от «загрузчик залез не туда»"
+    )
+    assert fake.ticks >= 2
+
+
+async def test_higher_timeframe_in_production_table_is_caught(
+    live_production,
+) -> None:
+    """Вторая половина: НАСТОЯЩЕЕ нарушение границы обязано сработать.
+
+    Старший масштаб в ``public.ohlcv`` мог записать только этот этап: продакшн
+    собирает 1m/5m/15m/1h и старших не собирает вовсе.
+    """
+    from backtest import db as bt_db
+    from scripts.load_htf_z0 import check_stage_boundary
+
+    fake = live_production(timeframes=["1m", "1h"])
+    boundary_before = await bt_db.production_boundary_violations()
+    assert boundary_before == {}, "опыт начинается с чистой продакшн-таблицы"
+
+    fake.timeframes += ["1Dutc", "1Dutc", "1Wutc"]
+    code, reasons = await check_stage_boundary(boundary_before)
+    assert code == 6, "нарушение границы этапа НЕ поймано — код 6 снова пуст"
+    assert any("ПОЯВИЛИСЬ" in reason for reason in reasons)
+    assert any("1Dutc" in reason for reason in reasons)
+
+
+async def test_pre_existing_violation_is_named_separately(live_production) -> None:
+    """Нарушение, случившееся РАНЬШЕ, называется своим именем, а не этим прогоном."""
+    from backtest import db as bt_db
+    from scripts.load_htf_z0 import check_stage_boundary
+
+    live_production(timeframes=["1Mutc"])
+    boundary_before = await bt_db.production_boundary_violations()
+    code, reasons = await check_stage_boundary(boundary_before)
+    assert code == 6
+    assert any("УЖЕ ЛЕЖАЛИ" in reason for reason in reasons), (
+        "старое нарушение выдано за появившееся в этом прогоне — разные "
+        "находки смешаны"
+    )
+
+
+async def test_missing_production_table_is_not_reported_as_clean(
+    live_production,
+) -> None:
+    """«Проверить нечем» и «нарушений нет» — разные исходы, и они не смешиваются."""
+    from backtest import db as bt_db
+    from scripts.load_htf_z0 import check_stage_boundary
+
+    live_production(has_ohlcv=False)
+    boundary_before = await bt_db.production_boundary_violations()
+    assert boundary_before is None
+    code, reasons = await check_stage_boundary(boundary_before)
+    assert code == 6
+    assert any("НЕЧЕМ" in reason for reason in reasons)
+
+
+async def test_boundary_check_only_reads(live_production) -> None:
+    """Проверка границы ничего не пишет: ни одного запроса на запись."""
+    from backtest import db as bt_db
+
+    fake = live_production(timeframes=["1Dutc"])
+    await bt_db.production_boundary_violations()
+    assert fake.queries, "двойник не получил ни одного запроса — опыт не о том"
+    for sql in fake.queries:
+        upper = sql.upper()
+        assert not any(
+            word in upper
+            for word in ("INSERT", "UPDATE", "DELETE", "TRUNCATE", "ALTER", "DROP")
+        ), f"проверка границы отправила запрос на запись: {sql}"
+
+
+def test_loader_no_longer_judges_the_boundary_by_row_counts() -> None:
+    """Заведомо ложная проверка убрана, а не оставлена рядом с новой.
+
+    Оставить её «вспомогательной» с прежним вердиктом значило бы сохранить код
+    возврата 6, который на боевой машине не означает ничего.
+    """
+    text = (ROOT / "scripts" / "load_htf_z0.py").read_text(encoding="utf-8")
+    assert "ПРОДАКШН-ТАБЛИЦЫ ИЗМЕНИЛИСЬ" not in text, (
+        "вердикт по счётчикам строк вернулся в загрузчик"
+    )
+    assert "check_stage_boundary" in text
+    assert "наблюдение, не вердикт" in text, (
+        "счётчики строк печатаются без оговорки, что они не вердикт"
+    )
+
+
+@pytest.fixture
+async def prod_pool():
+    """Пул к тестовой базе с ПРОДАКШН-схемой из ``db/init.sql`` (§11 ТЗ).
+
+    Схема берётся из файла, а не переписывается здесь: переписанный список
+    колонок однажды разошёлся бы с базой молча (урок Этапа 9.1.2.2).
+    """
+    import asyncpg
+
+    from backtest import db as bt_db
+
+    pool = await asyncpg.create_pool(dsn=TEST_DSN, min_size=1, max_size=2)
+    await pool.execute((ROOT / "db" / "init.sql").read_text(encoding="utf-8"))
+    await pool.execute("DELETE FROM ohlcv;")
+    previous = bt_db._pool
+    bt_db._pool = pool
+    try:
+        yield pool
+    finally:
+        bt_db._pool = previous
+        await pool.execute("DELETE FROM ohlcv;")
+        await pool.close()
+
+
+@requires_db
+async def test_boundary_query_runs_against_the_real_production_table(
+    prod_pool,
+) -> None:
+    """Тот же вердикт, но на НАСТОЯЩЕЙ таблице: запрос обязан быть исполнимым.
+
+    Двойник базы проверяет правило. Он не проверяет, что запрос вообще
+    выполняется на схеме продакшна, — а именно этого и не хватило бы, окажись
+    колонка названа иначе.
+    """
+    from backtest import db as bt_db
+
+    inst = await prod_pool.fetchval(
+        "INSERT INTO instruments (exchange, symbol, base, quote) "
+        "VALUES ('okx', 'BTC-USDT', 'BTC', 'USDT') "
+        "ON CONFLICT (exchange, symbol, type) DO UPDATE SET base = EXCLUDED.base "
+        "RETURNING id;"
+    )
+    rows = [
+        (inst, "1h", DAY + timedelta(hours=i), 1.0, 2.0, 0.5, 1.5, 10.0)
+        for i in range(3)
+    ]
+    await prod_pool.executemany(
+        "INSERT INTO ohlcv (instrument_id, timeframe, ts, open, high, low, "
+        "close, volume) VALUES ($1,$2,$3,$4,$5,$6,$7,$8);",
+        rows,
+    )
+    assert await bt_db.production_boundary_violations() == {}, (
+        "часовые свечи продакшна засчитаны нарушением границы этапа"
+    )
+
+    await prod_pool.execute(
+        "INSERT INTO ohlcv (instrument_id, timeframe, ts, open, high, low, "
+        "close, volume) VALUES ($1,'1Dutc',$2,1,2,0.5,1.5,10);",
+        inst, DAY,
+    )
+    assert await bt_db.production_boundary_violations() == {"1Dutc": 1}, (
+        "старший масштаб в продакшн-таблице не найден — запрос проверки не "
+        "работает на настоящей схеме"
+    )
+
+
+# ---------------------------------------------------------------------------
+# ЗАМЕР 0.1, дефект 3: пункт 5 verify_z0.sh обязан уметь пройти
+# ---------------------------------------------------------------------------
+
+VERIFY = ROOT / "deploy" / "verify_z0.sh"
+RUNBOOK = ROOT / "deploy" / "RUNBOOK_Z0.md"
+
+
+def _verify_container_names() -> list[str]:
+    """Имена контейнеров этапа из ЕДИНСТВЕННОГО источника — verify_z0.sh."""
+    text = VERIFY.read_text(encoding="utf-8")
+    found = re.search(r"^Z0_CONTAINERS=\(([^)]*)\)", text, re.MULTILINE)
+    assert found, "в verify_z0.sh нет массива Z0_CONTAINERS — источник имён исчез"
+    return found.group(1).split()
+
+
+def test_runbook_creates_exactly_the_containers_verify_looks_for() -> None:
+    """КОРНЕВАЯ ПРИЧИНА дефекта 3: два документа одного этапа разошлись в именах.
+
+    verify_z0.sh искал журнал контейнера ``z0_load``, которого runbook не
+    создаёт ни на одном шаге: шаг 9 создаёт ``z0_load_hourly``, шаг 11 —
+    ``z0_load_htf``. Проверка следит не за строкой 198, а за тем, чтобы имена
+    оставались одни и те же.
+    """
+    named = set(re.findall(r"--name\s+(\S+)", RUNBOOK.read_text(encoding="utf-8")))
+    assert named == set(_verify_container_names()), (
+        f"runbook создаёт {sorted(named)}, а verify_z0.sh ищет "
+        f"{sorted(_verify_container_names())} — расхождение вернулось"
+    )
+
+
+def _run_verify(tmp_path, docker_shim: str, *, metrics: str | None) -> str:
+    """Запускает verify_z0.sh с двойником docker и своим каталогом APP_DIR."""
+    import subprocess
+
+    app = tmp_path / "app"
+    (app / "analysis_out").mkdir(parents=True, exist_ok=True)
+    if metrics is not None:
+        (app / "analysis_out" / "z0_metrics.txt").write_text(metrics, encoding="utf-8")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    shim = bin_dir / "docker"
+    shim.write_text(docker_shim, encoding="utf-8")
+    shim.chmod(0o755)
+    env = dict(os.environ)
+    env["APP_DIR"] = str(app)
+    env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
+    done = subprocess.run(
+        ["bash", str(VERIFY)], capture_output=True, text=True, env=env, timeout=180
+    )
+    return done.stdout
+
+
+DOCKER_DEAD = "#!/bin/sh\nexit 1\n"
+
+DOCKER_CONTAINERS_WITHOUT_KEYS = """#!/bin/sh
+case "$1" in
+  inspect) exit 0 ;;
+  logs) echo "какой-то вывод без единого ключа"; exit 0 ;;
+  *) exit 1 ;;
+esac
+"""
+
+METRICS_SAMPLE = """# z0_load_htf 2026-09-11T10:00:00+00:00
+z0_htf_rows_written=75417
+z0_htf_dropped_unconfirmed=4
+z0_boundary_violations=0
+z0_metrics_epoch=1757584800
+# z0_parity 2026-09-11T10:20:00+00:00
+z0_parity_days_compared=10759
+z0_parity_ohlc_mismatches=2
+z0_parity_ohlc_mismatches_abs=513
+z0_parity_rel_dev_max=0.00163
+z0_parity_rel_dev_p50=4.2e-05
+z0_unclosed_rows=0
+peak_rss_mb=180.4
+z0_metrics_epoch=1757586000
+"""
+
+
+def test_verify_prints_every_key_from_the_metrics_file(tmp_path) -> None:
+    """§5.7 приёмки, половина первая: ключи прогонов ПЕЧАТАЮТСЯ.
+
+    Docker в этом опыте мёртв целиком — и это главное: файл ключей обязан
+    работать сам по себе. Журнал контейнера шага 14 исчезает вместе с
+    контейнером (``run --rm``), и единственным источником быть не может.
+    """
+    out = _run_verify(tmp_path, DOCKER_DEAD, metrics=METRICS_SAMPLE)
+    for key, value in (
+        ("z0_parity_days_compared", "10759"),
+        ("z0_parity_ohlc_mismatches", "2"),
+        ("z0_parity_ohlc_mismatches_abs", "513"),
+        ("z0_parity_rel_dev_max", "0.00163"),
+        ("z0_parity_rel_dev_p50", "4.2e-05"),
+        ("z0_htf_rows_written", "75417"),
+        ("z0_unclosed_rows", "0"),
+        ("peak_rss_mb", "180.4"),
+    ):
+        assert re.search(rf"{key}\s+{re.escape(value)}", out), (
+            f"ключ {key} не напечатан пунктом 5 — при живом файле ключей"
+        )
+    assert "СБОР ЖУРНАЛОВ НЕ УДАЛСЯ" not in out
+    assert "прогоны либо не выполнялись" not in out
+
+
+def test_verify_says_log_collection_failed_not_that_runs_are_absent(
+    tmp_path,
+) -> None:
+    """§5.7 приёмки, половина вторая: испорченный сбор называется своим именем.
+
+    Контейнеры этапа существуют, их журналы читаются — а ключей в них нет.
+    Прежняя версия объявляла бы, что прогоны не выполнялись, то есть называла
+    БЕЗ ОСНОВАНИЙ неверную причину.
+    """
+    out = _run_verify(tmp_path, DOCKER_CONTAINERS_WITHOUT_KEYS, metrics=None)
+    assert "СБОР ЖУРНАЛОВ НЕ УДАЛСЯ" in out, (
+        "отказ разбора снова выдан за отсутствие прогонов"
+    )
+    assert "контейнеры этапа существуют" in out
+    assert "судя по всему, не выполнялись" not in out
+
+
+def test_verify_says_log_collection_failed_when_no_source_is_readable(
+    tmp_path,
+) -> None:
+    """Ни файла, ни журналов, ни docker: это тоже отказ сбора, а не вывод."""
+    out = _run_verify(tmp_path, DOCKER_DEAD, metrics=None)
+    assert "СБОР ЖУРНАЛОВ НЕ УДАЛСЯ" in out
+    assert "не прочитан НИ ОДИН источник" in out
+
+
+def test_verify_still_says_runs_are_absent_when_nothing_ran(tmp_path) -> None:
+    """КОНТРОЛЬНЫЙ ОПЫТ к предыдущим: настоящее «не запускали» не переименовано.
+
+    Если бы скрипт теперь на ЛЮБОЙ пустой разбор говорил «сбор не удался», он
+    перестал бы отличать одно от другого — то есть повторил бы прежний дефект,
+    только другой стороной.
+    """
+    shim = """#!/bin/sh
+case "$1" in
+  inspect) exit 1 ;;
+  compose) echo "какой-то журнал служб без ключей"; exit 0 ;;
+  *) exit 1 ;;
+esac
+"""
+    out = _run_verify(tmp_path, shim, metrics=None)
+    assert "судя по всему, не выполнялись" in out
+    assert "СБОР ЖУРНАЛОВ НЕ УДАЛСЯ" not in out
+
+
+def test_one_broken_log_source_does_not_wipe_the_others(tmp_path) -> None:
+    """Отказ одного звена сбора не обнуляет уже собранное.
+
+    Это и была механика дефекта: все источники собирались одной подстановкой,
+    и несуществующий контейнер внутри неё уносил с собой остальные.
+    """
+    shim = """#!/bin/sh
+case "$1" in
+  inspect) [ "$2" = "z0_load_htf" ] && exit 0 || exit 1 ;;
+  logs) echo 'z0_parity_ohlc_mismatches=2'; exit 0 ;;
+  compose) exit 1 ;;
+  *) exit 1 ;;
+esac
+"""
+    out = _run_verify(tmp_path, shim, metrics=None)
+    assert re.search(r"z0_parity_ohlc_mismatches\s+2", out), (
+        "ключ из живого журнала потерян из-за отказа соседнего источника"
+    )
+
+
+def test_verify_reads_keys_written_by_the_scripts_themselves(tmp_path) -> None:
+    """Формат файла ключей и его разбор в verify_z0.sh — одно и то же.
+
+    Файл здесь не составляется руками: он пишется ТОЙ ЖЕ функцией, которой
+    пишут скрипты этапа. Согласовывать два представления «на глаз» — способ
+    получить расхождение молча.
+    """
+    from backtest.z0_metrics import write_metrics
+
+    app = tmp_path / "app"
+    (app / "analysis_out").mkdir(parents=True)
+    target = app / "analysis_out" / "z0_metrics.txt"
+    os.environ["Z0_METRICS_PATH"] = str(target)
+    try:
+        written = write_metrics("z0_parity", {
+            "z0_parity_ohlc_mismatches": 2,
+            "z0_parity_rel_dev_max": 1.63e-3,
+            "peak_rss_mb": 180.4,
+        })
+    finally:
+        del os.environ["Z0_METRICS_PATH"]
+    assert written == target
+    out = _run_verify(
+        tmp_path, DOCKER_DEAD, metrics=target.read_text(encoding="utf-8")
+    )
+    assert re.search(r"z0_parity_ohlc_mismatches\s+2", out)
+    assert re.search(r"z0_parity_rel_dev_max\s+0\.00163", out)
+    assert re.search(r"peak_rss_mb\s+180\.4", out)
+
+
+def test_metrics_file_is_appended_not_overwritten(tmp_path) -> None:
+    """Шаги 9, 11 и 14 — разные прогоны: затирать чужие ключи нельзя."""
+    from backtest.z0_metrics import write_metrics
+
+    target = tmp_path / "out" / "z0_metrics.txt"
+    os.environ["Z0_METRICS_PATH"] = str(target)
+    try:
+        write_metrics("z0_load_hourly", {"z0_hourly_appended": 12})
+        write_metrics("z0_parity", {"z0_parity_ohlc_mismatches": 2})
+    finally:
+        del os.environ["Z0_METRICS_PATH"]
+    body = target.read_text(encoding="utf-8")
+    assert "z0_hourly_appended=12" in body, "ключи первого прогона затёрты вторым"
+    assert "z0_parity_ohlc_mismatches=2" in body
+
+
+def test_unwritable_metrics_path_does_not_break_the_run(tmp_path) -> None:
+    """КОНТРОЛЬНЫЙ ОПЫТ: потеря места для ключей не стоит шестичасовой загрузки."""
+    from backtest.z0_metrics import write_metrics
+
+    blocker = tmp_path / "blocker"
+    blocker.write_text("не каталог", encoding="utf-8")
+    os.environ["Z0_METRICS_PATH"] = str(blocker / "z0_metrics.txt")
+    try:
+        assert write_metrics("z0_parity", {"peak_rss_mb": 1.0}) is None
+    finally:
+        del os.environ["Z0_METRICS_PATH"]
+
+
+def test_verify_reads_keys_from_the_json_rendered_log(tmp_path) -> None:
+    """Журнал контейнера — ЗАПАСНОЙ источник, и он тоже обязан разбираться.
+
+    В контейнере без TTY structlog печатает JSON, и ключ выглядит как
+    ``"z0_parity_ohlc_mismatches": 2``, а не ``ключ=значение``. Разбор,
+    понимающий только вторую запись, нашёл бы в таком журнале ноль ключей и
+    объявил бы, что прогоны не выполнялись.
+    """
+    shim = (
+        "#!/bin/sh\n"
+        'case "$1" in\n'
+        "  inspect) exit 0 ;;\n"
+        '  logs) echo \'{"event":"ok","z0_parity_ohlc_mismatches":2,'
+        '"z0_unclosed_rows":0,"peak_rss_mb":180.4}\'; exit 0 ;;\n'
+        "  *) exit 1 ;;\n"
+        "esac\n"
+    )
+    out = _run_verify(tmp_path, shim, metrics=None)
+    assert re.search(r"z0_parity_ohlc_mismatches\s+2", out), (
+        "ключ из JSON-журнала не найден — разбор понимает только одну запись"
+    )
+    assert re.search(r"peak_rss_mb\s+180\.4", out)
+    assert "СБОР ЖУРНАЛОВ НЕ УДАЛСЯ" not in out

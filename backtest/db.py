@@ -18,6 +18,7 @@ from typing import Any
 
 import asyncpg
 
+from backtest.htf import PRODUCTION_FORBIDDEN_TIMEFRAMES
 from src.core.config import settings
 
 _pool: asyncpg.Pool | None = None
@@ -89,9 +90,19 @@ async def schema_exists() -> bool:
 
 
 async def production_row_counts() -> dict[str, int]:
-    """Счётчики строк продакшн-таблиц — доказательство неизменности (§14.6 ТЗ).
+    """Счётчики строк продакшн-таблиц. НАБЛЮДЕНИЕ, А НЕ ВЕРДИКТ.
 
     Снимается до и после прогона. Читает, но ничего не меняет.
+
+    ЧЕМ ЭТИ ЧИСЛА НЕ ЯВЛЯЮТСЯ (Замер 0.1). Доказательством неприкосновенности
+    продакшна они не являются НА БОЕВОЙ МАШИНЕ. Продакшн работает 24/7 и пишет
+    в свои таблицы параллельно с любым прогоном: измерено 11.09.2026 — за
+    60 секунд покоя signals +5, agent_outputs +15, ohlcv +5, open_interest +5.
+    Разница «до» и «после» здесь означает «система живёт», и назвать её
+    нарушением границы значило бы назвать нарушением работу системы.
+
+    Границу этапа проверяет :func:`production_boundary_violations` — по
+    ПРИЗНАКУ ПРОИСХОЖДЕНИЯ строки, а не по их числу.
     """
     tables = (
         "signals",
@@ -113,3 +124,30 @@ async def production_row_counts() -> dict[str, int]:
             continue
         counts[table] = int(await fetchval(f"SELECT count(*) FROM public.{table};"))
     return counts
+
+
+async def production_boundary_violations() -> dict[str, int] | None:
+    """Строки в ``public.ohlcv``, которые мог записать ТОЛЬКО этот этап.
+
+    Продакшн собирает 1m/5m/15m/1h и старших масштабов не пишет вовсе, поэтому
+    их присутствие в продакшн-таблице свечей есть запись вне схемы ``backtest``
+    — прямой запрет §1 ТЗ. Запрос тот же, что в пункте 7 deploy/verify_z0.sh.
+
+    Возвращает ``{масштаб: строк}``; пустой словарь — нарушений нет. ``None``
+    означает, что проверить НЕЧЕМ: таблицы ``public.ohlcv`` не существует. Это
+    НЕ «нарушений нет», и вызывающий код обязан их различать.
+
+    ТОЛЬКО ЧТЕНИЕ: ни одного запроса на запись здесь нет.
+    """
+    exists = await fetchval(
+        "SELECT 1 FROM information_schema.tables "
+        "WHERE table_schema = 'public' AND table_name = 'ohlcv';"
+    )
+    if not exists:
+        return None
+    rows = await fetch(
+        "SELECT timeframe, count(*) AS rows FROM public.ohlcv "
+        "WHERE timeframe = ANY($1::text[]) GROUP BY timeframe ORDER BY timeframe;",
+        list(PRODUCTION_FORBIDDEN_TIMEFRAMES),
+    )
+    return {str(row["timeframe"]): int(row["rows"]) for row in rows}

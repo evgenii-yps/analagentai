@@ -23,7 +23,13 @@
 просто измерить.
 
 ПОРОГИ:
-  * O/H/L/C — расхождение не более 1e-8. БЛОКИРУЮЩЕЕ;
+  * O/H/L/C — допуск ОТНОСИТЕЛЬНЫЙ (Замер 0.1): поле считается разошедшимся,
+    если ``|собрано - биржа| / max(|биржа|, EPS_FLOOR) > TOL_REL`` И при этом
+    ``|собрано - биржа| > EPS_FLOOR``. Оба числа живут в одном месте —
+    ``backtest/htf.py``, — вместе с измерением, из которого выведены.
+    БЛОКИРУЮЩЕЕ. Рядом печатается ``z0_parity_ohlc_mismatches_abs`` по
+    ПРЕЖНЕМУ абсолютному правилу 1e-8: молчаливая замена метрики лишила бы
+    следующего читателя возможности сопоставить прогоны;
   * объём — на первом прогоне НЕ блокирующий. Печатаются фактические
     максимальное и медианное отклонения; порог назначается по ИЗМЕРЕННОЙ
     величине в отчёте, а не угадывается здесь. Сумма многих часовых значений
@@ -37,6 +43,11 @@
        проверка ничего не проверяет, и этап не сдан;
   §8 — в проверку хранилища подаётся бар, период которого ещё не закрылся, и
        счётчик обязан стать ненулевым. Ноль здесь означает, что проверка слепая.
+
+ТРЕТИЙ КОНТРОЛЬНЫЙ ОПЫТ — НАД САМИМ ДОПУСКОМ (Замер 0.1). Подаются два
+отклонения: ровно ``TOL_REL × 1,01`` и ``TOL_REL × 0,99``. Первое обязано быть
+засчитано, второе — нет. Опыт со сдвигом окна показывает лишь, что сравнение
+видит разные данные, и прошёл бы при пороге, задранном на порядок.
 
 ПОЧЕМУ КОНТРОЛЬНЫЙ ОПЫТ §8 НЕ ПИШЕТ СТРОКУ В БАЗУ. Этот скрипт только читает;
 запись ради проверки означала бы, что «только чтение» — не свойство, а
@@ -72,6 +83,7 @@ import statistics
 import sys
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -83,7 +95,10 @@ from backtest import db  # noqa: E402
 from backtest.config import ConfigError  # noqa: E402
 from backtest.htf import (  # noqa: E402
     BAR_HOURLY,
+    EPS_FLOOR,
+    OHLC_FIELDS,
     OHLC_TOLERANCE,
+    TOL_REL,
     AssembledBar,
     Deviation,
     HtfError,
@@ -97,6 +112,7 @@ from backtest.htf import (  # noqa: E402
     week_anchor_weekday,
 )
 from backtest.htf_loader import stream_source_bars, stream_stored_htf  # noqa: E402
+from backtest.z0_metrics import metrics_path, write_metrics  # noqa: E402
 from scripts.load_htf_z0 import MEMORY_CAP_MB, read_settings  # noqa: E402
 from scripts.stop_counterfactual_9_1_4 import peak_rss_mb  # noqa: E402
 from src.barrier.runner import settle_seconds  # noqa: E402
@@ -135,8 +151,20 @@ class ParityTally:
     compared: int = 0
     skipped_incomplete: int = 0
     missing_counterpart: int = 0
+    # Расхождения по правилу Замера 0.1: относительный TOL_REL И абсолютный
+    # EPS_FLOOR, оба обязаны быть превышены. Это то число, по которому этап
+    # принимает решение.
     ohlc_mismatches: int = 0
+    # Расхождения по ПРЕЖНЕМУ абсолютному правилу 1e-8. Ничего не решает и
+    # существует ради одного: сопоставимости с прогоном 11.09.2026. Молчаливая
+    # замена метрики недопустима — сравнить два прогона было бы нечем.
+    ohlc_mismatches_abs: int = 0
     examples: list[Deviation] = field(default_factory=list)
+    # Относительные отклонения ПО ПОЛЯМ, разошедшимся по старому правилу.
+    # Накапливаются затем, чтобы распределение осталось видимым и порог можно
+    # было пересмотреть позже ПО ДАННЫМ, а не заново. Их сотни, а не миллионы:
+    # поле, уложившееся в 1e-8, сюда не попадает вовсе.
+    rel_devs: list[float] = field(default_factory=list)
     volume_rel: list[float] = field(default_factory=list)
     volume_abs: list[float] = field(default_factory=list)
 
@@ -246,8 +274,7 @@ async def _walk(
             tally.missing_counterpart += 1
             continue
         tally.compared += 1
-        if _compare(inst_id, built, counterpart, tally, keep_examples):
-            tally.ohlc_mismatches += 1
+        _compare(inst_id, built, counterpart, tally, keep_examples)
 
 
 def _compare(
@@ -256,30 +283,43 @@ def _compare(
     stored: SourceBar,
     tally: ParityTally,
     keep_examples: int,
-) -> bool:
-    """Сверяет один бар по полям. Возвращает, было ли расхождение O/H/L/C.
+) -> None:
+    """Сверяет один бар по полям и наполняет счётчики ``tally``.
+
+    СЧИТАЮТСЯ ДВА ЧИСЛА, И ЭТО НЕ ДУБЛИРОВАНИЕ. ``ohlc_mismatches`` — по
+    правилу Замера 0.1 (относительный допуск), им этап и решает.
+    ``ohlc_mismatches_abs`` — по прежнему абсолютному 1e-8, ради сопоставимости
+    с прогоном 11.09.2026. Заменить второе первым молча значило бы лишить
+    следующего читателя возможности увидеть, что именно изменилось.
 
     Объём считается ВСЕГДА и в решение о расхождении не входит: на первом
     прогоне он не блокирующий (§7 ТЗ), и смешать его с O/H/L/C значило бы
     заблокировать этап округлением на стороне биржи.
     """
     mismatched = False
-    for name in ("open", "high", "low", "close"):
+    mismatched_abs = False
+    for name in OHLC_FIELDS:
         deviation = Deviation(
             inst_id=inst_id, bar=built.bar, open_time=built.open_time, field=name,
             assembled=getattr(built, name), stored=getattr(stored, name),
         )
-        if deviation.absolute > OHLC_TOLERANCE:
+        if deviation.is_mismatch_abs:
+            mismatched_abs = True
+            tally.rel_devs.append(float(deviation.relative_floored))
+        if deviation.is_mismatch:
             mismatched = True
             if len(tally.examples) < keep_examples:
                 tally.examples.append(deviation)
+    if mismatched:
+        tally.ohlc_mismatches += 1
+    if mismatched_abs:
+        tally.ohlc_mismatches_abs += 1
     volume = Deviation(
         inst_id=inst_id, bar=built.bar, open_time=built.open_time, field="volume",
         assembled=built.volume, stored=stored.volume,
     )
     tally.volume_abs.append(float(volume.absolute))
     tally.volume_rel.append(float(volume.relative))
-    return mismatched
 
 
 async def assemble_stream(
@@ -323,6 +363,36 @@ async def measure_stored_boundaries(inst_id: str, bar: str) -> dict[str, Any]:
     return measure_boundaries(bar, stamps)
 
 
+def tolerance_probe() -> tuple[bool, bool]:
+    """Контрольный опыт САМОГО допуска: (засчитано выше порога, засчитано ниже).
+
+    Порог проверяется опытом над ТЕМ ЖЕ правилом, которым считается результат
+    (:attr:`Deviation.is_mismatch`), а не над его копией: опыт над копией
+    проверял бы копию. Подаются две пары значений, различающиеся ровно на
+    ``TOL_REL × 1,01`` и ``TOL_REL × 0,99`` от биржевого. Первая обязана быть
+    засчитана как расхождение, вторая — нет.
+
+    ЗАЧЕМ ЭТО НУЖНО ОТДЕЛЬНО. Опыт со сдвигом окна (§7) показывает, что
+    сравнение видит РАЗНЫЕ ДАННЫЕ. Он ничего не говорит о том, где именно
+    проходит граница допуска: он прошёл бы и при TOL_REL, задранном на порядок.
+    Этот опыт закрывает ровно эту дыру.
+
+    Цена деления берётся такой, чтобы относительное отклонение считалось точно:
+    ``Decimal`` и никаких ``float`` на пути (урок DOGE).
+    """
+    base = Decimal("100")
+
+    def counted(factor: Decimal) -> bool:
+        deviation = Deviation(
+            inst_id="КОНТРОЛЬНЫЙ-ОПЫТ", bar="1Dutc",
+            open_time=datetime(2026, 1, 1, tzinfo=UTC), field="close",
+            assembled=base * (Decimal(1) + TOL_REL * factor), stored=base,
+        )
+        return deviation.is_mismatch
+
+    return counted(Decimal("1.01")), counted(Decimal("0.99"))
+
+
 def print_tally(tally: ParityTally) -> None:
     volume_max = max(tally.volume_rel) if tally.volume_rel else 0.0
     volume_med = statistics.median(tally.volume_rel) if tally.volume_rel else 0.0
@@ -332,13 +402,15 @@ def print_tally(tally: ParityTally) -> None:
         f"неполных {tally.skipped_incomplete:>5}  "
         f"без пары {tally.missing_counterpart:>5}  "
         f"расхождений O/H/L/C {tally.ohlc_mismatches:>5}  "
+        f"(по старому 1e-8: {tally.ohlc_mismatches_abs:>5})  "
         f"объём: макс {volume_max:.3e}, медиана {volume_med:.3e}",
         flush=True,
     )
     for example in tally.examples:
         print(f"      {example.open_time.isoformat()} {example.field}: "
               f"собрано {example.assembled}, биржа {example.stored}, "
-              f"|Δ| {example.absolute}", flush=True)
+              f"|Δ| {example.absolute}, "
+              f"относительное {float(example.relative_floored):.3e}", flush=True)
 
 
 async def run(args: argparse.Namespace) -> int:
@@ -433,6 +505,8 @@ async def _measure(instruments: list[str], bars: list[str]) -> int:
     compared = sum(item.compared for item in tallies)
     skipped = sum(item.skipped_incomplete for item in tallies)
     mismatches = sum(item.ohlc_mismatches for item in tallies)
+    mismatches_abs = sum(item.ohlc_mismatches_abs for item in tallies)
+    rel_devs = [value for item in tallies for value in item.rel_devs]
     volume_rel = [value for item in tallies for value in item.volume_rel]
     volume_abs = [value for item in tallies for value in item.volume_abs]
 
@@ -454,6 +528,22 @@ async def _measure(instruments: list[str], bars: list[str]) -> int:
               f"расхождений {shifted.ohlc_mismatches:>6}", flush=True)
     print(f"  ИТОГ контрольного опыта: расхождений {control_mismatches} "
           f"на {control_compared} сравнениях", flush=True)
+
+    # --- шаг 4: контрольный опыт САМОГО ДОПУСКА (обязан упасть) -------------
+    print("\n=== Шаг 4. КОНТРОЛЬНЫЙ ОПЫТ: чувствительность относительного "
+          "допуска ===", flush=True)
+    print("  Опыт над самим правилом, а не над данными: пара значений, "
+          f"различающихся ровно на TOL_REL×1,01, обязана быть засчитана, "
+          f"на TOL_REL×0,99 — нет. Без этого «расхождений {mismatches}» "
+          "означало бы лишь, что порог достаточно велик.", flush=True)
+    control_above, control_below = tolerance_probe()
+    print(f"  TOL_REL = {TOL_REL} (относительный), "
+          f"EPS_FLOOR = {EPS_FLOOR} (абсолютный, вторичное условие)", flush=True)
+    print(f"  отклонение TOL_REL×1,01 засчитано: "
+          f"{'ДА' if control_above else 'НЕТ — ДОПУСК СЛЕП'}", flush=True)
+    print(f"  отклонение TOL_REL×0,99 засчитано: "
+          f"{'НЕТ' if not control_below else 'ДА — ДОПУСК НЕ ДЕЙСТВУЕТ'}",
+          flush=True)
 
     # --- шаг 5: незакрытые бары в хранилище ---------------------------------
     settle = settle_seconds()
@@ -501,6 +591,11 @@ async def _measure(instruments: list[str], bars: list[str]) -> int:
     volume_max = max(volume_rel) if volume_rel else 0.0
     volume_med = statistics.median(volume_rel) if volume_rel else 0.0
     volume_abs_max = max(volume_abs) if volume_abs else 0.0
+    # Распределение относительного отклонения СРЕДИ РАЗОШЕДШИХСЯ ПО СТАРОМУ
+    # ПРАВИЛУ. Именно среди них, а не среди всех сравнений: по всем сравнениям
+    # медиана была бы нулём и не говорила бы ни о чём.
+    rel_dev_max = max(rel_devs) if rel_devs else 0.0
+    rel_dev_p50 = statistics.median(rel_devs) if rel_devs else 0.0
     peak = peak_rss_mb()
 
     print("\n" + "=" * 100, flush=True)
@@ -508,7 +603,17 @@ async def _measure(instruments: list[str], bars: list[str]) -> int:
     print("=" * 100, flush=True)
     print(f"  z0_parity_days_compared            = {compared}", flush=True)
     print(f"  z0_parity_days_skipped_incomplete  = {skipped}", flush=True)
-    print(f"  z0_parity_ohlc_mismatches          = {mismatches}", flush=True)
+    print(f"  z0_parity_ohlc_mismatches          = {mismatches} "
+          f"(относительное правило: |Δ|/max(|биржа|,{EPS_FLOOR}) > {TOL_REL} "
+          f"И |Δ| > {EPS_FLOOR})", flush=True)
+    print(f"  z0_parity_ohlc_mismatches_abs      = {mismatches_abs} "
+          f"(прежнее абсолютное правило {OHLC_TOLERANCE}; "
+          "для сопоставимости с прогоном 11.09.2026, ничего не решает)",
+          flush=True)
+    print(f"  z0_parity_rel_dev_max              = {rel_dev_max:.6e} "
+          "(среди разошедшихся по старому правилу)", flush=True)
+    print(f"  z0_parity_rel_dev_p50              = {rel_dev_p50:.6e} "
+          "(там же, медиана)", flush=True)
     print(f"  z0_parity_volume_max_dev           = {volume_max:.6e} "
           f"(относительное; в абсолютных единицах {volume_abs_max:.6e})", flush=True)
     print(f"  медианное отклонение объёма        = {volume_med:.6e} "
@@ -524,15 +629,29 @@ async def _measure(instruments: list[str], bars: list[str]) -> int:
     print("  Порог по объёму НЕ НАЗНАЧАЕТСЯ здесь: он выводится из напечатанных "
           "выше величин в отчёте этапа (§7 ТЗ).", flush=True)
 
-    _log.info(
-        "Замер 0: контроль завершён",
-        z0_parity_days_compared=compared,
-        z0_parity_days_skipped_incomplete=skipped,
-        z0_parity_ohlc_mismatches=mismatches,
-        z0_parity_volume_max_dev=volume_max,
-        z0_unclosed_rows=len(violations),
-        peak_rss_mb=round(peak, 1),
-    )
+    keys: dict[str, Any] = {
+        "z0_parity_days_compared": compared,
+        "z0_parity_days_skipped_incomplete": skipped,
+        "z0_parity_ohlc_mismatches": mismatches,
+        "z0_parity_ohlc_mismatches_abs": mismatches_abs,
+        "z0_parity_rel_dev_max": rel_dev_max,
+        "z0_parity_rel_dev_p50": rel_dev_p50,
+        "z0_parity_volume_max_dev": volume_max,
+        "z0_unclosed_rows": len(violations),
+        "peak_rss_mb": round(peak, 1),
+    }
+    _log.info("Замер 0: контроль завершён", **keys)
+
+    # Ключи пишутся ЕЩЁ И В ФАЙЛ. Журнал контейнера, запущенного с --rm,
+    # исчезает вместе с контейнером, и пункт 5 verify_z0.sh не находил в нём
+    # ничего — при том что ключи там были (прогон 11.09.2026).
+    written = write_metrics("z0_parity", keys)
+    if written is None:
+        print(f"\n  🟡 ключи НЕ записаны в {metrics_path()}: каталог "
+              "недоступен на запись. Прогон это не отменяет, но verify_z0.sh "
+              "придётся читать журнал контейнера.", flush=True)
+    else:
+        print(f"\n  Машиночитаемые ключи дописаны в {written}", flush=True)
 
     # СТАРШИНСТВО КОДОВ, а не первый попавшийся отказ. Пустая выборка старше
     # всего: при ней остальные числа не значат ничего. Следом — слепой
@@ -551,13 +670,22 @@ async def _measure(instruments: list[str], bars: list[str]) -> int:
             "КОНТРОЛЬНЫЙ ОПЫТ НЕ УПАЛ: проверка слепа, и её ноль ничего не значит"
         )
         code = code or 4
+    if control_above is False or control_below is True:
+        reasons.append(
+            "КОНТРОЛЬНЫЙ ОПЫТ ДОПУСКА НЕ УПАЛ: правило сравнения не различает "
+            f"отклонения по обе стороны от TOL_REL={TOL_REL}, и число "
+            "расхождений ничего не значит"
+        )
+        code = code or 4
     if violations:
         reasons.append(f"в хранилище {len(violations)} незакрытых баров")
         code = code or 3
     if mismatches:
         reasons.append(
-            f"расхождений O/H/L/C: {mismatches} при допуске {OHLC_TOLERANCE}. "
-            "ПЕРВЫМ ДЕЛОМ проверять часовой пояс (§3), а не арифметику сборки"
+            f"расхождений O/H/L/C: {mismatches} при допуске TOL_REL={TOL_REL} "
+            f"(по прежнему абсолютному {OHLC_TOLERANCE} их было бы "
+            f"{mismatches_abs}). ПЕРВЫМ ДЕЛОМ проверять часовой пояс (§3), "
+            "а не арифметику сборки"
         )
         code = code or 2
     if peak > MEMORY_CAP_MB:

@@ -46,6 +46,27 @@ EXPECTED_DIGEST="1f12d5d29d64eb17911b2a20196311fdde6a66e9f932120a7d5d412aac0de18
 # свечи без суффикса открываются по гонконгскому времени (UTC+8).
 HTF_BARS="'1Dutc','1Wutc','1Mutc'"
 
+# ЕДИНСТВЕННЫЙ ИСТОЧНИК ИМЁН КОНТЕЙНЕРОВ ЭТАПА. deploy/RUNBOOK_Z0.md обязан
+# создавать их ИМЕННО с этими именами и ссылается сюда, а не повторяет список.
+#
+# ЗАЧЕМ ЭТО НАПИСАНО ЯВНО. Строка 198 прежней версии искала журнал контейнера
+# `z0_load`, которого runbook не создаёт НИКОГДА: шаг 9 создаёт z0_load_hourly,
+# шаг 11 — z0_load_htf. Пункт 5 печатал «⚪ НЕ ПРОВЕРЕНО» при том, что ключи
+# лежали в журналах и находились grep-ом. Корневая причина — не строка 198, а
+# расхождение двух документов одного этапа. Поэтому список здесь один.
+#
+# Контроль свечей (шаг 14 runbook) запускается через `run --rm` и ИМЕНИ НЕ
+# ИМЕЕТ намеренно: его журнал исчезает вместе с контейнером, и полагаться на
+# него нельзя. Его ключи берутся из файла ниже.
+Z0_CONTAINERS=(z0_probe z0_load_hourly z0_load_htf)
+
+# ГЛАВНЫЙ источник машиночитаемых ключей — файл, а не журнал. Журнал
+# вытесняется по объёму и исчезает вместе с контейнером; каталог analysis_out
+# смонтирован с хоста и переживает и то, и другое. Скрипты этапа дописывают
+# сюда `ключ=значение` (backtest/z0_metrics.py); журналы остаются ЗАПАСНЫМ
+# источником, а не единственным.
+Z0_METRICS_FILE="${Z0_METRICS_FILE:-${APP_DIR}/analysis_out/z0_metrics.txt}"
+
 cd "${APP_DIR}" || { echo "Нет каталога ${APP_DIR}"; exit 2; }
 
 blocking=0
@@ -194,13 +215,79 @@ fi
 
 # ---------------------------------------------------------------------------
 echo
-echo "── 5. Итоги прогонов по машиночитаемым ключам журнала ─────────────────────"
-LOGS="$(docker compose logs --no-log-prefix --tail 20000 2>/dev/null; docker logs z0_load 2>&1 | tail -20000; docker logs z0_parity 2>&1 | tail -20000)"
-key_value() { grep -o "$1=[-0-9.e+]*" <<< "${LOGS}" | tail -1 | cut -d= -f2; }
+echo "── 5. Итоги прогонов по машиночитаемым ключам ─────────────────────────────"
+# СБОР ИДЁТ ПО ЗВЕНЬЯМ, И ОТКАЗ ОДНОГО НЕ ОБНУЛЯЕТ ОСТАЛЬНЫЕ. Прежняя версия
+# собирала все источники одной подстановкой $( ) с несуществующим контейнером
+# внутри и теряла разом всё, что уже было собрано. Каждое звено здесь
+# добавляется отдельно, с `|| true`, и считается в SOURCES: «сколько источников
+# фактически прочитано» — величина того же класса, что checked >= 6 в стороже
+# масштаба, и без неё пустой разбор нельзя отличить от пустого результата.
+LOGS=""
+SOURCES=0
+CONTAINERS_ALIVE=()
+
+# Звено 1 и ГЛАВНОЕ: файл ключей. Он переживает и вытеснение журнала, и
+# удаление контейнера с --rm.
+METRICS_EPOCH=""
+if [[ -f "${Z0_METRICS_FILE}" ]]; then
+  METRICS_BODY="$(cat "${Z0_METRICS_FILE}" 2>/dev/null || true)"
+  if [[ -n "${METRICS_BODY}" ]]; then
+    LOGS+="${METRICS_BODY}"$'\n'
+    SOURCES=$((SOURCES + 1))
+    METRICS_EPOCH="$(grep -o 'z0_metrics_epoch=[0-9]*' "${Z0_METRICS_FILE}" 2>/dev/null | tail -1 | cut -d= -f2 || true)"
+    if [[ -n "${METRICS_EPOCH}" ]]; then
+      info "ключи из ${Z0_METRICS_FILE}, последняя запись $(date -u -d "@${METRICS_EPOCH}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "@${METRICS_EPOCH}")"
+    else
+      info "ключи из ${Z0_METRICS_FILE} (без метки времени записи)"
+    fi
+  else
+    note_unk "файл ключей ${Z0_METRICS_FILE} есть, но пуст или нечитаем"
+  fi
+else
+  info "файла ключей ${Z0_METRICS_FILE} нет — он появляется после первого прогона; ключи ищутся в журналах"
+fi
+
+# Звено 2: журнал служб compose.
+COMPOSE_LOGS="$(docker compose logs --no-log-prefix --tail 20000 2>/dev/null || true)"
+if [[ -n "${COMPOSE_LOGS}" ]]; then
+  LOGS+="${COMPOSE_LOGS}"$'\n'
+  SOURCES=$((SOURCES + 1))
+fi
+
+# Звено 3: журналы ИМЕНОВАННЫХ контейнеров этапа. Имена берутся из Z0_CONTAINERS
+# — единственного их источника, — а не пишутся здесь заново.
+for container in "${Z0_CONTAINERS[@]}"; do
+  if docker inspect "${container}" >/dev/null 2>&1; then
+    CONTAINERS_ALIVE+=("${container}")
+    CONTAINER_LOGS="$(docker logs "${container}" 2>&1 | tail -20000 || true)"
+    if [[ -n "${CONTAINER_LOGS}" ]]; then
+      LOGS+="${CONTAINER_LOGS}"$'\n'
+      SOURCES=$((SOURCES + 1))
+    fi
+  fi
+done
+if [[ "${#CONTAINERS_ALIVE[@]}" -gt 0 ]]; then
+  info "журналы контейнеров этапа: ${CONTAINERS_ALIVE[*]}"
+fi
+
+# Разбор понимает ОБА вида записи: `ключ=значение` (файл ключей и читаемый
+# рендер structlog при TTY) и `"ключ": значение` (JSON-рендер в контейнере без
+# TTY). Один разбор на все источники: два разбора однажды разойдутся.
+key_value() {
+  local found
+  found="$(grep -o "$1=[-0-9.e+]*" <<< "${LOGS}" | tail -1 | cut -d= -f2 || true)"
+  if [[ -z "${found}" ]]; then
+    found="$(grep -o "\"$1\"[[:space:]]*:[[:space:]]*[-0-9.e+]*" <<< "${LOGS}" | tail -1 | sed 's/.*:[[:space:]]*//' || true)"
+  fi
+  printf '%s' "${found}"
+}
 FOUND_ANY=0
 for key in z0_hourly_appended z0_hourly_gaps z0_htf_rows_written \
-           z0_htf_dropped_unconfirmed z0_parity_days_compared \
+           z0_htf_dropped_unconfirmed z0_boundary_violations \
+           z0_parity_days_compared \
            z0_parity_days_skipped_incomplete z0_parity_ohlc_mismatches \
+           z0_parity_ohlc_mismatches_abs z0_parity_rel_dev_max \
+           z0_parity_rel_dev_p50 \
            z0_parity_volume_max_dev z0_unclosed_rows peak_rss_mb; do
   value="$(key_value "${key}")"
   if [[ -n "${value}" ]]; then
@@ -209,15 +296,36 @@ for key in z0_hourly_appended z0_hourly_gaps z0_htf_rows_written \
   fi
 done
 if [[ "${FOUND_ANY}" == "0" ]]; then
-  note_unk "в журналах нет ни одного ключа Замера 0 — прогоны либо не выполнялись, либо их вывод уже вытеснен"
-  info "запустите: docker compose --profile ${Z0_PROFILE:-backtest} run --rm ${Z0_SERVICE:-backtest} python scripts/htf_parity_z0.py"
+  # ПРИЧИНА НАЗЫВАЕТСЯ ВЕРНАЯ. Прежняя версия при любом пустом разборе
+  # объявляла, что прогоны не выполнялись, — и называла неверную причину при
+  # том, что ключи лежали в журнале и находились grep-ом (прогон 11.09.2026).
+  if [[ "${SOURCES}" == "0" ]]; then
+    note_unk "СБОР ЖУРНАЛОВ НЕ УДАЛСЯ: не прочитан НИ ОДИН источник ключей — ни ${Z0_METRICS_FILE}, ни журнал compose, ни журналы контейнеров этапа. О том, выполнялись прогоны или нет, это не говорит ничего"
+    info "проверьте доступ к docker и права на ${APP_DIR}/analysis_out"
+  elif [[ "${#CONTAINERS_ALIVE[@]}" -gt 0 ]]; then
+    note_unk "СБОР ЖУРНАЛОВ НЕ УДАЛСЯ: контейнеры этапа существуют (${CONTAINERS_ALIVE[*]}), источников прочитано ${SOURCES}, а ключей в собранном выводе нет ни одного. Это отказ разбора, а не отсутствие прогонов"
+    info "проверьте вручную: docker logs ${CONTAINERS_ALIVE[0]} | grep -o 'z0_[a-z_]*=[-0-9.e+]*' | tail"
+  else
+    note_unk "ни одного ключа Замера 0 и ни одного контейнера этапа: прогоны, судя по всему, не выполнялись (источников прочитано ${SOURCES})"
+    info "запустите: docker compose --profile ${Z0_PROFILE:-backtest} run --rm ${Z0_SERVICE:-backtest} python scripts/htf_parity_z0.py"
+  fi
 else
   MISMATCH="$(key_value z0_parity_ohlc_mismatches)"
+  MISMATCH_ABS="$(key_value z0_parity_ohlc_mismatches_abs)"
+  REL_MAX="$(key_value z0_parity_rel_dev_max)"
   UNCLOSED="$(key_value z0_unclosed_rows)"
   DROPPED="$(key_value z0_htf_dropped_unconfirmed)"
+  BOUNDARY="$(key_value z0_boundary_violations)"
   PEAK="$(key_value peak_rss_mb)"
+  # Расхождение по ОТНОСИТЕЛЬНОМУ правилу (Замер 0.1) остаётся блокирующим:
+  # проверка обязана ловить настоящее рассогласование, а не быть смягчённой до
+  # молчания. Рядом печатается число по прежнему абсолютному правилу и
+  # максимум относительного отклонения — чтобы огрубление знака в данных биржи
+  # не отправляло человека искать часовой пояс, которого он не менял.
   [[ -n "${MISMATCH}" && "${MISMATCH}" != "0" ]] && \
-    note_block "z0_parity_ohlc_mismatches=${MISMATCH}: собранная свеча не совпала с биржевой. ПЕРВЫМ ДЕЛОМ проверять часовой пояс (§3), а не арифметику сборки"
+    note_block "z0_parity_ohlc_mismatches=${MISMATCH}: собранная свеча не совпала с биржевой (по прежнему абсолютному правилу их было бы ${MISMATCH_ABS:-?}, максимум относительного отклонения ${REL_MAX:-?}). ПЕРВЫМ ДЕЛОМ проверять часовой пояс (§3), а не арифметику сборки"
+  [[ -n "${BOUNDARY}" && "${BOUNDARY}" != "0" ]] && \
+    note_block "z0_boundary_violations=${BOUNDARY}: загрузчик нашёл в продакшн-таблице строки, которые мог записать только этот этап"
   [[ -n "${UNCLOSED}" && "${UNCLOSED}" != "0" ]] && \
     note_block "z0_unclosed_rows=${UNCLOSED}: в хранилище есть незакрытые бары"
   [[ -n "${DROPPED}" && "${DROPPED}" == "0" ]] && \
