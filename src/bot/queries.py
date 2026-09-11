@@ -569,6 +569,52 @@ class BotQueries:
         )
         return [dict(r) for r in rows]
 
+    async def positions_state(self, pause_sec: float) -> dict[str, Any]:
+        """Число открытых позиций и токены, по которым идёт пауза (§5 C6 ТЗ 7).
+
+        ОДНИМ ЗАПРОСОМ, А НЕ ДВУМЯ. Число открытых позиций и перечень пауз
+        читаются из одной и той же таблицы; два запроса могли бы разойтись
+        между собой, откройся позиция между ними, — и /status показал бы
+        состояние, которого не было ни в один момент времени.
+
+        ПАУЗА СЧИТАЕТСЯ ОТ ``opened_at`` ЛЮБОЙ позиции — открытой или уже
+        закрытой (§4 B3 ТЗ): отсчёт ведётся от ОТКРЫТИЯ, и закрывшаяся
+        полчаса назад сделка держит токен ровно так же, как продолжающаяся.
+
+        ``pause_sec <= 0`` (пауза выключена) — перечень пуст, и запрос о ней не
+        задаётся вовсе: спрашивать базу о величине, которая ни на что не
+        влияет, незачем.
+        """
+        open_count = int(
+            await self._pool.fetchval(
+                "SELECT count(*) FROM positions WHERE status = 'open';"
+            )
+            or 0
+        )
+        if pause_sec <= 0:
+            return {"open_count": open_count, "pauses": []}
+        rows = await self._pool.fetch(
+            """
+            SELECT i.symbol,
+                   $1::float8 - EXTRACT(
+                       EPOCH FROM (now() - max(p.opened_at))
+                   ) AS left_sec
+            FROM positions p
+            JOIN instruments i ON i.id = p.instrument_id
+            WHERE p.opened_at >= now() - make_interval(secs => $1::float8)
+            GROUP BY i.symbol
+            HAVING $1::float8 - EXTRACT(
+                       EPOCH FROM (now() - max(p.opened_at))
+                   ) > 0
+            ORDER BY left_sec DESC;
+            """,
+            float(pause_sec),
+        )
+        return {
+            "open_count": open_count,
+            "pauses": [(str(r["symbol"]), float(r["left_sec"])) for r in rows],
+        }
+
     async def positions_capital(self) -> dict[str, Any]:
         """Занятый капитал и накопленный итог (Этап 9.1.1 §5.5).
 

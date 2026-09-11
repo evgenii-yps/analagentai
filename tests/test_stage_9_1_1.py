@@ -46,7 +46,7 @@ from src.positions.rules import (
     EXIT_REASONS,
     REASON_NO_FREE_CAPITAL,
     REASON_NO_FRESH_BAR,
-    REASON_SLOTS_FULL,
+    REASON_TOKEN_PAUSE,
     REFUSAL_REASONS,
     Bar,
     check_gap_exit,
@@ -94,9 +94,11 @@ def _open_kwargs(**overrides):
         degraded=False,
         probability=0.9,
         min_probability=0.8,
-        has_open_position=False,
-        open_count=0,
-        max_open=5,
+        # ВЕРСИЯ 7 (§3, §4 ТЗ 7): слотов нет, «занят ли инструмент» нет; есть
+        # возраст последнего входа по токену и длина паузы. ``None`` означает
+        # «по токену не входили» — пауза не держит.
+        last_open_age_sec=None,
+        token_pause_sec=3600.0,
         signal_age_sec=30.0,
         max_signal_age_sec=180,
         bar_age_sec=45.0,
@@ -130,18 +132,27 @@ def test_no_free_capital_when_money_runs_out_before_slots() -> None:
     )
 
 
-def test_slots_full_wins_when_both_slots_and_money_ran_out() -> None:
-    """§7.2: заняты слоты И кончились деньги — причиной названы СЛОТЫ.
+def test_the_token_pause_wins_when_both_the_pause_and_the_money_bite() -> None:
+    """Идёт пауза по токену И кончились деньги — причиной названа ПАУЗА.
 
-    Порядок содержателен, а не произволен: «слоты заняты» — более точная
-    причина, когда верны обе, потому что занятые слоты и есть то, во что ушли
-    деньги. Обратный порядок объяснял бы происходящее нехваткой денег там, где
-    деньги просто работают.
+    ЧТО ЗДЕСЬ ПРОВЕРЯЕТСЯ НА САМОМ ДЕЛЕ — ПОРЯДОК, А НЕ ЧИСЛА. До версии 7 в
+    этой паре стояли слоты: «слоты заняты» было точнее «денег нет», потому что
+    занятые слоты и есть то, во что ушли деньги. Слотов не стало (§3 A4 ТЗ 7),
+    их место в очереди заняла пауза, а вопрос остался тот же: когда верны обе
+    причины, журнал обязан называть ту, которая действует, а не ту, которая
+    оказалась выше по коду.
+
+    С бюджетом «без ограничения» (§3 A3) вторая причина недостижима вовсе —
+    именно поэтому она проверяется здесь искусственным остатком, а не
+    настройкой: проверка обязана пережить тот день, когда бюджет снова сделают
+    конечным.
     """
     verdict = should_open(
-        **_open_kwargs(open_count=5, max_open=5, free_capital_usd=0.0)
+        **_open_kwargs(
+            last_open_age_sec=60.0, token_pause_sec=3600.0, free_capital_usd=0.0
+        )
     )
-    assert verdict.reason == REASON_SLOTS_FULL
+    assert verdict.reason == REASON_TOKEN_PAUSE
 
 
 def test_money_is_checked_before_the_freshness_of_the_candle() -> None:
@@ -185,18 +196,26 @@ def test_profit_is_never_added_to_the_budget() -> None:
     этой арифметике не участвует ни одним слагаемым. Проверка текстовая, потому
     что доказывать надо ОТСУТСТВИЕ слагаемого: значением его не поймать — при
     нулевом накопленном итоге обе формулы дают одно и то же число.
+
+    ВЕРСИЯ 7 ДОБАВИЛА В ФОРМУЛУ ВЕТКУ «БЕЗ ОГРАНИЧЕНИЯ» (§3 A3 ТЗ 7), и
+    проверяемое утверждение от этого не изменилось: бюджет по-прежнему берётся
+    из настройки и по-прежнему уменьшается только занятым. Проверяются поэтому
+    ОБЕ строки формулы — и та, что читает настройку, и та, что считает, — а не
+    первая попавшаяся: ветка «бесконечность» сама по себе ничего не сказала бы
+    о реинвестировании.
     """
     runner_text = (_ROOT / "src" / "positions" / "runner.py").read_text(
         encoding="utf-8"
     )
     formula = [
         line for line in runner_text.splitlines()
-        if "free_capital = " in line
+        if "free_capital = " in line or "budget = " in line
     ]
     assert formula, "в сервисе не найдено вычисление свободного капитала"
-    assert "POSITION_BUDGET_USD" in formula[0]
-    assert "committed" in formula[0]
-    assert "net_pnl" not in formula[0] and "realized" not in formula[0]
+    whole = "\n".join(formula)
+    assert "POSITION_BUDGET_USD" in whole
+    assert "committed" in whole
+    assert "net_pnl" not in whole and "realized" not in whole
     # И уменьшается он ровно на размер слота, а не на «слот плюс заработанное».
     assert "free_capital -= float(settings.POSITION_SLOT_USD)" in runner_text
 
@@ -995,10 +1014,18 @@ def test_refusal_reasons_stay_a_closed_list_of_ten() -> None:
     Поэтому здесь проверяется то, что проверить можно и нужно: перечень закрыт,
     не содержит повторов, и в миграциях его значений действительно нет — то
     есть отсутствие сверки не следствие того, что её забыли написать.
+
+    ДЕСЯТЬ СТАЛО ДЕВЯТЬЮ (§3, §4 ТЗ 7): ушли ``instrument_busy`` и
+    ``slots_full``, пришла ``token_pause``. Число здесь живёт не ради самого
+    числа, а ради того, чтобы новая причина не появилась молча: причина отказа,
+    о которой не знает ни бот, ни сводка, — это молчание, выглядящее как ноль.
     """
-    assert len(REFUSAL_REASONS) == 10
-    assert len(set(REFUSAL_REASONS)) == 10
+    assert len(REFUSAL_REASONS) == 9
+    assert len(set(REFUSAL_REASONS)) == 9
     assert REASON_NO_FREE_CAPITAL in REFUSAL_REASONS
+    assert REASON_TOKEN_PAUSE in REFUSAL_REASONS
+    assert "slots_full" not in REFUSAL_REASONS
+    assert "instrument_busy" not in REFUSAL_REASONS
 
     migrations = "".join(
         (_MIGRATIONS / name).read_text(encoding="utf-8")

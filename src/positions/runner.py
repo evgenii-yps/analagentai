@@ -6,11 +6,13 @@
      прогоняет правило ``check_exit`` и либо закрывает позицию одним UPDATE,
      либо двигает отметку «докуда разобрано»;
   2. ``open_new_positions`` — отбирает кандидатов, проверяет ``should_open`` и
-     открывает позиции в свободных слотах.
+     открывает позиции по тем, кто прошёл.
 
-ПОРЯДОК СОДЕРЖАТЕЛЕН, А НЕ ПРОИЗВОЛЕН. Закрытая на этой же итерации позиция
-обязана освободить слот немедленно, иначе инструмент простаивает лишнюю минуту
-на ровном месте.
+ПОРЯДОК СОХРАНЁН, ХОТЯ ПРИЧИНА У НЕГО ТЕПЕРЬ ДРУГАЯ. До версии 7 закрытая на
+этой же итерации позиция обязана была освободить слот немедленно, иначе
+инструмент простаивал лишнюю минуту. Слотов больше нет, освобождать нечего — но
+считать деньги и вести открытые позиции по состоянию НАЧАЛА итерации значило бы
+описывать базу, которой уже нет.
 
 ПОЗИЦИИ ВИРТУАЛЬНЫЕ. Ордера на биржу не отправляются, ключи API не читаются,
 сетевых обращений к бирже этот код не делает вовсе: он читает только
@@ -30,6 +32,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -44,6 +47,7 @@ from src.positions import messages
 from src.positions.rules import (
     EXIT_DATA_GAP,
     PLUS_WAIT_MIN_LOGIC_VERSION,
+    REASON_TOKEN_PAUSE,
     REFUSAL_TTL_SEC,
     SIDE_BUY,
     Bar,
@@ -58,6 +62,7 @@ from src.positions.rules import (
     should_open,
     slippage_pct,
     target_price_of,
+    token_pause_left_sec,
 )
 
 _log = structlog.get_logger().bind(component="positions")
@@ -107,8 +112,8 @@ def plus_start_of(row: dict[str, Any]) -> datetime:
     этого следует ровно одно неприятное свойство: правь
     ``POSITION_PLUS_WAIT_START_HOURS`` при открытых позициях — и уже открытые
     позиции будут дочитаны по новой отметке, а не по той, что действовала при
-    входе. Настройку поэтому меняют на пустых слотах; ограничение названо здесь,
-    а не оставлено на догадку.
+    входе. Настройку поэтому меняют, когда открытых позиций нет; ограничение
+    названо здесь, а не оставлено на догадку.
 
     ``deadline_at`` при этом берётся ИЗ СТРОКИ и настройкой не пересчитывается:
     срок позиции — записанный факт, и подменять его сегодняшним значением
@@ -186,12 +191,12 @@ async def _send(text: str) -> None:
 async def _count_refusals(now: datetime, refusals: dict[str, int]) -> None:
     """Складывает отказы итерации в суточные счётчики Redis (§7.2 ТЗ 9.2).
 
-    ЗАЧЕМ ЭТО ВООБЩЕ НУЖНО. По замеру 9.1.6 слот при новом правиле занят в
-    среднем 22.5 часа вместо 3.4 — то есть отказ «слот занят» перестаёт быть
-    редкостью и становится обычным делом. Владелец обязан видеть, СКОЛЬКО
-    сигналов система пропускает, а не узнавать об этом из тишины: журнал
-    сервиса отвечает на этот вопрос только тому, кто читает журнал за сутки
-    целиком.
+    ЗАЧЕМ ЭТО ВООБЩЕ НУЖНО. Владелец обязан видеть, СКОЛЬКО сигналов система
+    пропускает, а не узнавать об этом из тишины: журнал сервиса отвечает на
+    этот вопрос только тому, кто читает журнал за сутки целиком. С версии 7
+    счётчик отвечает ещё и на главный вопрос этапа — сколько потока режет пауза
+    по токену (§8 ТЗ предсказывает больше половины всех отклонённых
+    кандидатов), — и без него предсказание нечем было бы проверить.
 
     СЧЁТЧИК НЕ ЗАМЕНЯЕТ ЖУРНАЛ, А ДОПОЛНЯЕТ ЕГО. Каждый отказ по-прежнему
     пишется отдельной строкой ``positions_skipped=1`` с причиной и номером
@@ -406,23 +411,42 @@ async def sync_open_positions(now: datetime) -> ClosedStats:
 
 
 async def open_new_positions(now: datetime) -> OpenedStats:
-    """Отбирает кандидатов и открывает позиции в свободных слотах (§4.1–§4.3)."""
+    """Отбирает кандидатов и открывает позиции (§4.1–§4.3 ТЗ 9.1, §3–§4 ТЗ 7).
+
+    СВОБОДНЫХ СЛОТОВ БОЛЬШЕ НЕТ — НЕТ И САМИХ СЛОТОВ (§3 ТЗ 7). Число
+    одновременно открытых позиций не ограничено ничем, по одному токену их может
+    быть сколько угодно, а единственный ограничитель потока — ПАУЗА ПО ТОКЕНУ.
+    """
     stats = OpenedStats()
-    # Занятые инструменты и число занятых слотов — из ОДНОГО чтения: два
-    # запроса могли бы разойтись между собой, если позиция закроется между ними.
+    # МОМЕНТ ПОСЛЕДНЕГО ОТКРЫТИЯ ПО КАЖДОМУ ТОКЕНУ — единственное состояние,
+    # которое теперь требуется отбору. Читается ОДНИМ запросом на итерацию, а не
+    # запросом на кандидата: кандидатов бывает несколько, и пять обращений к
+    # базе ради пяти чисел — это пять сетевых задержек там, где хватает одной.
+    #
+    # ПРИ ВЫКЛЮЧЕННОЙ ПАУЗЕ (POSITION_TOKEN_PAUSE_MIN=0, контрольный опыт §9 ТЗ)
+    # запроса не делается вовсе: спрашивать базу о величине, которая ни на что
+    # не влияет, значит тратить время на ответ, который будет отброшен.
+    token_pause_sec = float(settings.POSITION_TOKEN_PAUSE_MIN) * 60.0
+    last_open_at: dict[int, datetime] = {}
+    if token_pause_sec > 0:
+        last_open_at = await db.get_last_open_ts_by_instrument(
+            now - timedelta(seconds=token_pause_sec)
+        )
+    # ЗАНЯТЫЙ КАПИТАЛ. Читается из того же единственного источника, что и
+    # прежде, — списка открытых позиций.
     open_rows = await db.get_open_positions()
-    busy = {int(row["instrument_id"]) for row in open_rows}
-    open_count = len(open_rows)
-    # ЗАНЯТЫЙ КАПИТАЛ — ИЗ ТОГО ЖЕ ЕДИНСТВЕННОГО ЧТЕНИЯ, что и занятые
-    # инструменты. Отдельный запрос «сколько денег в позициях» мог бы разойтись
-    # с этим списком, закройся позиция между двумя запросами, — и тогда слоты
-    # считались бы по одному состоянию базы, а деньги по другому.
     committed = sum(float(row["notional_usd"]) for row in open_rows)
-    # ПРИБЫЛЬ НЕ РЕИНВЕСТИРУЕТСЯ: бюджет — постоянная величина из настройки, и
-    # накопленный итог закрытых позиций к нему НЕ ПРИБАВЛЯЕТСЯ ни при каких
-    # условиях. Иначе поздняя сделка весила бы больше ранней просто потому, что
-    # она поздняя, и замер перестал бы быть замером.
-    free_capital = float(settings.POSITION_BUDGET_USD) - committed
+    # БЮДЖЕТ В РЕЖИМЕ «БЕЗ ОГРАНИЧЕНИЯ» (§3 A3 ТЗ 7). Ноль означает, что деньги
+    # не ограничивают число сделок, и свободных денег БЕСКОНЕЧНО много — а не
+    # «нисколько». Записано бесконечностью намеренно: вычитание из неё остаётся
+    # бесконечностью, и ни одна ветка ниже не требует особого случая.
+    #
+    # ПРИБЫЛЬ ПРИ ЭТОМ ПО-ПРЕЖНЕМУ НЕ РЕИНВЕСТИРУЕТСЯ: накопленный итог
+    # закрытых позиций к бюджету НЕ ПРИБАВЛЯЕТСЯ ни при каких условиях, а
+    # размер слота остаётся тем же (POSITION_SLOT_USD=2.0) — именно он делает
+    # проценты версии 7 сопоставимыми с версиями 5 и 6.
+    budget = float(settings.POSITION_BUDGET_USD)
+    free_capital = math.inf if budget <= 0 else budget - committed
 
     candidates = await db.get_position_candidates(
         logic_version=settings.LOGIC_VERSION,
@@ -470,6 +494,12 @@ async def open_new_positions(now: datetime) -> OpenedStats:
             None if bar_close is None else (now - bar_close).total_seconds()
         )
 
+        # ВОЗРАСТ ПОСЛЕДНЕГО ОТКРЫТИЯ ПО ЭТОМУ ТОКЕНУ. ``None`` означает «по
+        # токену не открывались в пределах паузы» — то есть пауза не держит.
+        last_open = last_open_at.get(instrument_id)
+        last_open_age_sec = (
+            None if last_open is None else (now - last_open).total_seconds()
+        )
         verdict = should_open(
             decision=str(row["decision"]),
             logic_version=int(row["logic_version"]),
@@ -478,9 +508,8 @@ async def open_new_positions(now: datetime) -> OpenedStats:
             probability=None if row["probability"] is None
             else float(row["probability"]),
             min_probability=settings.POSITION_MIN_PROBABILITY,
-            has_open_position=instrument_id in busy,
-            open_count=open_count,
-            max_open=settings.POSITION_MAX_OPEN,
+            last_open_age_sec=last_open_age_sec,
+            token_pause_sec=token_pause_sec,
             signal_age_sec=float(row["age_sec"]),
             max_signal_age_sec=settings.POSITION_MAX_SIGNAL_AGE_SEC,
             bar_age_sec=bar_age_sec,
@@ -491,11 +520,29 @@ async def open_new_positions(now: datetime) -> OpenedStats:
         )
         if not verdict.allowed:
             stats.refuse(verdict.reason)
-            _log.info(
-                "positions_skipped=1",
-                signal_id=int(row["signal_id"]), symbol=row["symbol"],
-                reason=verdict.reason,
-            )
+            # ОТКАЗ ПО ПАУЗЕ ПИШЕТСЯ ПОДРОБНЕЕ ОСТАЛЬНЫХ (§4 B4 ТЗ 7): токен,
+            # вероятность сигнала и СКОЛЬКО ЖДАТЬ. Без последнего числа по
+            # журналу нельзя отличить «пауза только началась» от «пауза
+            # кончалась через секунду», а именно из этих отказов и состоит
+            # ответ на вопрос, сколько потока режет антиспам.
+            if verdict.reason == REASON_TOKEN_PAUSE:
+                _log.info(
+                    "positions_skipped=1",
+                    signal_id=int(row["signal_id"]), symbol=row["symbol"],
+                    reason=verdict.reason,
+                    probability=None if row["probability"] is None
+                    else round(float(row["probability"]), 6),
+                    pause_left_sec=int(token_pause_left_sec(
+                        last_open_age_sec, token_pause_sec
+                    )),
+                    token_pause_min=int(settings.POSITION_TOKEN_PAUSE_MIN),
+                )
+            else:
+                _log.info(
+                    "positions_skipped=1",
+                    signal_id=int(row["signal_id"]), symbol=row["symbol"],
+                    reason=verdict.reason,
+                )
             continue
 
         assert bar is not None  # гарантировано verdict.allowed (no_fresh_bar)
@@ -559,10 +606,16 @@ async def open_new_positions(now: datetime) -> OpenedStats:
                       signal_id=int(row["signal_id"]), stage="open")
             continue
 
-        open_count += 1
-        busy.add(instrument_id)
+        # ПАУЗА ПО ТОКЕНУ НАЧИНАЕТСЯ НЕМЕДЛЕННО, В ТОЙ ЖЕ ИТЕРАЦИИ. Кандидатов
+        # по одному токену в одной итерации бывает несколько (сигналы моложе
+        # POSITION_MAX_SIGNAL_AGE_SEC), и не отметь мы открытие здесь — все они
+        # вошли бы разом, а пауза начала бы действовать только со следующей
+        # минуты. Антиспам, пропускающий пачку и придерживающий одиночек, —
+        # это не антиспам.
+        last_open_at[instrument_id] = opened_at
         # Свободный капитал уменьшается ровно на РАЗМЕР СЛОТА — ту же величину,
-        # что ушла в notional_usd, — так же, как здесь же растёт open_count.
+        # что ушла в notional_usd. При бюджете «без ограничения» вычитание из
+        # бесконечности остаётся бесконечностью — особый случай не нужен.
         free_capital -= float(settings.POSITION_SLOT_USD)
         stats.opened += 1
         lag = int((opened_at - signal_ts).total_seconds())
@@ -611,26 +664,73 @@ async def _heartbeat() -> None:
     await get_redis().set("positions:heartbeat", now_iso, ex=_HEARTBEAT_TTL)
 
 
+# ПОЛЯ СТРОКИ ЗАПУСКА, НАЗВАННЫЕ §9 ТЗ 7 ПОИМЁННО. Перечень вынесен в функцию
+# не ради красоты: §9 требует, чтобы служба печатала при старте ИМЕННО эти
+# восемь величин, и проверить это можно только тогда, когда их собирает одно
+# место, а не форматная строка внутри вечного цикла.
+STARTUP_FIELDS: tuple[str, ...] = (
+    "logic_version", "max_open", "token_pause_min", "budget_usd", "slot_usd",
+    "max_hold_hours", "plus_wait_start_hours", "min_probability",
+)
+
+
+def startup_fields() -> dict[str, Any]:
+    """Величины, которые служба позиций называет в журнале при старте (§9 ТЗ 7).
+
+    ТРИ ЧИСЛА РЯДОМ НАМЕРЕННО: горизонт СИГНАЛА, срок жизни ПОЗИЦИИ и отметка
+    начала ожидания плюса — разные величины, и в журнале запуска они обязаны
+    быть видны все три, иначе первая же правка одного из них будет истолкована
+    как правка другого.
+
+    ``max_open=0`` И ``budget_usd=0`` ЗДЕСЬ ЧИТАЮТСЯ КАК «БЕЗ ОГРАНИЧЕНИЯ», а
+    не как «ноль позиций» и «нет денег» (§3 A1, A3 ТЗ 7).
+    """
+    return {
+        "logic_version": int(settings.LOGIC_VERSION),
+        "max_open": int(settings.POSITION_MAX_OPEN),
+        "token_pause_min": int(settings.POSITION_TOKEN_PAUSE_MIN),
+        "budget_usd": float(settings.POSITION_BUDGET_USD),
+        "slot_usd": float(settings.POSITION_SLOT_USD),
+        "max_hold_hours": int(settings.POSITION_MAX_HOLD_HOURS),
+        "plus_wait_start_hours": int(settings.POSITION_PLUS_WAIT_START_HOURS),
+        "min_probability": float(settings.POSITION_MIN_PROBABILITY),
+        "horizon_h": int(settings.POSITION_HORIZON_H),
+        "interval": int(settings.POSITION_INTERVAL),
+        "gap_grace_sec": int(settings.POSITION_GAP_GRACE_SEC),
+        "settle_sec": int(settings.POSITION_SETTLE_SEC),
+    }
+
+
+def _warn_about_settings_that_do_nothing() -> None:
+    """Говорит вслух о настройках, которые больше ни на что не влияют (§3 A1).
+
+    ``POSITION_MAX_OPEN`` остался в настройках — его печатает строка запуска, и
+    удалённый ключ уронил бы ``.env`` при откате, — но проверки по нему в коде
+    больше нет ни одной. Ненулевое значение поэтому НЕ ограничивает ничего, и
+    молчать об этом нельзя: человек, поставивший «3», обязан узнать, что число
+    не работает, от службы, а не по расхождению журнала с ожиданием через
+    неделю.
+    """
+    if int(settings.POSITION_MAX_OPEN) != 0:
+        _log.warning(
+            "positions_setting_ignored=1",
+            setting="POSITION_MAX_OPEN",
+            value=int(settings.POSITION_MAX_OPEN),
+            reason=(
+                "с версии 7 число одновременно открытых позиций не "
+                "ограничивается; ограничивается частота — "
+                "POSITION_TOKEN_PAUSE_MIN"
+            ),
+        )
+
+
 async def run() -> None:
     """Вечный цикл. Не падает ни при каких ошибках итерации."""
     _log.info(
-        "Сервис ведения позиций запущен (Этап 9.2, позиции ВИРТУАЛЬНЫЕ)",
-        interval=settings.POSITION_INTERVAL,
-        logic_version=settings.LOGIC_VERSION,
-        # Три числа рядом намеренно: горизонт СИГНАЛА, срок жизни ПОЗИЦИИ и
-        # отметка начала ожидания плюса — разные величины, и в журнале запуска
-        # они обязаны быть видны все три, иначе первая же правка одного из них
-        # будет истолкована как правка другого.
-        horizon_h=settings.POSITION_HORIZON_H,
-        max_hold_hours=settings.POSITION_MAX_HOLD_HOURS,
-        plus_wait_start_hours=settings.POSITION_PLUS_WAIT_START_HOURS,
-        min_probability=settings.POSITION_MIN_PROBABILITY,
-        max_open=settings.POSITION_MAX_OPEN,
-        slot_usd=settings.POSITION_SLOT_USD,
-        budget_usd=settings.POSITION_BUDGET_USD,
-        gap_grace_sec=settings.POSITION_GAP_GRACE_SEC,
-        settle_sec=settings.POSITION_SETTLE_SEC,
+        "Сервис ведения позиций запущен (версия логики 7, позиции ВИРТУАЛЬНЫЕ)",
+        **startup_fields(),
     )
+    _warn_about_settings_that_do_nothing()
     while True:
         try:
             stats = await run_once()

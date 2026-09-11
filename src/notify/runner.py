@@ -11,12 +11,18 @@ from src.core.config import settings
 from src.core.db import db
 from src.core.instruments import horizon_label
 from src.core.redis_client import close_redis, get_redis
-from src.notify.agent import NotifyAgent
+from src.notify.agent import NotifyAgent, signal_notifications_enabled
 
 
 async def run() -> None:
     """Поднимает инфраструктуру, запускает сервис уведомлений и ждёт остановки."""
     log = structlog.get_logger()
+    # СТРОКА ЗАПУСКА НАЗЫВАЕТ ГЛАВНОЕ СВОЙСТВО СЕРВИСА ПРЯМО (§5 C1 ТЗ 7):
+    # уходят ли сообщения о сигналах вообще. Пороги и ограничения потока рядом
+    # печатаются по-прежнему — они остались в коде и в настройках (§5 C4), —
+    # и без явного признака их присутствие в журнале читалось бы как «сигналы
+    # шлются, просто с ограничениями».
+    signals_to_telegram = signal_notifications_enabled(settings.LOGIC_VERSION)
     log.info(
         "Запуск сервиса уведомлений Agent Trade (Этап 5)",
         interval=settings.NOTIFY_INTERVAL,
@@ -24,7 +30,18 @@ async def run() -> None:
         telegram_configured=settings.telegram_configured,
         hold_min=settings.NOTIFY_HOLD_MIN,
         max_per_hour=settings.NOTIFY_MAX_PER_HOUR,
+        logic_version=settings.LOGIC_VERSION,
+        signal_messages=signals_to_telegram,
     )
+    if not signals_to_telegram:
+        log.info(
+            "notify_signal_messages_off=1",
+            logic_version=int(settings.LOGIC_VERSION),
+            reason=(
+                "с версии 7 в Telegram уходят только события сделок; сигналы "
+                "собираются, оцениваются и пишутся в базу как прежде"
+            ),
+        )
 
     await db.connect()
     get_redis()

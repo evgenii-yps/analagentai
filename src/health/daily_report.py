@@ -563,6 +563,97 @@ def section_funding_reserve() -> list[str]:
     return lines
 
 
+def section_positions_24h() -> list[str]:
+    """Суточная сводка ПО СДЕЛКАМ (§5 C2 ТЗ 7).
+
+    ТРЕТЬЕ И ПОСЛЕДНЕЕ, ЧТО СИСТЕМА ПИШЕТ ЧЕЛОВЕКУ В TELEGRAM. Открытие сделки,
+    закрытие сделки и эта сводка — всё; сообщения о сигналах прекращены (§5 C1).
+    Время сводки не меняется: тот же ежесуточный прогон в 06:00 UTC, что и
+    прежде, — новая рассылка означала бы ещё один поток, а этап их сокращает.
+
+    СЧИТАЕТСЯ ПО ОДНОЙ ВЕРСИИ ЛОГИКИ. Сделки версий 6 и 7 живут по разным
+    правилам допуска и несравнимы: сложить их в одно суточное число значило бы
+    описать смесь. Версия берётся из .env — из того же места, откуда её берёт
+    служба позиций.
+
+    ЗАКРЫТИЯ ПО ПРОБЕЛУ В ДАННЫХ ИСКЛЮЧЕНЫ ИЗ ИТОГА И ДОЛИ ПРИБЫЛЬНЫХ: у них
+    цена выхода не наблюдалась, а восстановлена, и их «итог» описывает не
+    рынок, а сбой сбора данных. Само их число при этом названо: прятать его
+    нельзя — по нему видно состояние коллектора.
+    """
+    lines = [f"<b>💼 Сделки за 24 часа (версия логики {LOGIC_VERSION})</b>"]
+
+    opened = _psql(
+        "SELECT count(*) FROM positions "
+        f"WHERE logic_version = {int(LOGIC_VERSION)} "
+        "AND opened_at > now() - interval '24 hours';"
+    )
+    lines.append(f"Открыто: {opened or '0'}")
+
+    # ОДНОЙ СТРОКОЙ ЧЕТЫРЕ ЧИСЛА О ЗАКРЫТИЯХ: всего, из них измеренных, сумма
+    # итогов по измеренным и число прибыльных среди них. Четыре запроса вместо
+    # одного означали бы четыре пуска psql в контейнере — и четыре разных
+    # мгновения базы в одной строке отчёта.
+    closed_raw = _psql(
+        "SELECT count(*) || '|' || "
+        "count(*) FILTER (WHERE exit_reason <> 'data_gap') || '|' || "
+        "COALESCE(round(sum(net_pnl_usd) FILTER "
+        "    (WHERE exit_reason <> 'data_gap'), 6), 0) || '|' || "
+        "count(*) FILTER (WHERE exit_reason <> 'data_gap' AND net_pnl_usd > 0) "
+        "FROM positions "
+        f"WHERE logic_version = {int(LOGIC_VERSION)} "
+        "AND status = 'closed' AND closed_at > now() - interval '24 hours';"
+    )
+    if closed_raw and closed_raw.count("|") == 3:
+        total, measured, pnl_usd, winners = (
+            part.strip() for part in closed_raw.split("|")
+        )
+        lines.append(f"Закрыто: {total}")
+        lines.append(f"Итог за сутки: ${float(pnl_usd):+.6f}")
+        if measured.isdigit() and int(measured) > 0:
+            share = round(100.0 * int(winners) / int(measured))
+            lines.append(
+                f"Доля прибыльных: {share}% ({winners} из {measured} измеренных)"
+            )
+        else:
+            lines.append("Доля прибыльных: измеренных закрытий за сутки нет")
+        if total.isdigit() and measured.isdigit() and int(total) > int(measured):
+            lines.append(
+                f"⚠ Закрыто по пробелу в данных: {int(total) - int(measured)} "
+                "(в итог и долю не входят)"
+            )
+    else:
+        lines.append("Закрыто: 0")
+
+    open_now = _psql(
+        "SELECT count(*) FROM positions "
+        f"WHERE logic_version = {int(LOGIC_VERSION)} AND status = 'open';"
+    )
+    lines.append(f"Открыто на момент сводки: {open_now or '0'}")
+
+    # ОТКАЗЫ ПО ПАУЗЕ ПО ТОКЕНУ — ИЗ СУТОЧНЫХ СЧЁТЧИКОВ REDIS, и суток этих
+    # ДВОЕ, а не одни. Счётчик заведён на календарные сутки UTC
+    # (positions:refused:<версия>:<ГГГГ-ММ-ДД>:token_pause), а сводка выходит в
+    # 06:00 UTC — то есть её «последние 24 часа» приходятся на два ключа.
+    # Сложить их в одно число значило бы назвать суммой за 30 часов то, что
+    # подписано «за сутки»; поэтому названы оба, каждый своей датой.
+    today = datetime.now(UTC)
+    yesterday = today.timestamp() - 86400
+    day_keys = [
+        today.strftime("%Y-%m-%d"),
+        datetime.fromtimestamp(yesterday, UTC).strftime("%Y-%m-%d"),
+    ]
+    parts = []
+    for day in day_keys:
+        raw = _redis_get(
+            f"positions:refused:{int(LOGIC_VERSION)}:{day}:token_pause"
+        )
+        value = raw.strip() if raw else ""
+        parts.append(f"{day}: {value if value.isdigit() else '0'}")
+    lines.append("Отказов по паузе токена (сутки UTC) — " + ", ".join(parts))
+    return lines
+
+
 def section_db_and_errors() -> list[str]:
     lines = ["<b>🗄 БД и ошибки</b>"]
     size = _psql("SELECT pg_size_pretty(pg_database_size(current_database()));")
@@ -590,6 +681,7 @@ def build_message() -> str:
         "\n".join(section_agent_failures()),
         "\n".join(section_agent_silence()),
         "\n".join(section_funding_reserve()),
+        "\n".join(section_positions_24h()),
         "\n".join(section_db_and_errors()),
     ]
     return "\n\n".join(blocks)

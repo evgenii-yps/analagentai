@@ -38,6 +38,7 @@ import pytest
 
 import src.barrier.runner as barrier_runner
 import src.baseline.runner as baseline_runner
+import src.positions.rules as rules
 from src.barrier.runner import settle_seconds
 from src.core.config import Settings, settings
 from src.positions.rules import (
@@ -47,7 +48,6 @@ from src.positions.rules import (
     EXIT_TARGET,
     EXIT_TIMEOUT,
     REASON_DEGRADED,
-    REASON_INSTRUMENT_BUSY,
     REASON_LOW_PROBABILITY,
     REASON_NO_FROZEN_TARGET,
     REASON_OK,
@@ -380,9 +380,11 @@ def _open_kwargs(**overrides):
         degraded=False,
         probability=0.9,
         min_probability=0.8,
-        has_open_position=False,
-        open_count=0,
-        max_open=5,
+        # ВЕРСИЯ 7 (§3, §4 ТЗ 7): вместо «занят ли инструмент» и «сколько
+        # слотов занято» — ОДНА величина, возраст последнего входа по токену.
+        # ``None`` означает «по токену не входили», то есть пауза не держит.
+        last_open_age_sec=None,
+        token_pause_sec=3600.0,
         signal_age_sec=30.0,
         max_signal_age_sec=180,
         bar_age_sec=45.0,
@@ -447,11 +449,22 @@ def test_stale_signal_is_refused() -> None:
     assert should_open(**_open_kwargs(signal_age_sec=180.0)).allowed is True
 
 
-def test_instrument_with_an_open_position_is_refused() -> None:
-    """Один инструмент — одна позиция. Второй вход по нему невозможен."""
-    verdict = should_open(**_open_kwargs(has_open_position=True))
-    assert verdict.allowed is False
-    assert verdict.reason == REASON_INSTRUMENT_BUSY
+def test_the_one_position_per_instrument_rule_is_gone() -> None:
+    """Правила «один инструмент — одна позиция» больше НЕТ (§3 A2 ТЗ 7).
+
+    Тест Этапа 9.1 проверял обратное, и это не ошибка того теста: правило
+    действовало и было главным ограничителем сделок. Здесь закреплено его
+    СНЯТИЕ — вместе с тем, что снято оно НАСОВСЕМ, а не отключено значением
+    настройки: ни параметра «занят ли инструмент», ни причины отказа
+    ``instrument_busy`` в правиле не осталось.
+
+    Что пришло на смену — пауза по токену — проверяется в tests/test_logic_7.py.
+    """
+    assert "instrument_busy" not in REFUSAL_REASONS
+    assert not hasattr(rules, "REASON_INSTRUMENT_BUSY")
+    # Открытая позиция по инструменту входу больше не мешает: единственное, что
+    # может помешать, — недавний вход, и он задаётся возрастом, а не фактом.
+    assert should_open(**_open_kwargs(last_open_age_sec=7200.0)).allowed is True
 
 
 def test_signal_without_a_frozen_target_is_refused() -> None:
@@ -477,7 +490,7 @@ def test_every_refusal_reason_belongs_to_the_closed_list() -> None:
         dict(decision="sell"), dict(decision="wait"),
         dict(logic_version=settings.LOGIC_VERSION + 1),
         dict(degraded=True), dict(probability=0.1), dict(probability=None),
-        dict(has_open_position=True), dict(open_count=5),
+        dict(last_open_age_sec=59.0, token_pause_sec=3600.0),
         dict(signal_age_sec=10_000.0), dict(bar_age_sec=10_000.0),
         dict(bar_age_sec=None), dict(has_frozen_target=False),
         # Этап 9.1.1 §5: перечень расширен одним значением, и оно тоже обязано
@@ -529,7 +542,13 @@ def test_stage_defaults_match_the_specification() -> None:
     fresh = Settings(POSTGRES_PASSWORD="x")
     assert fresh.POSITION_HORIZON_H == 24
     assert fresh.POSITION_MIN_PROBABILITY == 0.8
-    assert fresh.POSITION_MAX_OPEN == 5
+    # ЧИСЛО СЛОТОВ ЭТАПА 9.1 БОЛЬШЕ НЕ ПРОВЕРЯЕТСЯ ЗДЕСЬ, И ЭТО НЕ ОСЛАБЛЕНИЕ
+    # ТЕСТА. Версия 7 (§3 A1 ТЗ 7) сняла ограничение числа одновременных
+    # позиций целиком: 0 означает «без ограничения», и значение это закреплено
+    # в tests/test_logic_7.py вместе с тем, ЧТО именно код обязан с ним делать.
+    # Оставь здесь «== 5» — и тест ловил бы не подмену числа, а само решение
+    # владельца.
+    assert fresh.POSITION_MAX_OPEN == 0
     assert fresh.POSITION_SLOT_USD == 2.0
     assert fresh.POSITION_MAX_SIGNAL_AGE_SEC == 180
     assert fresh.POSITION_MAX_BAR_AGE_SEC == 300
