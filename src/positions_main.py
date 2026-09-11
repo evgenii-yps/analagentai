@@ -21,7 +21,7 @@ from src.core.config import settings
 from src.core.db import db
 from src.core.logging import setup_logging
 from src.core.redis_client import close_redis, get_redis
-from src.positions.runner import run
+from src.positions.runner import run, startup_fields
 
 
 async def _main() -> None:
@@ -40,13 +40,10 @@ async def _main() -> None:
         return
 
     log.info(
-        "Запуск сервиса ведения позиций (Этап 9.1)",
+        "Запуск сервиса ведения позиций (версия логики 7)",
         component="positions",
-        interval=settings.POSITION_INTERVAL,
-        horizon_h=settings.POSITION_HORIZON_H,
-        slot_usd=settings.POSITION_SLOT_USD,
-        max_open=settings.POSITION_MAX_OPEN,
         virtual=True,
+        **startup_fields(),
     )
 
     await db.connect()

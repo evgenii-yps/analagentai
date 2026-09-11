@@ -383,14 +383,28 @@ class BotPoller:
         return rows
 
     async def _cmd_status(self, now: datetime, chat_id: int) -> str:
-        """/status: живость системы и свежесть данных ПО КАЖДОМУ токену (§4)."""
+        """/status: живость системы, свежесть данных и состояние сделок.
+
+        СОСТОЯНИЕ СДЕЛОК ДОБАВЛЕНО ВЕРСИЕЙ 7 (§5 C6 ТЗ): число открытых позиций
+        и паузы по токенам. Оно НЕ ДОЛЖНО ронять команду: /status отвечает на
+        вопрос «жива ли система», и потерять ответ из-за недоступной таблицы
+        позиций значило бы промолчать ровно тогда, когда спрашивают.
+        """
         hb_rows = await self._read_heartbeats()
         facts = await self.queries.status_facts()
         user = await self._chat_settings(chat_id)
         per_token = await self.queries.freshness_by_instrument(
             None if user.instruments is None else list(user.instruments)
         )
-        return handlers.render_status(hb_rows, facts, now, per_token)
+        pause_sec = float(settings.POSITION_TOKEN_PAUSE_MIN) * 60.0
+        try:
+            positions = await self.queries.positions_state(pause_sec)
+        except Exception as exc:  # noqa: BLE001 — позиции не важнее ответа
+            self._log.warning("bot_positions_state_failed=1", error=str(exc))
+            positions = None
+        if positions is not None:
+            positions["token_pause_min"] = int(settings.POSITION_TOKEN_PAUSE_MIN)
+        return handlers.render_status(hb_rows, facts, now, per_token, positions)
 
     async def _cmd_last(self, args: list[str], now: datetime, chat_id: int) -> str:
         """/last: последние сигналы ПО ВЫБРАННЫМ токенам (§4 ТЗ 8.3)."""

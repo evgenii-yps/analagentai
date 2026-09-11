@@ -139,8 +139,16 @@ def test_the_wait_must_start_strictly_before_the_deadline() -> None:
 
 
 def test_the_logic_version_is_raised_to_six() -> None:
-    """§1.1 ТЗ: версия логики поднята 5 → 6, и это решение владельца."""
-    assert settings.LOGIC_VERSION == 6 == CURRENT_LOGIC_VERSION
+    """§1.1 ТЗ: версия логики поднята 5 → 6, и это решение владельца.
+
+    ВЕРСИЯ С ТЕХ ПОР УШЛА ДАЛЬШЕ (действующая — в ``CURRENT_LOGIC_VERSION``), и
+    проверять здесь равенство шести значило бы запрещать любой следующий
+    законный подъём. Проверяется то, что этот этап действительно утверждал:
+    версия НЕ НИЖЕ шести, а граница правила выхода — ровно шесть, потому что
+    именно с неё предела убытка не стало.
+    """
+    assert settings.LOGIC_VERSION >= 6
+    assert settings.LOGIC_VERSION == CURRENT_LOGIC_VERSION
     assert PLUS_WAIT_MIN_LOGIC_VERSION == 6
 
 
@@ -712,17 +720,20 @@ def test_the_bot_shows_every_refusal_reason_in_plain_words() -> None:
     assert set(REFUSAL_RU) == set(REFUSAL_REASONS)
 
 
-def test_the_slot_count_is_not_changed() -> None:
-    """§7.1 и §7.3 ТЗ: число слотов и размер слота НЕ МЕНЯЮТСЯ.
+def test_the_slot_count_is_not_changed_by_this_stage() -> None:
+    """§7.1 и §7.3 ТЗ 9.2: слоты и бюджет ЭТИМ ЭТАПОМ не менялись.
 
-    По замеру слот будет занят в среднем 22.5 часа вместо 3.4, и соблазн
-    «компенсировать» занятость очевиден. Это отдельное решение владельца, и
-    этап его не принимает.
+    По замеру 9.1.6 слот оказывался занят в среднем 22.5 часа вместо 3.4, и
+    соблазн «компенсировать» занятость был очевиден. Этап 9.2 такого решения не
+    принимал — его принял владелец ОТДЕЛЬНО, в ТЗ «Версия логики 7»: слоты и
+    бюджет сняты целиком, и вместо них поставлена пауза по токену.
+
+    ЧТО ОСТАЛОСЬ НЕИЗМЕННЫМ ЧЕРЕЗ ОБА РЕШЕНИЯ — размер слота и порог входа. Эти
+    два числа и делают проценты версий 5, 6 и 7 сопоставимыми между собой, и
+    проверка их стоит здесь по-прежнему.
     """
     fresh = Settings(POSTGRES_PASSWORD="x")
-    assert fresh.POSITION_MAX_OPEN == 5
     assert fresh.POSITION_SLOT_USD == 2.0
-    assert fresh.POSITION_BUDGET_USD == 10.0
     assert fresh.POSITION_MIN_PROBABILITY == 0.8
 
 
@@ -1317,7 +1328,7 @@ def test_every_name_the_report_promises_actually_exists() -> None:
         "db/migrations/025_positions_no_stop_rollback.sql": ["RAISE EXCEPTION"],
         "src/core/config.py": [
             "POSITION_MAX_HOLD_HOURS", "POSITION_PLUS_WAIT_START_HOURS",
-            "LOGIC_VERSION: int = 6",
+            "LOGIC_VERSION: int =",
         ],
         "src/positions/rules.py": [
             "EXIT_PLUS", "check_exit_plus_wait", "breakeven_price",
@@ -1341,6 +1352,6 @@ def test_every_name_the_report_promises_actually_exists() -> None:
 def test_the_env_example_names_the_new_settings() -> None:
     """Настройка, которой нет в ``.env.example``, для владельца не существует."""
     env = (_ROOT / ".env.example").read_text(encoding="utf-8")
-    assert re.search(r"^LOGIC_VERSION=6\b", env, re.M)
+    assert re.search(r"^LOGIC_VERSION=\d+\b", env, re.M)
     assert re.search(r"^POSITION_MAX_HOLD_HOURS=48\b", env, re.M)
     assert re.search(r"^POSITION_PLUS_WAIT_START_HOURS=24\b", env, re.M)
