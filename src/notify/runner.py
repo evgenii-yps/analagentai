@@ -11,18 +11,48 @@ from src.core.config import settings
 from src.core.db import db
 from src.core.instruments import horizon_label
 from src.core.redis_client import close_redis, get_redis
+from src.notify import daily_trades
 from src.notify.agent import NotifyAgent, signal_notifications_enabled
+
+# ПОЛЯ СТРОКИ ЗАПУСКА СЛУЖБЫ УВЕДОМЛЕНИЙ, НАЗВАННЫЕ §8 ТЗ 9.3 ПОИМЁННО.
+# Перечень вынесен константой затем, чтобы проверка приёмки сверяла его с
+# требованием, а не с тем, что случайно оказалось в форматной строке.
+STARTUP_FIELDS: tuple[str, ...] = (
+    "notify_signals_enabled", "notify_trades_enabled",
+    "notify_daily_summary_utc", "notify_trades_max_per_hour",
+)
+
+
+def startup_fields() -> dict[str, object]:
+    """Величины строки запуска службы уведомлений (§8 ТЗ 9.3).
+
+    ПЕЧАТАЮТСЯ ФАКТИЧЕСКИ ПРИМЕНЁННЫЕ ЗНАЧЕНИЯ, А НЕ УМОЛЧАНИЯ КОДА (§8 ТЗ):
+    значения читаются из ``settings`` в момент вызова.
+
+    ``notify_trades_enabled`` БЕРЁТСЯ ИЗ ``POSITION_NOTIFY_ENABLED``, и второй
+    настройки для той же величины не заводится. §3 ТЗ прямо это запрещает
+    («заводить второе имя для той же величины запрещено — это отдельный класс
+    дефекта, уже случавшийся в проекте»), а выключатель сообщений о сделках в
+    проекте есть с этапа 9.1 и живёт рядом с самими сообщениями — в службе
+    позиций, которая их и шлёт. Соответствие имён приведено в отчёте.
+    """
+    return {
+        "notify_signals_enabled": bool(settings.NOTIFY_SIGNALS_ENABLED),
+        "notify_trades_enabled": bool(settings.POSITION_NOTIFY_ENABLED),
+        "notify_daily_summary_utc": str(settings.NOTIFY_DAILY_SUMMARY_UTC),
+        "notify_trades_max_per_hour": int(settings.NOTIFY_TRADES_MAX_PER_HOUR),
+    }
 
 
 async def run() -> None:
     """Поднимает инфраструктуру, запускает сервис уведомлений и ждёт остановки."""
     log = structlog.get_logger()
-    # СТРОКА ЗАПУСКА НАЗЫВАЕТ ГЛАВНОЕ СВОЙСТВО СЕРВИСА ПРЯМО (§5 C1 ТЗ 7):
+    # СТРОКА ЗАПУСКА НАЗЫВАЕТ ГЛАВНОЕ СВОЙСТВО СЕРВИСА ПРЯМО (§8 ТЗ 9.3):
     # уходят ли сообщения о сигналах вообще. Пороги и ограничения потока рядом
-    # печатаются по-прежнему — они остались в коде и в настройках (§5 C4), —
+    # печатаются по-прежнему — они остались в коде и в настройках (§6.1), —
     # и без явного признака их присутствие в журнале читалось бы как «сигналы
     # шлются, просто с ограничениями».
-    signals_to_telegram = signal_notifications_enabled(settings.LOGIC_VERSION)
+    signals_to_telegram = signal_notifications_enabled()
     log.info(
         "Запуск сервиса уведомлений Agent Trade (Этап 5)",
         interval=settings.NOTIFY_INTERVAL,
@@ -31,15 +61,16 @@ async def run() -> None:
         hold_min=settings.NOTIFY_HOLD_MIN,
         max_per_hour=settings.NOTIFY_MAX_PER_HOUR,
         logic_version=settings.LOGIC_VERSION,
-        signal_messages=signals_to_telegram,
+        **startup_fields(),
     )
     if not signals_to_telegram:
         log.info(
             "notify_signal_messages_off=1",
             logic_version=int(settings.LOGIC_VERSION),
             reason=(
-                "с версии 7 в Telegram уходят только события сделок; сигналы "
-                "собираются, оцениваются и пишутся в базу как прежде"
+                "NOTIFY_SIGNALS_ENABLED=false: в Telegram уходят только "
+                "события сделок; сигналы собираются, оцениваются и пишутся в "
+                "базу как прежде"
             ),
         )
 
@@ -74,7 +105,15 @@ async def run() -> None:
             max_per_hour=settings.NOTIFY_MAX_PER_HOUR,
             recipients=[int(chat) for chat in settings.bot_allowed_chat_ids],
         )
-        tasks = [asyncio.create_task(agent.run(), name="notify")]
+        tasks = [
+            asyncio.create_task(agent.run(), name="notify"),
+            # СУТОЧНАЯ СВОДКА ПО СДЕЛКАМ — ОТДЕЛЬНОЙ ЗАДАЧЕЙ (§6.2 ТЗ 9.3), а
+            # не шагом внутри цикла уведомлений. Цикл уведомлений выходит
+            # досрочно, когда сигнальные сообщения выключены (а они выключены
+            # весь этап), и сводка, встроенная в него шагом, не ушла бы ни
+            # разу — при совершенно честном виде журнала.
+            asyncio.create_task(daily_trades.run_loop(), name="daily-trades"),
+        ]
 
         loop = asyncio.get_running_loop()
         _install_signal_handlers(loop, tasks, log)

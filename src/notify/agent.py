@@ -24,6 +24,7 @@ from src.core.user_settings import (
     default_settings,
     user_filter_reason,
 )
+from src.notify import rate_limit
 from src.notify.telegram import send_message
 from src.notify.wording import (
     agent_paragraph,
@@ -76,20 +77,27 @@ _CAP_REASON_PREFIX = "потолок уведомлений в час"
 # потолок и cooldown (§5 C4) ОСТАЮТСЯ в коде и в настройках нетронутыми: они
 # перестают влиять на то, что видит человек, но при возврате сигнальных
 # уведомлений их пришлось бы выводить заново.
-SIGNAL_NOTIFY_MAX_LOGIC_VERSION = 6
+def signal_notifications_enabled() -> bool:
+    """Уходят ли в Telegram сообщения О СИГНАЛАХ. Спрашивается у ``.env``.
 
+    ФЛАГ ВМЕСТО ГРАНИЦЫ ПО ВЕРСИИ ЛОГИКИ (§6.1 ТЗ 9.3). До этапа 9.3 здесь
+    стояла константа ``SIGNAL_NOTIFY_MAX_LOGIC_VERSION = 6``, и сигнальные
+    уведомления прекращались «сами» при подъёме версии. Довод был такой: откат
+    состоит из возврата ``LOGIC_VERSION=6``, и сигнальные сообщения обязаны
+    вернуться вместе с ним, не требуя правки кода.
 
-def signal_notifications_enabled(logic_version: int) -> bool:
-    """Уходят ли в Telegram сообщения О СИГНАЛАХ при этой версии логики.
+    ТЗ 9.3 отменяет это решение, и правильно делает: версия логики — ГРАНИЦА
+    ВЫБОРКИ, а не выключатель потока сообщений. Связанные, они не дают ни
+    вернуть сигнальные уведомления, не обнулив выборку сделок, ни поднять
+    версию, не вернув сорок сообщений в час. Возражение исходное («выключатель
+    в .env однажды переставят, не заметив») закрыто не константой, а тем, что
+    §13.1.7 требует ровно ноль сигнальных сообщений за сутки после
+    развёртывания — числом, снятым с боевого сервера.
 
-    Спрашивается по НАСТРОЙКЕ ``LOGIC_VERSION``, а не по версии в строке
-    сигнала, и это осознанно: речь о том, что видит человек СЕЙЧАС, а не о том,
-    каким правилом посчитан отдельный сигнал. Иначе при подъёме версии
-    недоотправленные сигналы прежней версии продолжали бы приходить ещё сутки —
-    ровно в тот момент, когда владелец проверяет, что поток сигналов прекратился
-    (§9 ТЗ).
+    КОД СИГНАЛЬНЫХ УВЕДОМЛЕНИЙ НЕ УДАЛЁН (§6.1): пороги, выдержка, потолок и
+    cooldown остаются на местах и при ``true`` работают как прежде.
     """
-    return int(logic_version) <= SIGNAL_NOTIFY_MAX_LOGIC_VERSION
+    return bool(settings.NOTIFY_SIGNALS_ENABLED)
 
 
 # Порядок агентов, участвующих в решении (совпадает с src.decision.agent.AGENTS).
@@ -641,7 +649,7 @@ class NotifyAgent:
         # СВОДКА ПРИДЕРЖАННЫХ СИГНАЛОВ ТОЖЕ НЕ УХОДИТ: она сообщение О
         # СИГНАЛАХ, а §5 C1 не делает для неё исключения. Очередь сводки,
         # оставшаяся с прежней версии, истекает сама (TTL два часа).
-        if not signal_notifications_enabled(settings.LOGIC_VERSION):
+        if not signal_notifications_enabled():
             for signal in signals:
                 await db.mark_signal_absorbed(signal["id"])
             if signals:
@@ -650,8 +658,9 @@ class NotifyAgent:
                     count=len(signals),
                     logic_version=int(settings.LOGIC_VERSION),
                     reason=(
-                        "с версии 7 в Telegram уходят только события сделок; "
-                        "сигналы собираются и пишутся в базу как прежде"
+                        "NOTIFY_SIGNALS_ENABLED=false: в Telegram уходят "
+                        "только события сделок; сигналы собираются, "
+                        "оцениваются и пишутся в базу как прежде"
                     ),
                 )
             return
@@ -1028,45 +1037,20 @@ class NotifyAgent:
         )
 
     async def _sent_last_hour(self, chat_id: int, now: datetime) -> int:
-        """Сколько уведомлений ушло за последний час (по всем инструментам).
+        """Сколько уведомлений ушло этому получателю за последний час.
 
-        Хранится упорядоченным множеством Redis: ключ — момент отправки, вес —
-        он же в секундах. Скользящее окно, а не счётчик с обнулением в начале
-        часа: со счётчиком шесть уведомлений в 10:59 и ещё шесть в 11:01
-        уложились бы в «потолок 6 в час», хотя человек получил бы двенадцать за
-        две минуты.
-
-        Недоступность Redis не должна затыкать уведомления совсем, поэтому при
-        ошибке возвращается 0 — ограничение по потолку в этот момент не
-        действует, а выдержка по инструменту продолжает работать.
+        РЕАЛИЗАЦИЯ ЖИВЁТ В ``src.notify.rate_limit`` И ОБЩАЯ СО СЛУЖБОЙ
+        ПОЗИЦИЙ (§6.3 ТЗ 9.3): предохранитель на поток сообщений о сделках
+        обязан считать час ровно так же, как его считает эта служба, а второй
+        реализацией «того же самого» они однажды разошлись бы молча.
         """
-        if self.cfg.max_per_hour <= 0:
-            return 0
-        try:
-            redis = get_redis()
-            key = f"{_SENT_KEY}:{chat_id}"
-            edge = now.timestamp() - 3600
-            await redis.zremrangebyscore(key, "-inf", edge)
-            return int(await redis.zcard(key))
-        except Exception as exc:  # noqa: BLE001
-            self._log.warning(
-                "Не удалось прочитать счётчик уведомлений за час", error=str(exc)
-            )
-            return 0
+        return await rate_limit.sent_last_hour(
+            f"{_SENT_KEY}:{chat_id}", now, self.cfg.max_per_hour > 0
+        )
 
     async def _record_sent(self, chat_id: int, now: datetime) -> None:
         """Отмечает факт отправки в скользящем окне часа этого получателя."""
-        try:
-            redis = get_redis()
-            key = f"{_SENT_KEY}:{chat_id}"
-            await redis.zadd(key, {now.isoformat(): now.timestamp()})
-            # Ключ живёт заведомо дольше окна: чистка идёт по весу, а срок жизни
-            # нужен только чтобы ключ не оставался навсегда после остановки.
-            await redis.expire(key, 7200)
-        except Exception as exc:  # noqa: BLE001
-            self._log.warning(
-                "Не удалось записать отправку в счётчик часа", error=str(exc)
-            )
+        await rate_limit.record_sent(f"{_SENT_KEY}:{chat_id}", now)
 
     async def run(self) -> None:
         """Бесконечный цикл: process_once → heartbeat → пауза. Не падает на ошибках."""

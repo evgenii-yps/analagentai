@@ -349,21 +349,29 @@ def test_a_position_without_new_bars_is_no_longer_skipped_forever() -> None:
 
 
 def test_the_gap_message_does_not_claim_a_result() -> None:
-    """§6.6: у пробела свой текст, и он не утверждает результата.
+    """§6.6: закрытие по пробелу не утверждает результата.
 
-    Обычный текст закрытия говорит «итог такой-то». Здесь итога нет — есть
+    Обычное сообщение о закрытии говорит «итог такой-то». Здесь итога нет — есть
     последняя известная цена и признание того, что измерить не удалось.
+
+    ФОРМА СООБЩЕНИЯ ИЗМЕНИЛАСЬ В ЭТАПЕ 9.3, СМЫСЛ — НЕТ. §6.2 ТЗ 9.3
+    перечисляет «пропали данные» среди значений строки «Причина:» сообщения о
+    закрытии, то есть требует ОДНОГО сообщения на все исходы. Оговорка о том,
+    что итог в статистику не идёт, при этом осталась — и проверяется здесь
+    по-прежнему.
     """
     from src.positions import messages
 
     text = messages.data_gap_text(
+        position_id=77,
         symbol="SOL/USDT", entry_price=142.37, exit_price=141.90,
         last_bar_ts=datetime(2026, 8, 30, 4, 12, tzinfo=UTC),
-        gap_sec=13320, net_pnl_pct=-0.55, net_pnl_usd=-0.011, bars_held=37,
+        gap_sec=13320, net_pnl_pct=-0.55, net_pnl_usd=-0.011,
+        cost_pct=0.22, held_sec=20 * 3600, bars_held=37,
     )
     assert "виртуально" in text
-    assert "пробел" in text.lower()
-    assert "последней известной цене" in text
+    assert "Причина: пропали данные" in text
+    assert "последняя известная" in text
     assert "В СТАТИСТИКУ НЕ ИДЁТ" in text
     assert "37 баров" in text
 
@@ -372,20 +380,26 @@ def test_the_gap_message_does_not_claim_a_result() -> None:
     # Сослаться на наблюдение, которого не было, — это то же самое, что
     # выдумать его.
     empty = messages.data_gap_text(
+        position_id=78,
         symbol="SOL/USDT", entry_price=142.37, exit_price=142.37,
         last_bar_ts=datetime(2026, 8, 30, 4, 12, tzinfo=UTC),
-        gap_sec=10800, net_pnl_pct=-0.22, net_pnl_usd=-0.0044, bars_held=0,
+        gap_sec=10800, net_pnl_pct=-0.22, net_pnl_usd=-0.0044,
+        cost_pct=0.22, held_sec=3 * 3600, bars_held=0,
     )
-    assert "последней известной цене" not in empty
+    assert "последняя известная" not in empty
     assert "по цене входа" in empty
     assert "оценить сделку нечем" in empty
-    # И это НЕ обычный текст закрытия: тот утверждал бы измеренный результат.
+    # И ОГОВОРКА ОТЛИЧАЕТ ЭТО СООБЩЕНИЕ ОТ ОБЫЧНОГО ЗАКРЫТИЯ. Форма у них с
+    # этапа 9.3 одна (§6.2 ТЗ 9.3), но обычное закрытие утверждает измеренный
+    # результат и ничего не оговаривает.
     closed = messages.closed_text(
+        position_id=77,
         symbol="SOL/USDT", exit_reason="timeout", entry_price=142.37,
         exit_price=141.90, net_pnl_pct=-0.55, net_pnl_usd=-0.011,
         cost_pct=0.22, held_sec=86400,
     )
     assert text != closed
+    assert "В СТАТИСТИКУ НЕ ИДЁТ" not in closed
 
 
 def test_data_gap_is_excluded_from_averages_but_counted_separately() -> None:
@@ -1016,17 +1030,35 @@ def test_refusal_reasons_stay_a_closed_list_of_ten() -> None:
     есть отсутствие сверки не следствие того, что её забыли написать.
 
     ДЕСЯТЬ СТАЛО ДЕВЯТЬЮ (§3, §4 ТЗ 7): ушли ``instrument_busy`` и
-    ``slots_full``, пришла ``token_pause``. Число здесь живёт не ради самого
-    числа, а ради того, чтобы новая причина не появилась молча: причина отказа,
-    о которой не знает ни бот, ни сводка, — это молчание, выглядящее как ноль.
+    ``slots_full``, пришла ``token_pause``. ДЕВЯТЬ СТАЛО ОДИННАДЦАТЬЮ (§3, §4.1
+    ТЗ 9.3): ограничители ЧИСЛА сделок вернулись выключателями — ``max_open`` и
+    ``instrument_busy``. Число здесь живёт не ради самого числа, а ради того,
+    чтобы новая причина не появилась молча: причина отказа, о которой не знает
+    ни бот, ни сводка, — это молчание, выглядящее как ноль.
+
+    А ВОТ ЭТО ИЗМЕНИЛОСЬ ПО СУЩЕСТВУ. Абзац выше верен для этапов до 9.3:
+    причины отказа не записывались ни в одну таблицу, и сверять их было не с
+    чем. §7.1 ТЗ 9.3 завёл ``public.position_rejections``, и перечень закрыт
+    теперь и ограничением БД — миграцией 028. Сверка с ней ниже.
     """
-    assert len(REFUSAL_REASONS) == 9
-    assert len(set(REFUSAL_REASONS)) == 9
+    assert len(REFUSAL_REASONS) == 11
+    assert len(set(REFUSAL_REASONS)) == 11
     assert REASON_NO_FREE_CAPITAL in REFUSAL_REASONS
     assert REASON_TOKEN_PAUSE in REFUSAL_REASONS
     assert "slots_full" not in REFUSAL_REASONS
-    assert "instrument_busy" not in REFUSAL_REASONS
 
+    # ПЕРЕЧЕНЬ В МИГРАЦИИ 028 СОВПАДАЕТ С ПЕРЕЧНЕМ В КОДЕ. Две копии закрытого
+    # списка в двух файлах однажды разошлись бы, и новая причина падала бы на
+    # ограничении БД — в бою, у службы, которая по построению не падает: она
+    # записала бы предупреждение, и отказы новой причины просто перестали бы
+    # попадать в выборку. Молча.
+    listed = set(re.findall(
+        r"'([a-z_]+)'",
+        (_MIGRATIONS / "028_position_rejections.sql")
+        .read_text(encoding="utf-8")
+        .split("reason IN (", 1)[1].split(")", 1)[0],
+    ))
+    assert listed == set(REFUSAL_REASONS)
     migrations = "".join(
         (_MIGRATIONS / name).read_text(encoding="utf-8")
         for name in ("018_positions.sql", "019_positions_data_gap.sql")

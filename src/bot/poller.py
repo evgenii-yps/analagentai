@@ -398,7 +398,9 @@ class BotPoller:
         )
         pause_sec = float(settings.POSITION_TOKEN_PAUSE_MIN) * 60.0
         try:
-            positions = await self.queries.positions_state(pause_sec)
+            positions = await self.queries.positions_state(
+                pause_sec, int(settings.LOGIC_VERSION)
+            )
         except Exception as exc:  # noqa: BLE001 — позиции не важнее ответа
             self._log.warning("bot_positions_state_failed=1", error=str(exc))
             positions = None

@@ -42,6 +42,7 @@ import structlog
 from src.core.config import settings
 from src.core.db import db
 from src.core.redis_client import get_redis
+from src.notify import rate_limit
 from src.notify.telegram import send_message
 from src.positions import messages
 from src.positions.rules import (
@@ -133,6 +134,10 @@ class OpenedStats:
     races: int = 0
     # Отказы по машиночитаемым ключам: знать, ПОЧЕМУ позиций мало, придётся.
     refusals: dict[str, int] = field(default_factory=dict)
+    # Отказы ПОИМЁННО — строки журнала public.position_rejections (§7.1 ТЗ 9.3).
+    # Копятся в итерации и пишутся одной пачкой: вставка на каждый отказ дала
+    # бы столько обращений к базе, сколько было кандидатов.
+    rejections: list[dict[str, Any]] = field(default_factory=list)
 
     def refuse(self, reason: str) -> None:
         self.refusals[reason] = self.refusals.get(reason, 0) + 1
@@ -174,18 +179,156 @@ def last_closed_bar_open_ts(now: datetime) -> datetime:
     return now - timedelta(seconds=60 + settings.POSITION_SETTLE_SEC)
 
 
-async def _send(text: str) -> None:
-    """Отправка уведомления. Молчит, если уведомления выключены настройкой.
+# --- ПРЕДОХРАНИТЕЛЬ НА ПОТОК СООБЩЕНИЙ О СДЕЛКАХ (§6.3, §6.4 ТЗ 9.3) --------
+#
+# ЧТО ЭТО И ЗАЧЕМ. Слотов больше нет, сделок ожидается несколько десятков в
+# сутки (§12.1 ТЗ), то есть 40–120 сообщений: два на сделку плюс сводка.
+# Владелец эту цену принял. Предохранитель встраивается СРАЗУ и выключенным
+# (``NOTIFY_TRADES_MAX_PER_HOUR=0``): если поток окажется невыносимым, решение
+# принимается правкой одной строки в ``.env``, а не спешной правкой кода в тот
+# самый день, когда всё и так плохо.
+#
+# СВЕРХ ПОТОЛКА СООБЩЕНИЯ НЕ ТЕРЯЮТСЯ, А СВОРАЧИВАЮТСЯ. Придержанные копятся
+# списком в Redis и уходят одной почасовой сводкой, которая В СЧЁТ ПОТОЛКА НЕ
+# ВХОДИТ (§6.3): включи её в счёт — и предохранитель глушил бы сам себя, а
+# владелец переставал бы узнавать о сделках вовсе.
+_TRADE_SENT_KEY = "positions:trades:sent:hour"
+_TRADE_HELD_KEY = "positions:trades:held"
+_TRADE_ROLLUP_KEY = "positions:trades:rollup_at"
+_TRADE_HELD_TTL_SEC = 24 * 3600
+# Суточные счётчики отправленных и неотправленных сообщений (§6.4, §13.2 ТЗ).
+# Живут неделю — столько же, сколько счётчики отказов, и по той же причине.
+_TRADE_STAT_TEMPLATE = "positions:notify:{version}:{day}:{kind}"
+_TRADE_STAT_TTL_SEC = 7 * 24 * 3600
 
-    Ошибку отправки сервис НЕ считает поводом уронить итерацию: позиция уже
-    открыта или закрыта в базе, и несостоявшееся сообщение не отменяет факта.
+
+def trade_stat_key(version: int, day: str, kind: str) -> str:
+    """Имя суточного счётчика сообщений о сделках. Одно место, а не литерал.
+
+    Собирают его ДВОЕ — служба позиций (пишет) и суточная сводка (читает), — и
+    две одинаковые строки в двух файлах однажды разошлись бы: счётчики просто
+    перестали бы находиться, молча, показывая честный ноль.
+    """
+    return _TRADE_STAT_TEMPLATE.format(
+        version=int(version), day=day, kind=kind
+    )
+
+
+async def _count_trade_message(now: datetime, kind: str) -> None:
+    """Считает отправленное и неотправленное сообщение (§6.4 ТЗ 9.3)."""
+    try:
+        redis = get_redis()
+        key = trade_stat_key(
+            int(settings.LOGIC_VERSION), now.strftime("%Y-%m-%d"), kind
+        )
+        await redis.incrby(key, 1)
+        await redis.expire(key, _TRADE_STAT_TTL_SEC)
+    except Exception as exc:  # noqa: BLE001 — счётчик не важнее позиции
+        _log.warning("positions_trade_metric_failed=1", error=str(exc))
+
+
+async def _hold_trade_message(text: str) -> None:
+    """Придерживает сообщение до почасовой сводки (§6.3).
+
+    ОШИБКА REDIS ЗДЕСЬ ТЕРЯЕТ СООБЩЕНИЕ, и молчать об этом нельзя: оно уже не
+    ушло в Telegram и теперь не попадёт в сводку. Поэтому потеря считается тем
+    же счётчиком ``failed``, что и неудачная отправка, — в суточной сводке она
+    и означает ровно это: владелец о сделке не узнал.
+    """
+    try:
+        redis = get_redis()
+        await redis.rpush(_TRADE_HELD_KEY, text)
+        await redis.expire(_TRADE_HELD_KEY, _TRADE_HELD_TTL_SEC)
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("notify_trade_failed=1", stage="hold", error=str(exc))
+        await _count_trade_message(datetime.now(UTC), "failed")
+
+
+async def _send(text: str, now: datetime | None = None) -> None:
+    """Отправка сообщения о сделке. Молчит, если сообщения выключены настройкой.
+
+    СДЕЛКА ПЕРВИЧНА, СООБЩЕНИЕ ВТОРИЧНО (§6.4 ТЗ 9.3). Неудачная отправка не
+    отменяет и не откладывает сделку: она уже открыта или закрыта в базе, и
+    несостоявшееся сообщение факта не отменяет. Неотправленное записывается в
+    журнал машиночитаемым ключом ``notify_trade_failed`` и попадает счётчиком в
+    суточную сводку.
     """
     if not settings.POSITION_NOTIFY_ENABLED:
         return
+    now = now or datetime.now(UTC)
+    cap = int(settings.NOTIFY_TRADES_MAX_PER_HOUR)
+    if cap > 0:
+        sent = await rate_limit.sent_last_hour(_TRADE_SENT_KEY, now, True)
+        if sent >= cap:
+            _log.info(
+                "notify_trade_deferred=1", sent_last_hour=sent, cap=cap,
+                reason="сверх потолка — уйдёт почасовой сводкой (§6.3 ТЗ 9.3)",
+            )
+            await _hold_trade_message(text)
+            return
     try:
-        await send_message(text)
-    except Exception as exc:  # noqa: BLE001 — уведомление не важнее позиции
-        _log.warning("positions_notify_failed=1", error=str(exc))
+        ok = await send_message(text)
+    except Exception as exc:  # noqa: BLE001 — сообщение не важнее позиции
+        _log.warning("notify_trade_failed=1", error=str(exc))
+        await _count_trade_message(now, "failed")
+        return
+    if not ok:
+        _log.warning("notify_trade_failed=1", reason="Telegram вернул отказ")
+        await _count_trade_message(now, "failed")
+        return
+    await _count_trade_message(now, "sent")
+    if cap > 0:
+        await rate_limit.record_sent(_TRADE_SENT_KEY, now)
+
+
+async def _flush_trade_rollup(now: datetime) -> None:
+    """Шлёт почасовую сводку придержанных сообщений (§6.3 ТЗ 9.3).
+
+    В СЧЁТ ПОТОЛКА НЕ ВХОДИТ — ``rate_limit.record_sent`` здесь не зовётся, и
+    это главное свойство этой функции. Иначе первая же сводка съедала бы часть
+    потолка следующего часа, и предохранитель душил бы сам себя.
+
+    ЧАС ОТСЧИТЫВАЕТСЯ ОТ ПРЕДЫДУЩЕЙ СВОДКИ, А НЕ ОТ НАЧАЛА КАЛЕНДАРНОГО ЧАСА —
+    по той же причине, по которой скользит окно паузы по токену (§5.2 ТЗ) и
+    окно потолка уведомлений: обнуление в начале часа даёт две сводки за две
+    минуты на границе.
+    """
+    if int(settings.NOTIFY_TRADES_MAX_PER_HOUR) <= 0:
+        return
+    try:
+        redis = get_redis()
+        last_raw = await redis.get(_TRADE_ROLLUP_KEY)
+        last = float(last_raw) if last_raw else 0.0
+        if now.timestamp() - last < 3600:
+            return
+        held = await redis.lrange(_TRADE_HELD_KEY, 0, -1)
+        if not held:
+            return
+        await redis.delete(_TRADE_HELD_KEY)
+        await redis.set(_TRADE_ROLLUP_KEY, str(now.timestamp()), ex=7200)
+    except Exception as exc:  # noqa: BLE001 — сводка не важнее позиции
+        _log.warning("notify_trade_rollup_failed=1", error=str(exc))
+        return
+    texts = [
+        item if isinstance(item, str) else item.decode() for item in held
+    ]
+    body = "\n\n".join(texts)
+    text = (
+        f"📦 <b>Придержано сообщений о сделках: {len(texts)}</b>\n"
+        f"Потолок {int(settings.NOTIFY_TRADES_MAX_PER_HOUR)} сообщений в час "
+        "(NOTIFY_TRADES_MAX_PER_HOUR). Сами сделки идут своим чередом — "
+        "придержаны только сообщения о них.\n\n"
+        f"{body}"
+    )
+    try:
+        ok = await send_message(text)
+    except Exception as exc:  # noqa: BLE001
+        ok = False
+        _log.warning("notify_trade_failed=1", stage="rollup", error=str(exc))
+    if not ok:
+        await _count_trade_message(now, "failed")
+        return
+    _log.info("notify_trade_rollup_sent=1", count=len(texts))
 
 
 async def _count_refusals(now: datetime, refusals: dict[str, int]) -> None:
@@ -382,6 +525,7 @@ async def sync_open_positions(now: datetime) -> ClosedStats:
         # результат, которого не измеряли.
         if by_gap:
             await _send(messages.data_gap_text(
+                position_id=position_id,
                 symbol=str(row["symbol"]),
                 entry_price=entry_price,
                 exit_price=decision.exit_price,
@@ -389,10 +533,13 @@ async def sync_open_positions(now: datetime) -> ClosedStats:
                 gap_sec=(now - decision.exit_bar_ts).total_seconds(),
                 net_pnl_pct=pnl_pct,
                 net_pnl_usd=pnl_usd,
+                cost_pct=float(row["cost_pct"]),
+                held_sec=(closed_at - opened_at).total_seconds(),
                 bars_held=decision.bars_held,
             ))
         else:
             await _send(messages.closed_text(
+                position_id=position_id,
                 symbol=str(row["symbol"]),
                 exit_reason=decision.exit_reason,
                 entry_price=entry_price,
@@ -401,10 +548,9 @@ async def sync_open_positions(now: datetime) -> ClosedStats:
                 net_pnl_usd=pnl_usd,
                 cost_pct=float(row["cost_pct"]),
                 held_sec=(closed_at - opened_at).total_seconds(),
-                # §8 ТЗ 9.2: сообщение обязано назвать исход человеческим
-                # языком и НЕ упоминать предел убытка у версии 6 — его больше
-                # нет, и писать о нём означало бы вводить в заблуждение.
-                logic_version=int(row["logic_version"]),
+                # §6.2 ТЗ 9.3: срок берётся из СТРОКИ позиции, а не из
+                # настройки — «истёк срок 48 ч» у сделки, жившей сутки, было бы
+                # неверным утверждением.
                 hold_hours=hold_hours(row["logic_version"]),
             ))
     return stats
@@ -429,13 +575,35 @@ async def open_new_positions(now: datetime) -> OpenedStats:
     token_pause_sec = float(settings.POSITION_TOKEN_PAUSE_MIN) * 60.0
     last_open_at: dict[int, datetime] = {}
     if token_pause_sec > 0:
+        # ОКНО ПАУЗЫ — СКОЛЬЗЯЩЕЕ, ОТ МЕТКИ ВРЕМЕНИ (§5.2 ТЗ 9.3), а не от
+        # начала календарного часа. Прямой урок этапа 8.3: при обнулении в
+        # начале часа два входа в 10:59 и 11:01 формально укладываются в
+        # правило и дают два входа за две минуты.
+        #
+        # ВЕРСИЯ ЛОГИКИ ПЕРЕДАЁТСЯ В ЗАПРОС (§5.3): пауза — свойство выборки
+        # версии 7, и позиции версии 6, открытые перед развёртыванием, её
+        # токены не держат.
         last_open_at = await db.get_last_open_ts_by_instrument(
-            now - timedelta(seconds=token_pause_sec)
+            now - timedelta(seconds=token_pause_sec),
+            int(settings.LOGIC_VERSION),
         )
-    # ЗАНЯТЫЙ КАПИТАЛ. Читается из того же единственного источника, что и
-    # прежде, — списка открытых позиций.
+    # ЗАНЯТЫЙ КАПИТАЛ И ЧИСЛО ОТКРЫТЫХ ПОЗИЦИЙ. Читаются из того же
+    # единственного источника — списка открытых позиций, — а не тремя
+    # запросами: три ответа о трёх разных мгновениях базы описали бы состояние,
+    # которого не было ни в один момент.
     open_rows = await db.get_open_positions()
     committed = sum(float(row["notional_usd"]) for row in open_rows)
+    # ЧИСЛО ОТКРЫТЫХ ПОЗИЦИЙ — ЭТО СЧЁТ СТРОК, А НЕ ХРАНИМАЯ ВЕЛИЧИНА (§7.2
+    # ТЗ 9.3: таблица positions не меняется ни одним столбцом).
+    open_count = len(open_rows)
+    # СКОЛЬКО ОТКРЫТО ПО КАЖДОМУ ТОКЕНУ — для инварианта §4.1. Считается по
+    # ВСЕМ версиям логики: инвариант «один инструмент — одна позиция» говорит
+    # о занятости инструмента, а инструмент занят независимо от того, каким
+    # правилом открыта занявшая его сделка.
+    token_open: dict[int, int] = {}
+    for row in open_rows:
+        key = int(row["instrument_id"])
+        token_open[key] = token_open.get(key, 0) + 1
     # БЮДЖЕТ В РЕЖИМЕ «БЕЗ ОГРАНИЧЕНИЯ» (§3 A3 ТЗ 7). Ноль означает, что деньги
     # не ограничивают число сделок, и свободных денег БЕСКОНЕЧНО много — а не
     # «нисколько». Записано бесконечностью намеренно: вычитание из неё остаётся
@@ -517,9 +685,25 @@ async def open_new_positions(now: datetime) -> OpenedStats:
             has_frozen_target=row["target_pct"] is not None,
             free_capital_usd=free_capital,
             slot_usd=settings.POSITION_SLOT_USD,
+            open_count=open_count,
+            max_open=int(settings.POSITION_MAX_OPEN),
+            token_open_count=token_open.get(instrument_id, 0),
+            one_per_token=bool(settings.POSITION_ONE_PER_TOKEN),
         )
         if not verdict.allowed:
             stats.refuse(verdict.reason)
+            # ОТКАЗ ЗАПИСЫВАЕТСЯ ПОИМЁННО (§5.5, §7.1 ТЗ 9.3): токен, сигнал,
+            # причина, минута. Счётчик Redis отвечает «сколько», журнал
+            # контейнера — «в какой строке», а эта запись — «по какому токену
+            # и какому сигналу», и только по ней считается доля отказов
+            # token_pause среди прошедших порог (предсказание §12.2).
+            stats.rejections.append({
+                "ts_utc": now,
+                "signal_id": int(row["signal_id"]),
+                "token": str(row["symbol"]),
+                "reason": verdict.reason,
+                "logic_version": int(settings.LOGIC_VERSION),
+            })
             # ОТКАЗ ПО ПАУЗЕ ПИШЕТСЯ ПОДРОБНЕЕ ОСТАЛЬНЫХ (§4 B4 ТЗ 7): токен,
             # вероятность сигнала и СКОЛЬКО ЖДАТЬ. Без последнего числа по
             # журналу нельзя отличить «пауза только началась» от «пауза
@@ -613,6 +797,12 @@ async def open_new_positions(now: datetime) -> OpenedStats:
         # минуты. Антиспам, пропускающий пачку и придерживающий одиночек, —
         # это не антиспам.
         last_open_at[instrument_id] = opened_at
+        # ЧИСЛО ОТКРЫТЫХ РАСТЁТ В ТОЙ ЖЕ ИТЕРАЦИИ. Без этого потолок
+        # ``max_open`` пропускал бы за одну итерацию сколько угодно кандидатов:
+        # он сравнивался бы с числом, снятым до первого открытия. Ограничитель,
+        # считающий состояние минутной давности, — это не ограничитель.
+        open_count += 1
+        token_open[instrument_id] = token_open.get(instrument_id, 0) + 1
         # Свободный капитал уменьшается ровно на РАЗМЕР СЛОТА — ту же величину,
         # что ушла в notional_usd. При бюджете «без ограничения» вычитание из
         # бесконечности остаётся бесконечностью — особый случай не нужен.
@@ -628,25 +818,40 @@ async def open_new_positions(now: datetime) -> OpenedStats:
             entry_slippage_pct=round(slip, 6),
         )
         await _send(messages.opened_text(
+            position_id=position_id,
             symbol=str(row["symbol"]),
             entry_price=entry_price,
-            notional_usd=settings.POSITION_SLOT_USD,
             target_price=target_price,
             target_pct=target_pct,
-            stop_price=stop_price,
-            stop_pct=stop_pct,
-            deadline_at=deadline_at,
-            signal_id=int(row["signal_id"]),
             probability=None if row["probability"] is None
             else float(row["probability"]),
-            entry_lag_sec=lag,
-            # §8.2 ТЗ 9.2: у версии 6 предела нет, и сообщение о нём молчит.
-            plus_price=breakeven_price(
-                entry_price, settings.RISK_COST_ROUNDTRIP_PCT
-            ) if without_stop(version) else None,
-            plus_wait_hours=int(settings.POSITION_PLUS_WAIT_START_HOURS),
+            logic_version=version,
+            # §6.2 ТЗ 9.3: «без предела убытка» — это факт СТРОКИ позиции
+            # (``stop_pct is None``), а не пересказ настройки.
+            stop_pct=stop_pct,
+            hold_hours=hold_hours(version),
         ))
     return stats
+
+
+async def _record_rejections(rows: list[dict[str, Any]]) -> None:
+    """Пишет отказы итерации в public.position_rejections (§7.1 ТЗ 9.3).
+
+    ОШИБКА ЗАПИСИ НЕ РОНЯЕТ ИТЕРАЦИЮ — по той же причине, по какой её не
+    роняет недоступный Redis: сделки важнее наблюдений за отказами, и служба,
+    упавшая на журнале отказов, перестала бы ВЕСТИ открытые позиции. Но молчать
+    об этом нельзя: предупреждение с числом непроставленных строк — единственный
+    признак, по которому потом объяснится расхождение счётчика Redis с выборкой.
+    """
+    if not rows:
+        return
+    try:
+        await db.record_position_rejections(rows)
+    except Exception as exc:  # noqa: BLE001 — журнал отказов не важнее позиции
+        _log.warning(
+            "positions_rejection_write_failed=1",
+            error=str(exc), lost=len(rows),
+        )
 
 
 async def run_once(now: datetime | None = None) -> IterationStats:
@@ -655,6 +860,10 @@ async def run_once(now: datetime | None = None) -> IterationStats:
     closed = await sync_open_positions(now)
     opened = await open_new_positions(now)
     await _count_refusals(now, opened.refusals)
+    await _record_rejections(opened.rejections)
+    # Почасовая сводка придержанных сообщений — в конце итерации: сначала
+    # сделки, потом рассказ о них.
+    await _flush_trade_rollup(now)
     return IterationStats(closed=closed, opened=opened)
 
 
@@ -664,31 +873,45 @@ async def _heartbeat() -> None:
     await get_redis().set("positions:heartbeat", now_iso, ex=_HEARTBEAT_TTL)
 
 
-# ПОЛЯ СТРОКИ ЗАПУСКА, НАЗВАННЫЕ §9 ТЗ 7 ПОИМЁННО. Перечень вынесен в функцию
-# не ради красоты: §9 требует, чтобы служба печатала при старте ИМЕННО эти
-# восемь величин, и проверить это можно только тогда, когда их собирает одно
-# место, а не форматная строка внутри вечного цикла.
+# ПОЛЯ СТРОКИ ЗАПУСКА, НАЗВАННЫЕ §8 ТЗ 9.3 ПОИМЁННО. Перечень вынесен в
+# функцию не ради красоты: §8 требует, чтобы служба печатала при старте ИМЕННО
+# эти девять величин, и проверить это можно только тогда, когда их собирает
+# одно место, а не форматная строка внутри вечного цикла.
+#
+# ПЕЧАТАЮТСЯ ФАКТИЧЕСКИ ПРИМЕНЁННЫЕ ЗНАЧЕНИЯ, А НЕ УМОЛЧАНИЯ КОДА (§8 ТЗ).
+# Отсюда и обращение к ``settings`` в теле функции: константа, собранная при
+# импорте модуля, показывала бы то, что написано в коде, а не то, что стоит в
+# ``.env``, — и строка запуска, ради которой всё это и печатается, врала бы
+# ровно в тот момент, когда по ней сверяют развёртывание.
 STARTUP_FIELDS: tuple[str, ...] = (
-    "logic_version", "max_open", "token_pause_min", "budget_usd", "slot_usd",
-    "max_hold_hours", "plus_wait_start_hours", "min_probability",
+    "logic_version", "max_open", "slot_usd", "budget_usd",
+    "min_probability", "max_hold_hours", "plus_wait_start_hours",
+    "cooldown_sec", "one_per_token",
 )
 
 
 def startup_fields() -> dict[str, Any]:
-    """Величины, которые служба позиций называет в журнале при старте (§9 ТЗ 7).
+    """Величины, которые служба позиций называет в журнале при старте (§8 ТЗ 9.3).
 
     ТРИ ЧИСЛА РЯДОМ НАМЕРЕННО: горизонт СИГНАЛА, срок жизни ПОЗИЦИИ и отметка
     начала ожидания плюса — разные величины, и в журнале запуска они обязаны
     быть видны все три, иначе первая же правка одного из них будет истолкована
     как правка другого.
 
-    ``max_open=0`` И ``budget_usd=0`` ЗДЕСЬ ЧИТАЮТСЯ КАК «БЕЗ ОГРАНИЧЕНИЯ», а
-    не как «ноль позиций» и «нет денег» (§3 A1, A3 ТЗ 7).
+    ``max_open=0`` И ``budget_usd=0`` ЗДЕСЬ ЧИТАЮТСЯ КАК «ОГРАНИЧЕНИЕ НЕ
+    ПРИМЕНЯЕТСЯ», а не как «ноль позиций» и «нет денег» (§3 ТЗ 9.3).
+
+    ``cooldown_sec`` — ПАУЗА В СЕКУНДАХ, ХОТЯ НАСТРОЙКА ЗАДАНА В МИНУТАХ.
+    Имя и единица взяты из §8 ТЗ, значение — пересчётом из существующей
+    настройки ``POSITION_TOKEN_PAUSE_MIN``. Второй настройки для той же
+    величины при этом не заводится (§3 ТЗ прямо это запрещает, и в проекте
+    такой дефект уже случался: ``NOTIFY_THRESHOLD`` / ``NOTIFY_MIN_PROBABILITY``).
     """
     return {
         "logic_version": int(settings.LOGIC_VERSION),
         "max_open": int(settings.POSITION_MAX_OPEN),
-        "token_pause_min": int(settings.POSITION_TOKEN_PAUSE_MIN),
+        "cooldown_sec": int(settings.POSITION_TOKEN_PAUSE_MIN) * 60,
+        "one_per_token": bool(settings.POSITION_ONE_PER_TOKEN),
         "budget_usd": float(settings.POSITION_BUDGET_USD),
         "slot_usd": float(settings.POSITION_SLOT_USD),
         "max_hold_hours": int(settings.POSITION_MAX_HOLD_HOURS),
@@ -701,25 +924,42 @@ def startup_fields() -> dict[str, Any]:
     }
 
 
-def _warn_about_settings_that_do_nothing() -> None:
-    """Говорит вслух о настройках, которые больше ни на что не влияют (§3 A1).
+def _warn_about_limits_that_are_on() -> None:
+    """Говорит вслух об ограничителях ЧИСЛА, если они включены (§3, §4 ТЗ 9.3).
 
-    ``POSITION_MAX_OPEN`` остался в настройках — его печатает строка запуска, и
-    удалённый ключ уронил бы ``.env`` при откате, — но проверки по нему в коде
-    больше нет ни одной. Ненулевое значение поэтому НЕ ограничивает ничего, и
-    молчать об этом нельзя: человек, поставивший «3», обязан узнать, что число
-    не работает, от службы, а не по расхождению журнала с ожиданием через
-    неделю.
+    БОЕВАЯ НАСТРОЙКА ЭТАПА — ОБА ВЫКЛЮЧЕНЫ, и ровно на этом стоит весь замер:
+    §12.1 ТЗ предсказывает 15–60 сделок в сутки вместо нынешних 2,75, а
+    §13.2 требует назвать числом максимум одновременно открытых позиций.
+    Включённый потолок или возвращённый инвариант делают эти числа
+    бессмысленными — и узнать об этом владелец обязан из строки запуска, а не
+    через неделю по расхождению предсказания с фактом.
+
+    ЭТО ПРЕДУПРЕЖДЕНИЕ, А НЕ ОТКАЗ. Оба выключателя оставлены в коде именно
+    затем, чтобы ими пользоваться (§3 ТЗ: «возврат должен быть правкой одной
+    строки в .env»); служба, отказавшаяся стартовать с включённым потолком,
+    отняла бы у владельца тормоз, ради которого проверки и сохранены.
     """
-    if int(settings.POSITION_MAX_OPEN) != 0:
+    if int(settings.POSITION_MAX_OPEN) > 0:
         _log.warning(
-            "positions_setting_ignored=1",
+            "positions_limit_enabled=1",
             setting="POSITION_MAX_OPEN",
             value=int(settings.POSITION_MAX_OPEN),
             reason=(
-                "с версии 7 число одновременно открытых позиций не "
-                "ограничивается; ограничивается частота — "
-                "POSITION_TOKEN_PAUSE_MIN"
+                "потолок числа одновременно открытых позиций ВКЛЮЧЁН; боевая "
+                "настройка этапа 9.3 — 0, «ограничение не применяется». "
+                "Отказы max_open перестанут быть нулевыми, и замер потолка "
+                "торговли не состоится"
+            ),
+        )
+    if bool(settings.POSITION_ONE_PER_TOKEN):
+        _log.warning(
+            "positions_limit_enabled=1",
+            setting="POSITION_ONE_PER_TOKEN",
+            value=True,
+            reason=(
+                "инвариант «один инструмент — одна позиция» ВКЛЮЧЁН; боевая "
+                "настройка этапа 9.3 — false. Вторых одновременных позиций по "
+                "токену не будет, и предсказание §12.5 проверить будет нечем"
             ),
         )
 
@@ -727,10 +967,10 @@ def _warn_about_settings_that_do_nothing() -> None:
 async def run() -> None:
     """Вечный цикл. Не падает ни при каких ошибках итерации."""
     _log.info(
-        "Сервис ведения позиций запущен (версия логики 7, позиции ВИРТУАЛЬНЫЕ)",
+        "Сервис ведения позиций запущен (позиции ВИРТУАЛЬНЫЕ)",
         **startup_fields(),
     )
-    _warn_about_settings_that_do_nothing()
+    _warn_about_limits_that_are_on()
     while True:
         try:
             stats = await run_once()

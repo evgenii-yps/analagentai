@@ -32,10 +32,7 @@ import src.positions.rules as rules
 import src.positions.runner as positions_runner
 from src.bot import handlers
 from src.core.config import Settings, settings
-from src.notify.agent import (
-    SIGNAL_NOTIFY_MAX_LOGIC_VERSION,
-    signal_notifications_enabled,
-)
+from src.notify.agent import signal_notifications_enabled
 from src.positions.rules import (
     REASON_NO_FREE_CAPITAL,
     REASON_OK,
@@ -108,40 +105,85 @@ def test_the_data_of_version_six_stays_comparable_because_the_slot_is_untouched(
 # =============================================================================
 
 def test_zero_max_open_means_no_limit_and_not_zero_positions() -> None:
-    """§3 A1 ТЗ: 0 — это «без ограничения», а НЕ «ноль позиций».
+    """0 — это «ограничение не применяется», а НЕ «ноль позиций» (§3 ТЗ 9.3).
 
-    ЭТО ТА САМАЯ ОШИБКА, КОТОРУЮ ТЗ ТРЕБУЕТ ЗАКРЕПИТЬ ТЕСТОМ. Поставь в .env
-    ноль, оставив в коде прежнюю проверку ``open_count >= max_open``, — и
-    отказано будет КАЖДОМУ кандидату, при совершенно честном виде журнала:
-    «отказов по слотам столько же, сколько кандидатов». Причину искали бы в
-    рынке.
+    ЭТО ТА САМАЯ ОШИБКА, КОТОРУЮ ТЗ ТРЕБУЕТ ЗАКРЕПИТЬ ТЕСТОМ (§11.1 —
+    намеренная поломка ровно на ней). Поставь в ``.env`` ноль, прочитай его как
+    «ноль позиций» — и отказано будет КАЖДОМУ кандидату, при совершенно честном
+    виде журнала: «отказов max_open столько же, сколько кандидатов». Причину
+    искали бы в рынке.
 
-    ЗАКРЕПЛЯЕТСЯ ОТСУТСТВИЕМ ПРОВЕРКИ, А НЕ ЕЁ МЯГКОСТЬЮ (§3 A4 ТЗ): у правила
-    не осталось ни параметра ``max_open``, ни причины отказа ``slots_full``.
-    Ветка, которая никогда не срабатывает, однажды снова начнёт срабатывать от
-    чужой правки — и объяснить, почему сделок стало вдвое меньше, будет нечем.
+    ЭТАП 9.3 ОТМЕНИЛ РЕШЕНИЕ ЭТАПА 7. Тот вырезал проверку целиком — здесь
+    стояло ``assert "max_open" not in rules_text``. §3 ТЗ 9.3 требует
+    обратного: проверка остаётся и обходится при нуле, потому что возврат
+    ограничения обязан быть правкой одной строки в ``.env``, а не откатом
+    ветки. Ограждение от вырезанного риска — не отсутствие ветки, а этот тест
+    и опыт §10.1.
     """
     assert Settings(POSTGRES_PASSWORD="x").POSITION_MAX_OPEN == 0
-    assert "slots_full" not in REFUSAL_REASONS
-    assert not hasattr(rules, "REASON_SLOTS_FULL")
-    rules_text = (_ROOT / "src" / "positions" / "rules.py").read_text(
-        encoding="utf-8"
-    )
-    # Имя настройки в чистом модуле правил не упоминается вовсе — ни в коде,
-    # ни в сигнатуре: это и есть «проверки нет», а не «проверка проходит».
-    assert "max_open" not in rules_text.replace("max_open``", "")
-    assert "max_open" not in should_open.__code__.co_varnames
+    assert rules.REASON_MAX_OPEN in REFUSAL_REASONS
+
+    # ПРОВЕРКА ЕСТЬ: при ненулевом потолке она срабатывает…
+    assert should_open(
+        **_open_kwargs(open_count=5, max_open=5)
+    ).reason == rules.REASON_MAX_OPEN
+    # …и не срабатывает, пока места есть.
+    assert should_open(**_open_kwargs(open_count=4, max_open=5)).allowed
+
+    # ПРИ НУЛЕ НЕДОСТИЖИМА, сколько бы позиций ни было открыто. Тысяча —
+    # число заведомо большее любого мыслимого потока: если ноль когда-нибудь
+    # прочитают как «ноль позиций», этот случай упадёт первым.
+    for open_count in (0, 1, 20, 1000):
+        verdict = should_open(**_open_kwargs(open_count=open_count, max_open=0))
+        assert verdict.allowed, open_count
+        assert verdict.reason == REASON_OK
+
+    # ОТРИЦАТЕЛЬНОЕ ЗНАЧЕНИЕ НЕ ПРОХОДИТ ВОВСЕ: оно читалось бы проверкой как
+    # «отказать всем», а настройкой выглядело бы заданным.
+    with pytest.raises(ValueError, match="не может быть отрицательным"):
+        Settings(POSTGRES_PASSWORD="x", POSITION_MAX_OPEN=-1)
 
 
-def test_a_nonzero_max_open_is_reported_and_not_silently_ignored(
+def test_the_one_per_token_invariant_is_a_switch_and_it_is_off() -> None:
+    """§4.1, §10.4 ТЗ 9.3: инвариант снят, но включается одной строкой .env.
+
+    БОЕВАЯ НАСТРОЙКА — ``false``: по одному токену допускается сколько угодно
+    одновременных позиций, и без этого §12.5 («не меньше 20% сделок — вторые и
+    последующие по занятому токену») проверить было бы нечем.
+
+    ``true`` — контроль опыта §10.4, который ОБЯЗАН упасть: вторая позиция по
+    занятому токену не открывается.
+    """
+    assert Settings(POSTGRES_PASSWORD="x").POSITION_ONE_PER_TOKEN is False
+    assert rules.REASON_INSTRUMENT_BUSY in REFUSAL_REASONS
+
+    # Выключен — занятость токена не мешает.
+    assert should_open(
+        **_open_kwargs(token_open_count=3, one_per_token=False)
+    ).allowed
+    # Включён — мешает с первой же открытой позиции по этому токену.
+    assert should_open(
+        **_open_kwargs(token_open_count=1, one_per_token=True)
+    ).reason == rules.REASON_INSTRUMENT_BUSY
+    # …и не мешает, когда по токену открытых нет.
+    assert should_open(
+        **_open_kwargs(token_open_count=0, one_per_token=True)
+    ).allowed
+
+
+def test_a_limit_that_is_switched_on_is_reported_and_not_silently_applied(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Настройка, которая больше ни на что не влияет, названа вслух.
+    """Включённый ограничитель числа сделок назван вслух (§3, §12 ТЗ 9.3).
 
-    ``POSITION_MAX_OPEN`` остался в настройках: его печатает строка запуска
-    (§9 ТЗ), и удалённый ключ уронил бы ``.env`` при откате. Но человек,
-    поставивший туда «3», обязан узнать, что число не работает, — от службы и
-    сразу, а не по расхождению журнала с ожиданием через неделю.
+    Боевая настройка этапа — оба выключены, и на этом стоит весь замер: §12.1
+    предсказывает 15–60 сделок в сутки, §12.5 — долю вторых позиций по токену.
+    Включённый потолок делает оба числа бессмысленными, и узнать об этом
+    владелец обязан из строки запуска, а не через неделю по расхождению
+    предсказания с фактом.
+
+    ЭТО ПРЕДУПРЕЖДЕНИЕ, А НЕ ОТКАЗ: выключатели оставлены затем, чтобы ими
+    пользоваться.
     """
     said: list[dict[str, Any]] = []
     monkeypatch.setattr(
@@ -149,15 +191,22 @@ def test_a_nonzero_max_open_is_reported_and_not_silently_ignored(
         lambda event, **kw: said.append({"event": event, **kw}),
     )
     monkeypatch.setattr(settings, "POSITION_MAX_OPEN", 3)
-    positions_runner._warn_about_settings_that_do_nothing()
-    assert said and said[0]["setting"] == "POSITION_MAX_OPEN"
+    monkeypatch.setattr(settings, "POSITION_ONE_PER_TOKEN", False)
+    positions_runner._warn_about_limits_that_are_on()
+    assert [item["setting"] for item in said] == ["POSITION_MAX_OPEN"]
     assert said[0]["value"] == 3
 
-    # При нуле служба молчит: предупреждение о правильной настройке приучает не
-    # читать предупреждения вовсе.
     said.clear()
     monkeypatch.setattr(settings, "POSITION_MAX_OPEN", 0)
-    positions_runner._warn_about_settings_that_do_nothing()
+    monkeypatch.setattr(settings, "POSITION_ONE_PER_TOKEN", True)
+    positions_runner._warn_about_limits_that_are_on()
+    assert [item["setting"] for item in said] == ["POSITION_ONE_PER_TOKEN"]
+
+    # При боевых настройках служба молчит: предупреждение о правильной
+    # настройке приучает не читать предупреждения вовсе.
+    said.clear()
+    monkeypatch.setattr(settings, "POSITION_ONE_PER_TOKEN", False)
+    positions_runner._warn_about_limits_that_are_on()
     assert said == []
 
 
@@ -332,6 +381,10 @@ def test_every_refusal_reason_is_reachable_and_named_in_the_bot() -> None:
         dict(has_frozen_target=False),
         dict(bar_age_sec=None),
         dict(free_capital_usd=0.0),
+        # Ограничители ЧИСЛА сделок (§3, §4.1 ТЗ 9.3): при боевых настройках
+        # недостижимы, но проверки живы и включаются одной строкой в .env.
+        dict(open_count=5, max_open=5),
+        dict(token_open_count=1, one_per_token=True),
     ]
     seen = {should_open(**_open_kwargs(**case)).reason for case in broken}
     assert seen == set(REFUSAL_REASONS)
@@ -388,11 +441,14 @@ class _FakeDB:
         self.last_open = last_open or {}
         self.opened: list[dict[str, Any]] = []
         self.since_asked: datetime | None = None
+        self.version_asked: int | None = None
+        self.rejections: list[dict[str, Any]] = []
 
     async def get_last_open_ts_by_instrument(
-        self, since: datetime
+        self, since: datetime, logic_version: int
     ) -> dict[int, datetime]:
         self.since_asked = since
+        self.version_asked = int(logic_version)
         return {
             key: value for key, value in self.last_open.items() if value >= since
         }
@@ -413,6 +469,12 @@ class _FakeDB:
     async def open_position(self, row: dict[str, Any]) -> int:
         self.opened.append(row)
         return len(self.opened)
+
+    async def record_position_rejections(
+        self, rows: list[dict[str, Any]]
+    ) -> int:
+        self.rejections.extend(rows)
+        return len(rows)
 
 
 async def _run_open(
@@ -638,18 +700,28 @@ def test_the_refusal_counter_key_carries_the_new_reason() -> None:
 # §5 ТЗ. Уведомления только по сделкам
 # =============================================================================
 
-def test_signal_notifications_stop_at_version_seven() -> None:
-    """§5 C1 ТЗ: сообщения о сигналах прекращаются полностью.
+def test_signal_notifications_are_off_and_it_is_a_flag_now(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """§6.1 ТЗ 9.3: сообщения о сигналах выключены ФЛАГОМ, а не версией логики.
 
-    ГРАНИЦА ЗАПИСАНА ВЕРСИЕЙ ЛОГИКИ, А НЕ ОТДЕЛЬНЫМ ВЫКЛЮЧАТЕЛЕМ: откат (§10
-    ТЗ) состоит из возврата .env и LOGIC_VERSION=6, и сигнальные уведомления
-    обязаны вернуться вместе с ним, не требуя правки кода.
+    ЭТАП 9.3 ОТМЕНИЛ РЕШЕНИЕ ЭТАПА 7. Тот держал границу константой
+    ``SIGNAL_NOTIFY_MAX_LOGIC_VERSION = 6``, рассуждая так: откат состоит из
+    возврата ``LOGIC_VERSION=6``, и сигнальные уведомления обязаны вернуться
+    вместе с ним. §6.1 ТЗ 9.3 требует обратного, и правильно: версия логики —
+    граница ВЫБОРКИ, а не выключатель потока сообщений. Связанные, они не дают
+    ни вернуть сигнальные уведомления, не обнулив выборку сделок, ни поднять
+    версию, не вернув сорок сообщений в час.
     """
-    assert SIGNAL_NOTIFY_MAX_LOGIC_VERSION == 6
-    assert signal_notifications_enabled(5)
-    assert signal_notifications_enabled(6)
-    assert not signal_notifications_enabled(7)
-    assert not signal_notifications_enabled(settings.LOGIC_VERSION)
+    assert Settings(POSTGRES_PASSWORD="x").NOTIFY_SIGNALS_ENABLED is False
+    assert not signal_notifications_enabled()
+    monkeypatch.setattr(settings, "NOTIFY_SIGNALS_ENABLED", True)
+    assert signal_notifications_enabled()
+    # И версия логики на это больше не влияет ничем: при флаге ``true``
+    # сигнальные уведомления уходят при любой версии.
+    monkeypatch.setattr(settings, "LOGIC_VERSION", 7)
+    assert signal_notifications_enabled()
+    assert not hasattr(notify_agent, "SIGNAL_NOTIFY_MAX_LOGIC_VERSION")
 
 
 async def test_not_a_single_signal_message_leaves_the_service(
@@ -905,18 +977,24 @@ def test_the_trade_journal_takes_every_version_and_deletes_nothing() -> None:
 # =============================================================================
 
 def test_the_startup_line_names_every_value_the_spec_lists() -> None:
-    """§9 ТЗ: служба печатает при старте ровно эти восемь величин.
+    """§8 ТЗ 9.3: служба печатает при старте ровно эти девять величин.
 
     Строка запуска — единственное место, где владелец видит, С ЧЕМ служба
-    поднялась, не заходя в .env. Пропусти в ней ``token_pause_min`` — и
-    отличить «пауза час» от «пауза выключена» можно было бы только по
-    отсутствию отказов, то есть постфактум и по косвенному признаку.
+    поднялась, не заходя в .env. Пропусти в ней ``cooldown_sec`` — и отличить
+    «пауза час» от «пауза выключена» можно было бы только по отсутствию
+    отказов, то есть постфактум и по косвенному признаку.
+
+    ЕДИНИЦА ПАУЗЫ В СТРОКЕ — СЕКУНДЫ, КАК ТРЕБУЕТ §8, хотя настройка задана в
+    минутах (``POSITION_TOKEN_PAUSE_MIN``, имя существует с этапа 7). Второй
+    настройки для той же величины при этом не заведено — §3 ТЗ это прямо
+    запрещает.
     """
     fields = startup_fields()
     assert set(STARTUP_FIELDS) <= set(fields)
     assert fields["logic_version"] == 7
     assert fields["max_open"] == 0
-    assert fields["token_pause_min"] == 60
+    assert fields["cooldown_sec"] == 3600
+    assert fields["one_per_token"] is False
     assert fields["budget_usd"] == 0.0
     assert fields["slot_usd"] == 2.0
     assert fields["max_hold_hours"] == 48
