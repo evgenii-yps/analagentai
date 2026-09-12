@@ -573,6 +573,18 @@ async def open_new_positions(now: datetime) -> OpenedStats:
     # запроса не делается вовсе: спрашивать базу о величине, которая ни на что
     # не влияет, значит тратить время на ответ, который будет отброшен.
     token_pause_sec = float(settings.POSITION_TOKEN_PAUSE_MIN) * 60.0
+    # ГРАНИЦА «ПОСЛЕДНЕГО ЗАВЕДОМО ЗАКРЫТОГО БАРА» нужна дважды: по ней
+    # выбирается бар входа и по ней же считается окно паузы. Считается один
+    # раз: два вызова в одной итерации дали бы две разные границы, разойдись
+    # часы между ними.
+    settle_edge = last_closed_bar_open_ts(now)
+    # САМЫЙ ПОЗДНИЙ МОМЕНТ, В КОТОРЫЙ КАНДИДАТ ЭТОЙ ИТЕРАЦИИ МОЖЕТ ВОЙТИ.
+    # Позиция открывается по ЗАКРЫТИЮ бара входа, а бар входа не новее
+    # ``settle_edge``; значит вход не позже ``settle_edge + минута``. Окно
+    # паузы отсчитывается ОТ ЭТОГО момента, а не от «сейчас», — по той же
+    # причине, по которой от него же считается возраст последнего открытия
+    # ниже: иначе окно отбрасывало бы позицию, которая паузу ещё держит.
+    latest_entry = settle_edge + timedelta(seconds=60)
     last_open_at: dict[int, datetime] = {}
     if token_pause_sec > 0:
         # ОКНО ПАУЗЫ — СКОЛЬЗЯЩЕЕ, ОТ МЕТКИ ВРЕМЕНИ (§5.2 ТЗ 9.3), а не от
@@ -584,7 +596,7 @@ async def open_new_positions(now: datetime) -> OpenedStats:
         # версии 7, и позиции версии 6, открытые перед развёртыванием, её
         # токены не держат.
         last_open_at = await db.get_last_open_ts_by_instrument(
-            now - timedelta(seconds=token_pause_sec),
+            latest_entry - timedelta(seconds=token_pause_sec),
             int(settings.LOGIC_VERSION),
         )
     # ЗАНЯТЫЙ КАПИТАЛ И ЧИСЛО ОТКРЫТЫХ ПОЗИЦИЙ. Читаются из того же
@@ -624,7 +636,6 @@ async def open_new_positions(now: datetime) -> OpenedStats:
         now=now,
     )
     stats.candidates = len(candidates)
-    settle_edge = last_closed_bar_open_ts(now)
 
     for row in candidates:
         instrument_id = int(row["instrument_id"])
@@ -664,9 +675,28 @@ async def open_new_positions(now: datetime) -> OpenedStats:
 
         # ВОЗРАСТ ПОСЛЕДНЕГО ОТКРЫТИЯ ПО ЭТОМУ ТОКЕНУ. ``None`` означает «по
         # токену не открывались в пределах паузы» — то есть пауза не держит.
+        #
+        # ВОЗРАСТ СЧИТАЕТСЯ ДО МОМЕНТА ПРЕДПОЛАГАЕМОГО ВХОДА, А НЕ ДО «СЕЙЧАС»,
+        # и это не придирка. Позиция открывается по ЗАКРЫТИЮ бара входа, и
+        # ``opened_at`` в базе — именно эта метка, на 60 + POSITION_SETTLE_SEC
+        # секунд младше «сейчас». Считай мы до «сейчас» — пауза сравнивала бы
+        # одну шкалу времени с другой, и расстояние между двумя СОСЕДНИМИ
+        # ``opened_at`` систематически выходило бы на полторы минуты короче
+        # настройки: при часовой паузе входы по одному токену случались бы раз
+        # в 58,5 минуты. Смещение маленькое, постоянное и невидимое — ровно
+        # такое, какое не обнаруживает никто.
+        #
+        # ТО ЖЕ ЧИСЛО ЧИТАЕТСЯ ОБРАТНО (§5.3: ``MAX(opened_at)``), так что
+        # измеряется и хранится одна и та же величина.
+        #
+        # БАРА МОЖЕТ НЕ БЫТЬ ВОВСЕ — тогда момент входа неизвестен, и берётся
+        # «сейчас». Такой кандидат всё равно получит отказ ``no_fresh_bar``;
+        # выдумывать ему момент входа незачем.
+        entry_at = bar_close if bar_close is not None else now
         last_open = last_open_at.get(instrument_id)
         last_open_age_sec = (
-            None if last_open is None else (now - last_open).total_seconds()
+            None if last_open is None
+            else (entry_at - last_open).total_seconds()
         )
         verdict = should_open(
             decision=str(row["decision"]),

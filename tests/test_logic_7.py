@@ -540,7 +540,16 @@ async def test_the_stand_reproduces_the_three_cases_of_the_spec(
     """
     # Случай 1 и 2 сразу: по одному токену пришли два кандидата, а час назад по
     # нему уже входили и позиция ещё открыта.
-    opened_an_hour_ago = _NOW - timedelta(hours=1)
+    #
+    # ЧАС ОТСЧИТЫВАЕТСЯ ДО МОМЕНТА ВХОДА, А НЕ ДО «СЕЙЧАС» (этап 9.3 §5.1, и
+    # это уточнение поведения относительно этапа 7). Позиция открывается по
+    # ЗАКРЫТИЮ бара входа, то есть на 60 + POSITION_SETTLE_SEC секунд раньше
+    # «сейчас», и ``opened_at`` в базе — именно эта метка. Считай служба до
+    # «сейчас» — расстояние между двумя соседними ``opened_at`` выходило бы на
+    # полторы минуты короче настройки, постоянно и незаметно. Поэтому прошлый
+    # вход отодвинут на те же полторы минуты: час до МОМЕНТА ВХОДА нового
+    # кандидата, а не до конца итерации.
+    opened_an_hour_ago = _NOW - timedelta(hours=1, seconds=90)
     fake = _FakeDB(
         candidates=[
             _candidate(1, "BTC/USDT", 1001),
@@ -560,7 +569,7 @@ async def test_the_stand_reproduces_the_three_cases_of_the_spec(
 
     # Случай 3: та же картина спустя 60 минут после последнего открытия — вход
     # снова разрешён, и это тот же кандидат, что минуту назад получал отказ.
-    later = _NOW + timedelta(hours=1)
+    later = _NOW + timedelta(hours=1, seconds=90)
     fake_later = _FakeDB(
         candidates=[dict(_candidate(1, "BTC/USDT", 1002), age_sec=100.0,
                          signal_ts=later - timedelta(seconds=100))],
@@ -640,10 +649,16 @@ async def test_the_service_asks_the_database_only_for_the_pause_window(
     Позиции старше паузы на ответ не влияют, и тянуть их значило бы читать всю
     таблицу ради пяти чисел. А при выключенной паузе спрашивать базу не о чем:
     ответ был бы отброшен целиком.
+
+    ГРАНИЦА ОТСЧИТЫВАЕТСЯ ОТ САМОГО ПОЗДНЕГО ВОЗМОЖНОГО МОМЕНТА ВХОДА, А НЕ ОТ
+    «СЕЙЧАС» (этап 9.3 §5.1). Вход случается по закрытию бара входа, то есть
+    не позже чем ``сейчас − POSITION_SETTLE_SEC``; окно, отсчитанное от
+    «сейчас», отбрасывало бы позицию, которая паузу ещё держит, — и пауза
+    выходила бы короче настройки на те же полторы минуты.
     """
     fake = _FakeDB(candidates=[_candidate(1, "BTC/USDT", 4001)])
     await _run_open(monkeypatch, fake, token_pause_min=60)
-    assert fake.since_asked == _NOW - timedelta(hours=1)
+    assert fake.since_asked == _NOW - timedelta(hours=1, seconds=90)
 
     quiet = _FakeDB(candidates=[_candidate(1, "BTC/USDT", 4002)])
     await _run_open(monkeypatch, quiet, token_pause_min=0)
@@ -667,7 +682,7 @@ async def test_the_refusal_log_names_the_token_probability_and_time_left(
     )
     fake = _FakeDB(
         candidates=[_candidate(1, "BTC/USDT", 5001, probability=0.93)],
-        last_open={1: _NOW - timedelta(minutes=50)},
+        last_open={1: _NOW - timedelta(minutes=50, seconds=90)},
     )
     await _run_open(monkeypatch, fake)
     skipped = [row for row in written if row["event"] == "positions_skipped=1"]
@@ -676,7 +691,10 @@ async def test_the_refusal_log_names_the_token_probability_and_time_left(
     assert line["reason"] == REASON_TOKEN_PAUSE
     assert line["symbol"] == "BTC/USDT"
     assert line["probability"] == pytest.approx(0.93)
-    # Десять минут до конца часовой паузы — с точностью до секунды.
+    # Десять минут до конца часовой паузы — с точностью до секунды. Прошлый
+    # вход отодвинут на 90 секунд ровно потому, что остаток считается до
+    # МОМЕНТА ВХОДА нового кандидата (этап 9.3 §5.1), а он на столько же
+    # младше «сейчас».
     assert line["pause_left_sec"] == 600
 
 
