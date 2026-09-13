@@ -1300,6 +1300,189 @@ class DB:
 
     # --- Ведение одной позиции, ВИРТУАЛЬНО (Этап 9.1) ---
 
+    async def positions_daily_summary(
+        self, since: datetime, until: datetime, logic_version: int
+    ) -> dict[str, Any]:
+        """Числа суточной сводки по сделкам (§6.2 ТЗ 9.3, сообщение 3).
+
+        ОДИН ЗАПРОС НА ВСЮ СВОДКУ. Четыре запроса вместо одного означали бы
+        четыре разных мгновения базы в одном сообщении: сделка, закрывшаяся
+        между ними, попала бы в «закрыто» и не попала бы в итог.
+
+        СУТКИ СЧИТАЮТСЯ ПО UTC И ПОЛУОТКРЫТЫМ ОКНОМ ``[since, until)``.
+        Местное время дало бы сводку, чья длина дважды в год не равна суткам
+        (§11.11 ТЗ — намеренная поломка ровно на этом).
+
+        ЗАКРЫТИЯ ПО ПРОБЕЛУ В ДАННЫХ СЧИТАЮТСЯ ОТДЕЛЬНО и в итог, долю
+        прибыльных, лучшую и худшую НЕ ВХОДЯТ. У них цена выхода не
+        наблюдалась, а восстановлена: их «итог» описывает не рынок, а сбой
+        сбора данных. Само их число при этом называется — по нему видно
+        состояние коллектора, и прятать его нельзя. Это то же правило, по
+        которому живут ``bot.queries.positions_summary`` и хостовая сводка.
+
+        ОТКРЫТЫЕ СДЕЛКИ В ЧИСЛО ЗАКРЫТЫХ НЕ ПОПАДАЮТ (§11.10 — намеренная
+        поломка на этом): условие ``status = 'closed'`` и окно по ``closed_at``,
+        а не по ``opened_at``.
+        """
+        row = await self.pool.fetchrow(
+            """
+            WITH win AS (
+                SELECT * FROM positions
+                WHERE logic_version = $3
+                  AND status = 'closed'
+                  AND closed_at >= $1 AND closed_at < $2
+            ),
+            measured AS (SELECT * FROM win WHERE exit_reason <> 'data_gap'),
+            total AS (
+                SELECT * FROM positions
+                WHERE logic_version = $3
+                  AND status = 'closed'
+                  AND exit_reason <> 'data_gap'
+            )
+            SELECT
+              (SELECT count(*) FROM positions
+                 WHERE logic_version = $3
+                   AND opened_at >= $1 AND opened_at < $2)      AS opened,
+              (SELECT count(*) FROM win)                        AS closed,
+              (SELECT count(*) FROM win) - (SELECT count(*) FROM measured)
+                                                                AS data_gaps,
+              (SELECT count(*) FROM positions
+                 WHERE logic_version = $3 AND status = 'open')  AS open_now,
+              (SELECT count(*) FROM measured)                   AS measured,
+              (SELECT count(*) FROM measured WHERE net_pnl_usd > 0)
+                                                                AS winners,
+              (SELECT coalesce(sum(net_pnl_usd), 0) FROM measured) AS pnl_usd,
+              (SELECT coalesce(sum(net_pnl_pct), 0) FROM measured) AS pnl_pct,
+              (SELECT max(net_pnl_pct) FROM measured)           AS best_pct,
+              (SELECT min(net_pnl_pct) FROM measured)           AS worst_pct,
+              (SELECT avg(EXTRACT(EPOCH FROM (closed_at - opened_at)))
+                 FROM measured)                                 AS avg_hold_sec,
+              (SELECT count(*) FROM total)                      AS total_trades,
+              (SELECT count(*) FROM total WHERE net_pnl_usd > 0)
+                                                                AS total_winners,
+              (SELECT coalesce(sum(net_pnl_usd), 0) FROM total) AS total_pnl_usd;
+            """,
+            since, until, int(logic_version),
+        )
+        return {} if row is None else dict(row)
+
+    async def ensure_position_rejections_schema(self) -> None:
+        """Идемпотентно создаёт журнал отказов во входе (миграция 028, §7.1).
+
+        ЗОВЁТСЯ ПРИ КАЖДОМ СТАРТЕ СЛУЖБЫ ПОЗИЦИЙ — по той же причине, по какой
+        зовётся :meth:`ensure_positions_schema`: порядок «сначала миграция,
+        потом образ» соблюсти удаётся не всегда, а служба без таблицы обязана
+        вести сделки, а не падать.
+
+        ОГРАНИЧЕНИЕ ПРИВОДИТСЯ К ТЕКУЩЕМУ ПЕРЕЧНЮ ПРИЧИН, а не создаётся один
+        раз и забывается. На томе, где таблица уже есть со СТАРЫМ списком,
+        ``CREATE TABLE IF NOT EXISTS`` не сделал бы ничего, новая причина
+        падала бы на ограничении, служба записала бы предупреждение — и отказы
+        этой причины тихо перестали бы попадать в выборку. Тот же приём и по
+        той же причине применён к ``positions_reason_chk`` (миграция 019).
+        """
+        from src.positions.rules import REFUSAL_REASONS
+
+        reasons = ", ".join(f"'{reason}'" for reason in REFUSAL_REASONS)
+        await self.pool.execute(POSITION_REJECTIONS_DDL.format(reasons=reasons))
+        await self.pool.execute(
+            f"""
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname = 'position_rejections_reason_chk'
+                      AND pg_get_constraintdef(oid) NOT LIKE
+                          '%{REFUSAL_REASONS[-1]}%'
+                ) THEN
+                    ALTER TABLE public.position_rejections
+                        DROP CONSTRAINT position_rejections_reason_chk;
+                    ALTER TABLE public.position_rejections
+                        ADD CONSTRAINT position_rejections_reason_chk
+                        CHECK (reason IN ({reasons}));
+                END IF;
+            END $$;
+            """
+        )
+        await self.pool.execute(
+            "CREATE INDEX IF NOT EXISTS position_rejections_ts_idx "
+            "ON public.position_rejections (ts_utc);"
+        )
+        await self.pool.execute(
+            "CREATE INDEX IF NOT EXISTS position_rejections_reason_idx "
+            "ON public.position_rejections (reason, logic_version);"
+        )
+
+    async def record_position_rejections(
+        self, rows: list[dict[str, Any]]
+    ) -> int:
+        """Пишет отказы во входе ОДНОЙ пачкой (§5.5, §7.1 ТЗ 9.3).
+
+        Пачкой, а не строкой на отказ: отказов за итерацию бывает столько же,
+        сколько кандидатов, и пять вставок ради пяти строк — это пять сетевых
+        задержек там, где хватает одной.
+
+        ВОЗВРАЩАЕТ ЧИСЛО ЗАПИСАННЫХ СТРОК. Вызывающий по нему не сверяется —
+        число нужно журналу службы: «отказов 12, записано 12» и «отказов 12,
+        записано 0» это разные состояния системы, и различать их обязан тот,
+        кто читает журнал, а не тот, кто потом недосчитается строк в выборке.
+        """
+        if not rows:
+            return 0
+        await self.pool.executemany(
+            """
+            INSERT INTO public.position_rejections
+                (ts_utc, signal_id, token, reason, logic_version)
+            VALUES ($1, $2, $3, $4, $5);
+            """,
+            [
+                (
+                    row["ts_utc"], int(row["signal_id"]), str(row["token"]),
+                    str(row["reason"]), int(row["logic_version"]),
+                )
+                for row in rows
+            ],
+        )
+        return len(rows)
+
+    async def count_position_rejections(
+        self, since: datetime, until: datetime, logic_version: int
+    ) -> dict[str, int]:
+        """Отказы за окно, по причинам (§6.2 ТЗ: строка отказов в сводке).
+
+        ОКНО ПОЛУОТКРЫТОЕ ``[since, until)``. Закрытое с обеих сторон окно
+        посчитало бы отказ, случившийся ровно в границу, ДВАЖДЫ — в сводке за
+        эти сутки и в сводке за следующие; при суточной сводке это ошибка на
+        единицу, которую никто никогда не заметит и которая тем не менее делает
+        сумму суточных чисел не равной итогу.
+        """
+        rows = await self.pool.fetch(
+            """
+            SELECT reason, count(*) AS n
+            FROM public.position_rejections
+            WHERE ts_utc >= $1 AND ts_utc < $2 AND logic_version = $3
+            GROUP BY reason;
+            """,
+            since, until, int(logic_version),
+        )
+        return {str(r["reason"]): int(r["n"]) for r in rows}
+
+    async def prune_position_rejections(self, keep_days: int) -> int:
+        """Прополка журнала отказов (§7.1 ТЗ: строки старше 90 суток).
+
+        ``keep_days <= 0`` отключает правило и НЕ УДАЛЯЕТ НИЧЕГО. Ноль как
+        «удалить всё» был бы прочтением, при котором опечатка в ``.env``
+        стирает таблицу целиком.
+        """
+        if int(keep_days) <= 0:
+            return 0
+        status = await self.pool.execute(
+            "DELETE FROM public.position_rejections "
+            "WHERE ts_utc < now() - make_interval(days => $1::int);",
+            int(keep_days),
+        )
+        return int(str(status).rsplit(" ", 1)[-1] or 0)
+
     async def ensure_positions_schema(self) -> None:
         """Идемпотентно создаёт таблицу позиций (миграция 018).
 
@@ -1532,36 +1715,66 @@ class DB:
         return [dict(r) for r in rows]
 
     async def get_last_open_ts_by_instrument(
-        self, since: datetime
+        self, since: datetime, logic_version: int
     ) -> dict[int, datetime]:
-        """Момент ПОСЛЕДНЕГО открытия позиции по каждому инструменту (§4 ТЗ 7).
+        """Момент ПОСЛЕДНЕГО открытия позиции по каждому инструменту (§5 ТЗ 9.3).
 
         ЧИТАЮТСЯ ПОЗИЦИИ ЛЮБОГО СОСТОЯНИЯ — и открытые, и уже закрытые. Пауза
-        отсчитывается от ОТКРЫТИЯ (§4 B3 ТЗ), поэтому закрывшаяся за эти
+        отсчитывается от ОТКРЫТИЯ (§5.1 ТЗ), поэтому закрывшаяся за эти
         полчаса сделка держит токен ровно так же, как продолжающаяся: иначе
         правило снова зависело бы от длительности сделки — ровно от того, от
         чего этап его и освобождает.
+
+        ВЕРСИЯ ЛОГИКИ В ОТБОРЕ УЧАСТВУЕТ (§5.3 ТЗ 9.3), и это прямая отмена
+        решения этапа 7, где её намеренно не было. Довод этапа 7 («две позиции
+        по одному токену в одну минуту — это две позиции по одному токену, чем
+        бы они ни отличались») описывает поток сообщений; ТЗ 9.3 требует
+        другого — чтобы пауза была свойством ВЫБОРКИ версии 7 и ничего не
+        наследовала от версии 6. Практическая разница видна в первый же час
+        после развёртывания: позиции версии 6, открытые перед перезапуском,
+        иначе придержали бы свои токены, и первые входы версии 7 оказались бы
+        пропущены по причине, к версии 7 отношения не имеющей.
 
         ГРАНИЦА ``since`` — НЕ ОПТИМИЗАЦИЯ, А ЧАСТЬ СМЫСЛА. Позиции старше
         паузы на ответ не влияют вовсе, и тянуть их значило бы читать всю
         таблицу ради пяти чисел. Вызывающий передаёт ``now - пауза``; при
         выключенной паузе он сюда не обращается совсем.
-
-        ВЕРСИЯ ЛОГИКИ В ОТБОРЕ НЕ УЧАСТВУЕТ. Пауза бережёт не сравнимость
-        версий, а частоту сделок по ТОКЕНУ: две позиции по одному токену,
-        открытые в одну минуту разными правилами, — это две сделки по одному
-        токену в одну минуту, чем бы они ни отличались между собой.
         """
         rows = await self.pool.fetch(
-            """
-            SELECT instrument_id, max(opened_at) AS last_opened_at
-            FROM positions
-            WHERE opened_at >= $1
-            GROUP BY instrument_id;
-            """,
-            since,
+            _LAST_OPEN_SQL, since, int(logic_version), None
         )
         return {int(r["instrument_id"]): r["last_opened_at"] for r in rows}
+
+    async def seconds_since_last_open(
+        self, token: str, logic_version: int, now: datetime | None = None
+    ) -> float | None:
+        """Секунды с ОТКРЫТИЯ последней позиции по токену в этой версии (§5.4).
+
+        ``None`` — позиций по этому токену в этой версии логики ещё не было;
+        вызывающий трактует это как «паузы нет, открывать можно».
+
+        МЕТКА БЕРЁТСЯ ИЗ БАЗЫ, А НЕ ИЗ ПАМЯТИ ПРОЦЕССА (§5.3 ТЗ), и это не
+        деталь реализации, а то, что проверяет опыт §10.3: перезапуск
+        контейнера не обнуляет паузу. Состояние в памяти пережило бы ровно до
+        первого ``docker compose restart`` — и обнулялось бы молча.
+
+        ЗАПРОС ТОТ ЖЕ САМЫЙ, что у пакетного :meth:`get_last_open_ts_by_instrument`
+        (``_LAST_OPEN_SQL``), и разделён он намеренно: два текста SQL для
+        одного правила однажды разошлись бы, и служба считала бы паузу по
+        одному правилу, а ``/status`` показывал бы её по другому.
+
+        ``token`` — СИМВОЛ ИНСТРУМЕНТА (``BTC/USDT``), как в ``instruments``.
+        Функция названа в ТЗ через токен, а не через ``instrument_id``, и
+        подменять один другим в сигнатуре нельзя: звать её будут по тому
+        имени, которое человек видит в журнале.
+        """
+        row = await self.pool.fetchrow(
+            _LAST_OPEN_SQL, _EPOCH_FLOOR, int(logic_version), str(token)
+        )
+        if row is None or row["last_opened_at"] is None:
+            return None
+        moment = now or datetime.now(UTC)
+        return (moment - row["last_opened_at"]).total_seconds()
 
     async def count_open_positions(self) -> int:
         """Сколько слотов занято прямо сейчас."""
@@ -3746,6 +3959,36 @@ END $$;
 # предыдущие таблицы: сервис гарантирует свою схему при старте, потому что
 # миграция могла быть не применена на уже работающем томе. Расхождение этих
 # двух описаний ловит deploy/schema_drift.sh.
+# --- ПАУЗА ПО ТОКЕНУ: ОДИН ТЕКСТ SQL НА ДВА ВОПРОСА (§5 ТЗ 9.3) -------------
+#
+# Спрашивают об одном и том же — «когда по этому токену открывались в последний
+# раз» — но по-разному: служба позиций пакетом по всем токенам сразу (одна
+# сетевая задержка вместо пяти), а :meth:`Database.seconds_since_last_open` по
+# одному названному токену. Два текста SQL для одного правила однажды разошлись
+# бы молча, поэтому текст один, а различие вынесено в параметр ``$3``: NULL —
+# «все токены», символ — «только этот».
+#
+# ТРИ СВОЙСТВА ПРАВИЛА ЗАПИСАНЫ ЗДЕСЬ, И КАЖДОЕ ПРОВЕРЯЕТСЯ НАМЕРЕННОЙ
+# ПОЛОМКОЙ (§11 ТЗ):
+#   * ``max(opened_at)``, а не ``closed_at``: отсчёт от ОТКРЫТИЯ (§5.1);
+#   * ``logic_version = $2``: только своя версия логики (§5.3);
+#   * ``GROUP BY instrument_id``: пауза У КАЖДОГО ТОКЕНА СВОЯ (§11.5).
+# Скользящее окно (§5.2) обеспечивает сам вызывающий, передавая ``now - пауза``
+# в ``$1``: обнуления в начале часа здесь нет и быть не может.
+_LAST_OPEN_SQL = """
+    SELECT p.instrument_id, max(p.opened_at) AS last_opened_at
+    FROM positions p
+    JOIN instruments i ON i.id = p.instrument_id
+    WHERE p.opened_at >= $1
+      AND p.logic_version = $2
+      AND ($3::text IS NULL OR i.symbol = $3::text)
+    GROUP BY p.instrument_id;
+"""
+
+# Нижняя граница «за всё время» для однотокенного вопроса: у него окна нет —
+# он отвечает «сколько секунд прошло», а не «держит ли пауза».
+_EPOCH_FLOOR = datetime(1970, 1, 1, tzinfo=UTC)
+
 POSITIONS_DDL = """
 CREATE TABLE IF NOT EXISTS positions (
     id                  BIGSERIAL PRIMARY KEY,
@@ -3786,6 +4029,30 @@ CREATE TABLE IF NOT EXISTS positions (
     resolution          TEXT          NOT NULL,
     created_at          TIMESTAMPTZ   NOT NULL DEFAULT now(),
     updated_at          TIMESTAMPTZ   NOT NULL DEFAULT now()
+);
+"""
+
+# ЖУРНАЛ ОТКАЗОВ ВО ВХОДЕ (§7.1 ТЗ 9.3). Тот же текст, что в миграции 028, и
+# совпадение проверяется тестом: служба создаёт таблицу при старте сама —
+# порядок «сначала миграция, потом образ» соблюсти удаётся не всегда, а без
+# таблицы служба обязана вести сделки, а не падать.
+#
+# ПЕРЕЧЕНЬ ПРИЧИН СОБИРАЕТСЯ ИЗ ``rules.REFUSAL_REASONS``, а не переписан сюда
+# руками. Две копии закрытого перечня в двух файлах однажды разошлись бы, и
+# новая причина отказа падала бы на ограничении БД — то есть в бою, у службы,
+# которая по построению не падает: она записала бы предупреждение, и отказы
+# новой причины просто перестали бы попадать в выборку. Молча.
+POSITION_REJECTIONS_DDL = """
+CREATE TABLE IF NOT EXISTS public.position_rejections (
+    id              BIGSERIAL PRIMARY KEY,
+    ts_utc          TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    signal_id       BIGINT       NOT NULL,
+    token           TEXT         NOT NULL,
+    reason          TEXT         NOT NULL,
+    logic_version   SMALLINT     NOT NULL,
+    CONSTRAINT position_rejections_reason_chk CHECK (
+        reason IN ({reasons})
+    )
 );
 """
 

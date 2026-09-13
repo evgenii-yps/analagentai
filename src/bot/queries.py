@@ -569,7 +569,9 @@ class BotQueries:
         )
         return [dict(r) for r in rows]
 
-    async def positions_state(self, pause_sec: float) -> dict[str, Any]:
+    async def positions_state(
+        self, pause_sec: float, logic_version: int
+    ) -> dict[str, Any]:
         """Число открытых позиций и токены, по которым идёт пауза (§5 C6 ТЗ 7).
 
         ОДНИМ ЗАПРОСОМ, А НЕ ДВУМЯ. Число открытых позиций и перечень пауз
@@ -584,6 +586,11 @@ class BotQueries:
         ``pause_sec <= 0`` (пауза выключена) — перечень пуст, и запрос о ней не
         задаётся вовсе: спрашивать базу о величине, которая ни на что не
         влияет, незачем.
+
+        ВЕРСИЯ ЛОГИКИ В ОТБОРЕ ПАУЗ УЧАСТВУЕТ (§5.3 ТЗ 9.3) — тем же условием,
+        каким её отбирает служба позиций. Показать в ``/status`` паузу, которой
+        служба не видит, значило бы объяснять владельцу расхождение между тем,
+        что он читает, и тем, что происходит.
         """
         open_count = int(
             await self._pool.fetchval(
@@ -602,13 +609,14 @@ class BotQueries:
             FROM positions p
             JOIN instruments i ON i.id = p.instrument_id
             WHERE p.opened_at >= now() - make_interval(secs => $1::float8)
+              AND p.logic_version = $2::int
             GROUP BY i.symbol
             HAVING $1::float8 - EXTRACT(
                        EPOCH FROM (now() - max(p.opened_at))
                    ) > 0
             ORDER BY left_sec DESC;
             """,
-            float(pause_sec),
+            float(pause_sec), int(logic_version),
         )
         return {
             "open_count": open_count,

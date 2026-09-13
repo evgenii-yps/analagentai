@@ -449,22 +449,26 @@ def test_stale_signal_is_refused() -> None:
     assert should_open(**_open_kwargs(signal_age_sec=180.0)).allowed is True
 
 
-def test_the_one_position_per_instrument_rule_is_gone() -> None:
-    """Правила «один инструмент — одна позиция» больше НЕТ (§3 A2 ТЗ 7).
+def test_the_one_position_per_instrument_rule_is_off_by_default() -> None:
+    """Правило «один инструмент — одна позиция» СНЯТО (§4.1 ТЗ 9.3).
 
-    Тест Этапа 9.1 проверял обратное, и это не ошибка того теста: правило
-    действовало и было главным ограничителем сделок. Здесь закреплено его
-    СНЯТИЕ — вместе с тем, что снято оно НАСОВСЕМ, а не отключено значением
-    настройки: ни параметра «занят ли инструмент», ни причины отказа
-    ``instrument_busy`` в правиле не осталось.
+    ТРИ РЕДАКЦИИ ЭТОГО ТЕСТА, И КАЖДАЯ ВЕРНА ДЛЯ СВОЕГО ЭТАПА. 9.1: правило
+    есть и оно главный ограничитель сделок. Этап 7: правила нет вовсе — ни
+    параметра, ни причины отказа. Этап 9.3: правило есть, но ВЫКЛЮЧЕНО
+    настройкой ``POSITION_ONE_PER_TOKEN=false``.
 
-    Что пришло на смену — пауза по токену — проверяется в tests/test_logic_7.py.
+    ПОЧЕМУ 9.3 ВЕРНУЛ ВЫКЛЮЧАТЕЛЬ. §4.1 требует именно его, а не удаления: им
+    ставится контроль опыта §10.4, который ОБЯЗАН упасть (при ``true`` вторая
+    позиция по токену не открывается), и им же возвращается ограничение — одной
+    строкой в ``.env``, а не откатом ветки.
     """
-    assert "instrument_busy" not in REFUSAL_REASONS
-    assert not hasattr(rules, "REASON_INSTRUMENT_BUSY")
-    # Открытая позиция по инструменту входу больше не мешает: единственное, что
-    # может помешать, — недавний вход, и он задаётся возрастом, а не фактом.
+    assert rules.REASON_INSTRUMENT_BUSY in REFUSAL_REASONS
+    assert settings.POSITION_ONE_PER_TOKEN is False
+    # Открытая позиция по инструменту входу не мешает: при боевой настройке
+    # единственное, что может помешать, — недавний вход, и он задаётся
+    # возрастом, а не фактом занятости.
     assert should_open(**_open_kwargs(last_open_age_sec=7200.0)).allowed is True
+    assert should_open(**_open_kwargs(token_open_count=4)).allowed is True
 
 
 def test_signal_without_a_frozen_target_is_refused() -> None:
@@ -497,6 +501,11 @@ def test_every_refusal_reason_belongs_to_the_closed_list() -> None:
         # быть достижимым — ключ, который не может случиться, ничего не
         # объясняет, но выглядит объяснением.
         dict(free_capital_usd=1.0),
+        # Этап 9.3 §3, §4.1: ограничители ЧИСЛА сделок вернулись в код
+        # выключателями. При боевых настройках недостижимы, но достижимы в
+        # принципе — иначе ключ ничего не объяснял бы, выглядя объяснением.
+        dict(open_count=5, max_open=5),
+        dict(token_open_count=1, one_per_token=True),
     ]
     seen = set()
     for override in broken:

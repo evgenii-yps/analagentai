@@ -549,50 +549,60 @@ def test_the_rollback_refuses_to_falsify_version_six_rows() -> None:
 # =============================================================================
 
 def test_the_closing_message_names_the_new_outcome_in_plain_words() -> None:
-    """§8.1 ТЗ: человеческий язык, а не машиночитаемый ключ."""
+    """§8.1 ТЗ 9.2: человеческий язык, а не машиночитаемый ключ.
+
+    ФОРМА СООБЩЕНИЯ ПЕРЕПИСАНА ЭТАПОМ 9.3 (§6.2 ТЗ 9.3 выписывает её
+    построчно), требование этапа 9.2 при этом осталось в силе и проверяется
+    здесь: исход назван словами, ключа в тексте нет, предел убытка не упомянут.
+    """
     text = messages.closed_text(
+        position_id=12,
         symbol="BTC/USDT", exit_reason="plus_exit", entry_price=100.0,
         exit_price=100.22, net_pnl_pct=0.0, net_pnl_usd=0.0,
-        cost_pct=_COST_PCT, held_sec=30 * 3600, logic_version=6, hold_hours=48,
+        cost_pct=_COST_PCT, held_sec=30 * 3600, hold_hours=48,
     )
-    assert "вышли в плюс после суток ожидания" in text
+    assert "Причина: вышли в плюс после суток" in text
     assert "plus_exit" not in text
     assert "предел" not in text.lower()
+    # §6.2 ТЗ 9.3: время в сделке в формате ЧЧ:ММ.
+    assert "Время в сделке 30:00" in text
 
     timeout = messages.closed_text(
+        position_id=13,
         symbol="BTC/USDT", exit_reason="timeout", entry_price=100.0,
         exit_price=96.5, net_pnl_pct=-3.72, net_pnl_usd=-0.074,
-        cost_pct=_COST_PCT, held_sec=48 * 3600, logic_version=6, hold_hours=48,
+        cost_pct=_COST_PCT, held_sec=48 * 3600, hold_hours=48,
     )
     assert "истёк срок 48 ч" in timeout
     assert "предел" not in timeout.lower()
 
 
 def test_the_opening_message_of_version_six_never_mentions_a_stop() -> None:
-    """§8.2 ТЗ: предела нет — и писать о нём означало бы вводить в заблуждение.
+    """§8.2 ТЗ 9.2: предела нет — писать о нём означало бы вводить в заблуждение.
 
-    На его месте стоит то, что у позиции ДЕЙСТВИТЕЛЬНО есть: цена безубытка и
-    час, с которого по ней начнут выходить.
+    ЧТО ИЗМЕНИЛ ЭТАП 9.3. §6.2 ТЗ 9.3 выписал сообщение об открытии построчно,
+    и строки о цене безубытка в образце нет — её место заняла строка правила
+    «Правило v7 · без предела убытка · срок 48 ч». Требование 9.2 при этом
+    выполнено сильнее прежнего: об отсутствии предела сказано прямо, а не
+    выведено из молчания.
     """
     text = messages.opened_text(
-        symbol="BTC/USDT", entry_price=100.0, notional_usd=2.0,
-        target_price=101.0, target_pct=1.0, stop_price=None, stop_pct=None,
-        deadline_at=_DEADLINE, signal_id=42, probability=0.83, entry_lag_sec=95,
-        plus_price=breakeven_price(100.0, _COST_PCT), plus_wait_hours=24,
+        position_id=42,
+        symbol="BTC/USDT", entry_price=100.0,
+        target_price=101.0, target_pct=1.0, stop_pct=None,
+        probability=0.83, logic_version=6, hold_hours=48,
     )
-    assert "предела убытка нет" in text
-    assert "предел 9" not in text and "−" not in text.split("Срок")[0].replace(
-        "предела убытка нет", ""
-    )
-    assert "выход в плюс от" in text and "с 24-го часа" in text
+    assert "Правило v6 · без предела убытка · срок 48 ч" in text
+    assert "предел убытка −" not in text
 
-    # У версии 5 сообщение прежнее, слово в слово.
+    # У версии 5 предел есть, и сообщение его называет.
     old = messages.opened_text(
-        symbol="BTC/USDT", entry_price=100.0, notional_usd=2.0,
-        target_price=101.0, target_pct=1.0, stop_price=99.0, stop_pct=1.0,
-        deadline_at=_DEADLINE, signal_id=42, probability=0.83, entry_lag_sec=95,
+        position_id=42,
+        symbol="BTC/USDT", entry_price=100.0,
+        target_price=101.0, target_pct=1.0, stop_pct=1.0,
+        probability=0.83, logic_version=5, hold_hours=24,
     )
-    assert "предел 99.0000 (−1.00%)" in old
+    assert "Правило v5 · предел убытка −1.00% · срок 24 ч" in old
 
 
 def test_the_sheet_note_of_version_six_names_the_rule_instead_of_the_stop() -> None:
