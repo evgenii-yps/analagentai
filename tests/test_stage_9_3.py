@@ -2097,7 +2097,9 @@ def test_the_targets_check_compares_only_rows_that_existed_at_snapshot() -> None
     # Граница снимается с часов БАЗЫ и кладётся в слепок.
     assert 'BOUNDARY="$(psql_q "SELECT now();")"' in snapshot
     assert "targets_boundary=" in snapshot
-    assert 'BOUNDARY="$(before_val targets_boundary)"' in verify
+    # А читается она через библиотеку, которая умеет и слепок прежней
+    # редакции: там ключа границы нет и появиться не может.
+    assert 'picked="$(pick_targets_boundary "${BEFORE}")"' in verify
 
     # У каждой таблицы свой столбец времени появления строки, и они не
     # перепутаны: computed_at — когда цель посчитана, frozen_at — когда
@@ -2206,3 +2208,226 @@ def test_the_metrics_file_accumulates_instead_of_being_wiped() -> None:
     assert ': > "${METRICS}"' not in verify
     assert '=== прогон %s ===' in verify
     assert '>> "${METRICS}"' in verify
+
+
+# =============================================================================
+# Совместимость со слепком, снятым ПРЕЖНЕЙ редакцией
+# =============================================================================
+#
+# «ДО» НЕВОСПРОИЗВОДИМО. Развёртывание состоялось; слепок от 13.09.2026
+# 09:42:14 UTC — единственное свидетельство состояния, которое было до него, и
+# снять его заново нельзя ни при каких условиях. Скрипт, спотыкающийся о
+# собственный вчерашний вывод, обнуляет это свидетельство целиком.
+#
+# ПОЭТОМУ ФАЙЛ ОБРАЗЦА ЗДЕСЬ — ДОСЛОВНЫЙ. Перечень ключей взят с боевого
+# сервера, включая дописанные владельцем вручную ``v7_boundary_*``, которых ни
+# одна редакция скрипта не пишет. Ключей границы по ``computed_at`` и
+# ``frozen_at`` в нём нет и появиться не может.
+
+_SNAP_LIB = _ROOT / "deploy" / "snapshot_read.sh"
+
+_LEGACY_SNAPSHOT = """# Слепок ДО развёртывания этапа 9.3
+snapshot_taken_at=2026-09-13T09:42:14Z
+snapshot_git_head=c4321c7
+v5_digest=6f1b0c4de2a9f77c1d35b8e0a4c7d219
+v5_rows=88
+v5_pnl_usd=-0.68088
+v6_digest=91ac4b77e0d2135fa8c6e41b9d770325
+v6_rows=11
+v6_pnl_usd=-0.04412
+risk_targets_digest=2b6a7d7c9e13f04a8b5c2d6e7f801234
+risk_targets_rows=60
+signal_targets_digest=38511cab77e9012d4f6a8b3c5d7e9012
+signal_targets_rows=41903
+agents_fingerprint=1f12d5d2000000000000000000000000000000000000000000000000000de18d
+v7_boundary_git_head=c4321c7
+v7_boundary_max_id=141
+v7_boundary_max_opened_at=2026-09-13T09:41:00Z
+v7_boundary_rows=42
+v7_boundary_open=31
+v7_boundary_pnl_usd=0.10118
+"""
+
+
+def _read_snapshot(path: str, script: str) -> tuple[int, str]:
+    """Спрашивает библиотеку чтения слепка так же, как её спрашивает скрипт."""
+    import subprocess
+
+    done = subprocess.run(
+        ["bash", "-c", f'. "{_SNAP_LIB}"\n{script}', "_", path],
+        capture_output=True, text=True,
+    )
+    return done.returncode, done.stdout
+
+
+def test_a_snapshot_from_the_previous_edition_reads_without_errors(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Слепок прежней редакции обязан читаться без ошибок. Не «желательно».
+
+    ОТСУТСТВУЮЩИЙ КЛЮЧ — ЗАКОННЫЙ ОТВЕТ, А НЕ СБОЙ. ``targets_boundary`` в
+    старом файле нет и появиться не может; чтение обязано вернуть пустую
+    строку и код 0, а не уронить прогон проверки целиком.
+
+    ДОПИСАННЫЕ ВРУЧНУЮ КЛЮЧИ НЕ МЕШАЮТ: владелец добавил в файл шесть строк
+    ``v7_boundary_*``, которых не пишет ни одна редакция скрипта. Читатель,
+    разбирающий файл построчно по имени ключа, к ним безразличен — и это
+    проверяется, а не предполагается.
+    """
+    path = tmp_path / "snapshot_9_3_before.txt"
+    path.write_text(_LEGACY_SNAPSHOT, encoding="utf-8")
+
+    # Все ключи, которые спрашивает скрипт у слепка, — поимённо.
+    expected = {
+        "snapshot_taken_at": "2026-09-13T09:42:14Z",
+        "v5_digest": "6f1b0c4de2a9f77c1d35b8e0a4c7d219",
+        "v6_digest": "91ac4b77e0d2135fa8c6e41b9d770325",
+        "risk_targets_digest": "2b6a7d7c9e13f04a8b5c2d6e7f801234",
+        "signal_targets_digest": "38511cab77e9012d4f6a8b3c5d7e9012",
+        "agents_fingerprint":
+            "1f12d5d2000000000000000000000000000000000000000000000000000de18d",
+    }
+    for key, value in expected.items():
+        code, out = _read_snapshot(str(path), f'snapshot_val "$1" {key}')
+        assert code == 0, key
+        assert out.strip() == value, key
+
+    # Ключа, которого в прежней редакции не было, — пусто и БЕЗ ошибки.
+    code, out = _read_snapshot(str(path), 'snapshot_val "$1" targets_boundary')
+    assert code == 0
+    assert out.strip() == ""
+
+    # И файла может не быть вовсе — это тоже не повод падать.
+    code, out = _read_snapshot(
+        str(tmp_path / "нет-такого"), 'snapshot_val "$1" v5_digest'
+    )
+    assert code == 0
+    assert out.strip() == ""
+
+
+def test_the_boundary_falls_back_to_the_snapshot_moment_and_says_so(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Без ``targets_boundary`` границей служит ``snapshot_taken_at``.
+
+    И ВИД ГРАНИЦЫ НАЗЫВАЕТСЯ ВСЛУХ. Это не украшение вывода: у восстановленной
+    границы есть известный изъян — ``snapshot_taken_at`` снят часами ХОСТА в
+    начале прогона, а суммы посчитаны базой несколькими запросами позже.
+    Вызывающий обязан знать, что граница восстановлена, чтобы проверить её
+    пригодность, а не сверять вслепую.
+    """
+    legacy = tmp_path / "legacy.txt"
+    legacy.write_text(_LEGACY_SNAPSHOT, encoding="utf-8")
+    code, out = _read_snapshot(str(legacy), 'pick_targets_boundary "$1"')
+    assert code == 0
+    assert out.split() == ["2026-09-13T09:42:14Z", "восстановленная"]
+
+    # Слепок НОВОЙ редакции даёт точную границу — и говорит это тем же полем.
+    fresh = tmp_path / "fresh.txt"
+    fresh.write_text(
+        _LEGACY_SNAPSHOT + "targets_boundary=2026-09-14 06:00:00.123456+00\n",
+        encoding="utf-8",
+    )
+    code, out = _read_snapshot(str(fresh), 'pick_targets_boundary "$1"')
+    assert code == 0
+    assert out.rsplit(" ", 1)[1] == "точная"
+    assert out.rsplit(" ", 1)[0] == "2026-09-14 06:00:00.123456+00"
+
+    # Ни того, ни другого — пусто и без ошибки: скрипт скажет «не проверено».
+    empty = tmp_path / "empty.txt"
+    empty.write_text("v5_digest=x\n", encoding="utf-8")
+    code, out = _read_snapshot(str(empty), 'pick_targets_boundary "$1"')
+    assert code == 0
+    assert out.strip() == ""
+
+
+def test_the_restored_boundary_is_measured_for_fitness_not_assumed() -> None:
+    """Пригодность восстановленной границы ИЗМЕРЯЕТСЯ, а не утверждается.
+
+    ЧТО ТРЕБУЕТСЯ ОТ ПРОГОНА ЗАВТРА ПОСЛЕ 03:40 UTC: закрыть §13.1.6 по
+    ``risk_targets`` и честно сказать «не проверено» по ``signal_targets`` —
+    не поднимая ложной тревоги и не обнуляя прогон.
+
+    КАК ЭТО ПОЛУЧАЕТСЯ БЕЗ СПИСКА ИМЁН. Скрипт считает строки, легшие вблизи
+    восстановленной границы (час в обе стороны — с запасом на задержку скрипта
+    и расхождение часов хоста и контейнера). Ноль означает, что никакая
+    задержка множества строк не меняет, и сверка честна. Больше нуля — сверять
+    нечем. ``risk_targets`` пополняется раз в сутки ночным пересчётом,
+    ``signal_targets`` — с каждым сигналом; разделяются они этим измерением
+    сами, по существу, а не по вписанному в скрипт перечню.
+    """
+    verify = _VERIFY.read_text("utf-8")
+    section = verify.split("# --- 5. Граница этапа", 1)[1].split(
+        "# --- 6. База", 1
+    )[0]
+
+    assert "pick_targets_boundary" in section
+    assert "_rows_near_boundary" in section
+    assert "interval '1 hour'" in section
+    # Отказ при ненулевом числе — «не проверено», а НЕ находка.
+    hazard = section.split("if [ \"${near}\" != \"0\" ]; then", 1)[1].split(
+        "fi", 1
+    )[0]
+    assert "note_skip" in hazard
+    assert "note_rollback" not in hazard
+    assert "note_stop" not in hazard
+
+
+def test_the_restored_boundary_never_prescribes_a_rollback() -> None:
+    """На восстановленной границе откат не предписывается ни при каком исходе.
+
+    ПОЧЕМУ. §14.4 разрешает откат только за нарушение границы этапа, и
+    расхождение сумм им бы и было — но лишь если граница верна. Точную границу
+    записал слепок; восстановленную вывел САМ СКРИПТ. Предписывать откат по
+    величине, которую он вывел сам, он не вправе: человеку сказано и что
+    расхождение похоже на настоящее, и чем оно отличается от доказанного.
+
+    «Не обнулять прогон» из требования владельца выполняется этим же: код
+    возврата 3 («остановиться и разобрать»), а не 1 («откатить»).
+    """
+    verify = _VERIFY.read_text("utf-8")
+    section = verify.split("# --- 5. Граница этапа", 1)[1].split(
+        "# --- 6. База", 1
+    )[0]
+    # Ветка отката существует — но только для ТОЧНОЙ границы: она стоит в
+    # ``else`` после явной проверки вида.
+    assert 'elif [ "${BOUNDARY_KIND}" = "восстановленная" ]; then' in section
+    restored = section.split(
+        'elif [ "${BOUNDARY_KIND}" = "восстановленная" ]; then', 1
+    )[1].split("else", 1)[0]
+    assert "note_stop" in restored
+    assert "note_rollback" not in restored
+    # А для точной — откат на месте: иначе исправление совместимости тихо
+    # отключило бы проверку границы для всех будущих слепков.
+    exact = section.rsplit("else", 1)[1]
+    assert "note_rollback" in exact
+
+
+def test_the_legacy_snapshot_still_closes_the_other_criteria() -> None:
+    """Слепок прежней редакции закрывает §13.1.2 и §13.1.3 как прежде.
+
+    Исправление совместимости касается ТОЛЬКО целей: у строк версий 5 и 6 и у
+    отпечатка агентов растущих таблиц нет, ключи их в старом файле есть, и
+    формат их не менялся. Проверяется, что скрипт спрашивает у слепка ровно те
+    имена, которые в нём лежат, — опечатка в имени ключа дала бы вечное
+    «не проверено», выглядящее безобидно.
+    """
+    verify = _VERIFY.read_text("utf-8")
+    # Только ЛИТЕРАЛЬНЫЕ имена: ``before_val "${table}_digest"`` собирается из
+    # подстановки и проверяется ниже раскрытием, а не этим перечнем.
+    asked = set(re.findall(r'before_val ([a-z][a-z0-9_]*)\b', verify))
+    present = {
+        line.split("=", 1)[0]
+        for line in _LEGACY_SNAPSHOT.split("\n")
+        if "=" in line and not line.startswith("#")
+    }
+    # Имена с подстановкой (${table}_digest, v${version}_digest) проверяются
+    # раскрытием: скрипт спрашивает их для двух таблиц и двух версий.
+    expanded = {f"{t}_digest" for t in ("risk_targets", "signal_targets")}
+    expanded |= {f"v{v}_digest" for v in (5, 6)}
+    expanded |= {"agents_fingerprint", "snapshot_taken_at"}
+    assert expanded <= present, expanded - present
+    # И ни одно ИМЯ БЕЗ подстановки, которое спрашивает скрипт, не выдумано:
+    # либо оно есть в старом файле, либо это новый ключ границы.
+    for name in asked:
+        assert name in present or name == "targets_boundary", name
