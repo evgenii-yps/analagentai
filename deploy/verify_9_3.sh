@@ -59,9 +59,29 @@ BEFORE="${OUT_DIR}/snapshot_9_3_before.txt"
 # собранный из переменных, невозможно сверить с требованием глазами.
 METRICS="${APP_DIR}/analysis_out/verify_9_3_metrics.txt"
 
+# РАЗБОР СТРОКИ ЗАПУСКА ВЫНЕСЕН В БИБЛИОТЕКУ и подключается отсюда. Причина —
+# дефект, найденный на боевом сервере 13.09.2026: проверка §2 дала девять
+# ложных тревог при полностью верной конфигурации, потому что искала величины
+# по образцу JSON, а служба печатает их в двух форматах и двумя строками.
+# Подробности — в самом файле; вынесен он затем, чтобы его можно было прогнать
+# тестом на настоящих строках обоих форматов.
+LIB="$(dirname "$(readlink -f "$0")")/startup_line.sh"
+if [ -r "${LIB}" ]; then
+  # shellcheck source=deploy/startup_line.sh
+  . "${LIB}"
+  HAVE_LIB=1
+else
+  HAVE_LIB=0
+fi
+
 cd "${APP_DIR}" || { echo "Нет каталога ${APP_DIR}"; exit 2; }
 mkdir -p "${OUT_DIR}" 2>/dev/null || true
-: > "${METRICS}" 2>/dev/null || METRICS="/dev/null"
+# ФАЙЛ МЕТРИК НАКОПИТЕЛЬНЫЙ, А НЕ ПЕРЕЗАПИСЫВАЕМЫЙ. Первая редакция затирала
+# его на каждом прогоне, и сравнить два прогона между собой было нечем — а
+# именно сравнение двух прогонов и показало дефект §5 (сумма signal_targets
+# сменилась за две минуты). Прогоны разделены заголовком.
+printf '\n=== прогон %s ===\n' "$(date -u +%FT%TZ)" >> "${METRICS}" 2>/dev/null \
+  || METRICS="/dev/null"
 
 rollback=0; stop=0; unknown=0
 note_rollback() { echo "  🔴 ОТКАТ:         $*"; rollback=$((rollback + 1)); }
@@ -128,37 +148,43 @@ fi
 echo
 
 # --- 2. Строки запуска обеих служб (§8 ТЗ) ----------------------------------
+#
+# ПРОВЕРЯЮТСЯ ВСЕ СТРОКИ-КАНДИДАТЫ, А НЕ ПОСЛЕДНЯЯ, и в любом из двух форматов
+# вывода. Так исправлен дефект, найденный на боевом сервере 13.09.2026: служба
+# позиций печатает свои величины ДВАЖДЫ (из positions_main и из runner.run), а
+# формат рендера зависит от того, терминал ли stdout. Первая редакция брала
+# ``tail -1`` и искала образец JSON — и дала девять ложных тревог при верных
+# настройках. Достаточно, чтобы величины нашлись ХОТЯ БЫ В ОДНОЙ строке: обе
+# строки собраны одной функцией ``startup_fields()`` и противоречить друг другу
+# не могут.
 echo "2. Строки запуска служб"
-pos_line="$(docker compose logs --since 24h --no-color positions 2>/dev/null \
-            | grep -F 'cooldown_sec' | tail -1 || true)"
-if [ -z "${pos_line}" ]; then
-  note_skip "в журнале positions за сутки нет строки запуска — перезапускалась ли служба?"
+if [ "${HAVE_LIB}" != "1" ]; then
+  note_skip "нет ${LIB} — разбирать строки запуска нечем"
 else
-  ok=1
-  for field in '"logic_version": 7' '"max_open": 0' '"slot_usd": 2' \
-               '"budget_usd": 0' '"min_probability": 0.8' \
-               '"max_hold_hours": 48' '"plus_wait_start_hours": 24' \
-               '"cooldown_sec": 3600' '"one_per_token": false'; do
-    echo "${pos_line}" | grep -qF "${field}" \
-      || { note_stop "в строке запуска positions нет ${field}"; ok=0; }
-  done
-  [ "${ok}" = 1 ] && note_ok "positions называет все девять величин §8"
-fi
-
-notify_line="$(docker compose logs --since 24h --no-color notify 2>/dev/null \
-               | grep -F 'notify_daily_summary_utc' | tail -1 || true)"
-if [ -z "${notify_line}" ]; then
-  note_skip "в журнале notify за сутки нет строки запуска — перезапускалась ли служба?"
-else
-  ok=1
-  for field in '"notify_signals_enabled": false' \
-               '"notify_trades_enabled": true' \
-               '"notify_daily_summary_utc": "06:00"' \
-               '"notify_trades_max_per_hour": 0'; do
-    echo "${notify_line}" | grep -qF "${field}" \
-      || { note_stop "в строке запуска notify нет ${field}"; ok=0; }
-  done
-  [ "${ok}" = 1 ] && note_ok "notify называет все четыре величины §8"
+  check_startup() { # служба якорь величина…
+    local service="$1" anchor="$2"; shift 2
+    local logs result
+    logs="$(docker compose logs --since 24h --no-color "${service}" 2>/dev/null \
+            | grep -F "${anchor}" || true)"
+    if [ -z "${logs}" ]; then
+      note_skip "в журнале ${service} за сутки нет строки запуска — перезапускалась ли служба?"
+      return
+    fi
+    if result="$(find_startup_line "${logs}" "$@")"; then
+      note_ok "${service} называет все требуемые §8 величины"
+    else
+      note_stop "${service}: ни одна строка запуска не несёт величин: ${result}"
+    fi
+  }
+  # Величины заданы в КАНОНИЧЕСКОМ виде — нижний регистр, ключ=значение.
+  # Числа записаны ровно так, как их печатает Python: 0.0 и 2.0, а не 0 и 2.
+  check_startup positions cooldown_sec \
+    logic_version=7 max_open=0 slot_usd=2.0 budget_usd=0.0 \
+    min_probability=0.8 max_hold_hours=48 plus_wait_start_hours=24 \
+    cooldown_sec=3600 one_per_token=false
+  check_startup notify notify_daily_summary_utc \
+    notify_signals_enabled=false notify_trades_enabled=true \
+    notify_daily_summary_utc=06:00 notify_trades_max_per_hour=0
 fi
 
 # ВКЛЮЧЁННЫЙ ОГРАНИЧИТЕЛЬ ЧИСЛА СДЕЛОК СЛУЖБА НАЗЫВАЕТ ВСЛУХ. Если он есть в
@@ -235,32 +261,56 @@ fi
 echo
 
 # --- 5. Граница этапа: цели пересчитываются по-прежнему (§13.1.6) -----------
+#
+# СВЕРЯЮТСЯ ТОЛЬКО СТРОКИ, СУЩЕСТВОВАВШИЕ НА МОМЕНТ СЛЕПКА. Дефект первой
+# редакции, найденный на боевом сервере 13.09.2026: сумма считалась по ВСЕЙ
+# таблице, а ``signal_targets`` растёт с каждым новым сигналом — два прогона с
+# разницей в две минуты давали разные суммы (2b6a7d7c… → 38511cab…) при
+# полностью неизменных старых строках. §14.1 прямо велит не принимать рост
+# продакшн-таблиц за тревогу.
+#
+# ЧТО ЭТА ПРОВЕРКА УТВЕРЖДАЕТ ТЕПЕРЬ: ни одна строка целей, существовавшая до
+# развёртывания, не переписана. Ровно это и требует §13.1.6 — этап не трогает
+# расчёт целей ни одной строкой. Появление НОВЫХ строк проверкой не считается
+# нарушением и не может считаться: ночной пересчёт 03:40 UTC для того и
+# работает.
 echo "5. Граница этапа: слепок целей"
-for table in risk_targets signal_targets; do
-  exists="$(psql_q "SELECT to_regclass('${table}') IS NOT NULL;")"
-  if [ "${exists}" != "t" ]; then
-    note_skip "${table}: таблицы нет"
-    continue
-  fi
-  now_digest="$(psql_q "
-    SELECT md5(string_agg(t::text, E'\n' ORDER BY t::text)) FROM ${table} t;")"
-  metric "${table}_digest_now" "${now_digest:-пусто}"
-  was="$(before_val "${table}_digest")"
-  if [ -z "${was}" ] || [ "${was}" = "НЕ_СНЯТО" ] || [ "${was}" = "НЕТ_ТАБЛИЦЫ" ]; then
-    note_skip "${table}: слепка ДО нет — критерий §13.1.6 закрыть нечем"
-  elif [ -z "${now_digest}" ]; then
-    note_skip "${table}: база не ответила"
-  elif [ "${was}" = "${now_digest}" ]; then
-    note_ok "${table}: побайтно как до развёртывания"
-  else
-    # ВНИМАНИЕ: ЭТО НЕ ОБЯЗАТЕЛЬНО НАРУШЕНИЕ. Цели пересчитываются ночью в
-    # 03:40 UTC, и расхождение ПОСЛЕ пересчёта законно. §13.1.6 требует
-    # сравнивать слепок с результатом ПЕРВОГО пересчёта после развёртывания —
-    # то есть смотреть на это число через сутки (§15.8), а не в день
-    # развёртывания. Поэтому предписание здесь — разобрать, а не откатывать.
-    note_stop "${table}: слепок отличается — проверьте, был ли ночной пересчёт 03:40 UTC между слепком и сейчас (§15.8)"
-  fi
-done
+BOUNDARY="$(before_val targets_boundary)"
+if [ -z "${BOUNDARY}" ] || [ "${BOUNDARY}" = "НЕ_СНЯТО" ]; then
+  note_skip "в слепке ДО нет границы времени (targets_boundary) — критерий §13.1.6 закрыть нечем"
+else
+  metric "targets_boundary" "${BOUNDARY}"
+  for pair in "risk_targets:computed_at" "signal_targets:frozen_at"; do
+    table="${pair%%:*}"; column="${pair##*:}"
+    exists="$(psql_q "SELECT to_regclass('${table}') IS NOT NULL;")"
+    if [ "${exists}" != "t" ]; then
+      note_skip "${table}: таблицы нет"
+      continue
+    fi
+    now_digest="$(psql_q "
+      SELECT md5(string_agg(t::text, E'\n' ORDER BY t::text))
+      FROM ${table} t WHERE t.${column} <= '${BOUNDARY}'::timestamptz;")"
+    metric "${table}_digest_now" "${now_digest:-пусто}"
+    # Число НОВЫХ строк печатается отдельно — это наблюдение, а не находка.
+    fresh="$(psql_q "
+      SELECT count(*) FROM ${table} t
+      WHERE t.${column} > '${BOUNDARY}'::timestamptz;")"
+    metric "${table}_rows_since_snapshot" "${fresh:-неизвестно}"
+    was="$(before_val "${table}_digest")"
+    if [ -z "${was}" ] || [ "${was}" = "НЕ_СНЯТО" ] || [ "${was}" = "НЕТ_ТАБЛИЦЫ" ]; then
+      note_skip "${table}: слепка ДО нет — критерий §13.1.6 закрыть нечем"
+    elif [ -z "${now_digest}" ]; then
+      note_skip "${table}: база не ответила"
+    elif [ "${was}" = "${now_digest}" ]; then
+      note_ok "${table}: строки на момент слепка не изменены (новых с тех пор: ${fresh:-?})"
+    else
+      # СТРОКИ, СУЩЕСТВОВАВШИЕ ДО РАЗВЁРТЫВАНИЯ, ПЕРЕПИСАНЫ. Это уже не рост
+      # таблицы и не ночной пересчёт: пересчёт добавляет строки с новым
+      # ``computed_at``, а не правит старые. Граница §1.2 нарушена.
+      note_rollback "${table}: строки, существовавшие на момент слепка, ИЗМЕНИЛИСЬ — граница §1.2 нарушена"
+    fi
+  done
+fi
 echo
 
 # --- 6. База: журнал отказов и послабление индекса (§7 ТЗ) ------------------
@@ -399,11 +449,36 @@ fail_lines="$(docker compose logs --since 24h --no-color positions 2>/dev/null \
               | grep -cF 'notify_trade_failed' || true)"
 metric "notify_trade_failed_log_lines" "${fail_lines:-не_проверено}"
 
-# СУТОЧНАЯ СВОДКА ПО СДЕЛКАМ уходит раз в сутки; её отсутствие за двое суток —
-# повод разобраться, а не тревога в первый же час после развёртывания.
-summary_lines="$(docker compose logs --since 48h --no-color notify 2>/dev/null \
-                 | grep -cF 'notify_daily_summary_sent=1' || true)"
-metric "daily_summary_sent_48h" "${summary_lines:-не_проверено}"
+# СУТОЧНАЯ СВОДКА ПО СДЕЛКАМ: БЕРЁТСЯ ИЗ REDIS, А НЕ ИЗ ЖУРНАЛА КОНТЕЙНЕРА.
+#
+# Дефект первой редакции, найденный на боевом сервере 13.09.2026: число
+# читалось из журнала контейнера ``notify`` и обнулялось при
+# ``--force-recreate`` — было 1, стало 0, хотя сводка отправлена и никуда не
+# делась. Это тот же класс, что §14.3 ТЗ («журнал контейнера, запущенного через
+# run --rm, исчезает вместе с ним»), только про другую команду: пересозданный
+# контейнер начинает журнал с нуля.
+#
+# ИСТОЧНИК ВЗЯТ ТОТ, ЧТО ПИШЕТ САМА СЛУЖБА И ТОЛЬКО ПОСЛЕ УСПЕШНОЙ ОТПРАВКИ:
+# ключ ``notify:daily_trades:last_day`` ставится в ``daily_trades.send_once``
+# строкой ПОСЛЕ ``send_message``, живёт 48 часов и лежит в томе ``redis_data``
+# — том переживает пересоздание любого контейнера. Журнал остаётся запасным
+# путём: если Redis недоступен, лучше приблизительный ответ, чем никакого, и
+# он помечается как приблизительный.
+summary_day="$(redis_get "notify:daily_trades:last_day")"
+if [ -n "${summary_day}" ]; then
+  metric "daily_summary_last_day" "${summary_day}"
+  note_ok "суточная сводка по сделкам отправлена, последняя — за ${summary_day}"
+else
+  summary_lines="$(docker compose logs --since 48h --no-color notify 2>/dev/null \
+                   | grep -cF 'notify_daily_summary_sent=1' || true)"
+  if [ "${summary_lines:-0}" != "0" ]; then
+    metric "daily_summary_sent_48h_from_log" "${summary_lines}"
+    note_ok "сводка отправлена (${summary_lines} раз по журналу; отметки в Redis нет — ключ мог истечь)"
+  else
+    metric "daily_summary_last_day" "нет"
+    note_skip "отметки об отправке сводки нет ни в Redis, ни в журнале — если развёртыванию меньше суток, это норма"
+  fi
+fi
 echo
 
 # --- 9. Прополка журнала отказов (§7.1) -------------------------------------

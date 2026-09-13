@@ -1959,3 +1959,250 @@ def test_the_snapshot_is_taken_before_anything_changes() -> None:
     assert 'v${version}_digest' in snapshot
     for key in ("agents_fingerprint", "risk_targets", "signal_targets"):
         assert key in snapshot, key
+
+
+# =============================================================================
+# Дефекты обвязки, найденные на боевом сервере 13.09.2026
+# =============================================================================
+#
+# ПЯТЬ НАХОДОК ВЛАДЕЛЬЦА ПОСЛЕ РАЗВЁРТЫВАНИЯ. Все — в обвязке, ни одной в
+# логике торговли. Каждая закреплена здесь тестом: находка, исправленная без
+# теста, возвращается следующим этапом, и возвращается молча.
+
+_LIB = _ROOT / "deploy" / "startup_line.sh"
+
+# НАСТОЯЩИЕ СТРОКИ, снятые с двух рендеров structlog (``src/core/logging.py``
+# выбирает их по TTY). Различие между ними и есть дефект №1: `false` против
+# `False`, `"06:00"` против `06:00`.
+_JSON_POSITIONS = (
+    '{"component": "positions", "logic_version": 7, "max_open": 0, '
+    '"cooldown_sec": 3600, "one_per_token": false, "budget_usd": 0.0, '
+    '"slot_usd": 2.0, "max_hold_hours": 48, "plus_wait_start_hours": 24, '
+    '"min_probability": 0.8, "horizon_h": 24, "interval": 60, '
+    '"gap_grace_sec": 7200, "settle_sec": 90, "event": "\\u0421\\u0435", '
+    '"level": "info", "timestamp": "2026-09-13T09:58:27.918224Z"}'
+)
+_CONSOLE_POSITIONS = (
+    "2026-09-13T09:58:27.918387Z [info     ] Сервис ведения позиций запущен "
+    "budget_usd=0.0 component=positions cooldown_sec=3600 gap_grace_sec=7200 "
+    "horizon_h=24 interval=60 logic_version=7 max_hold_hours=48 max_open=0 "
+    "min_probability=0.8 one_per_token=False plus_wait_start_hours=24 "
+    "settle_sec=90 slot_usd=2.0"
+)
+_CONSOLE_NOTIFY = (
+    "2026-09-13T09:58:27.918465Z [info     ] Запуск сервиса уведомлений "
+    "component=notify notify_daily_summary_utc=06:00 "
+    "notify_signals_enabled=False notify_trades_enabled=True "
+    "notify_trades_max_per_hour=0"
+)
+
+_POSITIONS_FIELDS = (
+    "logic_version=7 max_open=0 slot_usd=2.0 budget_usd=0.0 "
+    "min_probability=0.8 max_hold_hours=48 plus_wait_start_hours=24 "
+    "cooldown_sec=3600 one_per_token=false"
+)
+
+
+def _ask_lib(logs: str, fields: str) -> tuple[int, str]:
+    """Спрашивает библиотеку разбора так же, как её спрашивает скрипт."""
+    import subprocess
+
+    script = (
+        f'. "{_LIB}"\n'
+        'find_startup_line "$1" $2\n'
+    )
+    done = subprocess.run(
+        ["bash", "-c", script, "_", logs, fields],
+        capture_output=True, text=True,
+    )
+    return done.returncode, done.stdout
+
+
+def test_the_startup_check_reads_both_render_formats() -> None:
+    """Дефект 1: величины ищутся в любом из двух форматов вывода журнала.
+
+    ЧТО СЛУЧИЛОСЬ НА БОЮ. Первая редакция §2 искала образец JSON
+    (``"logic_version": 7``) и дала **девять ложных тревог** при полностью
+    верной конфигурации: раздел 1 был зелёным целиком, значения в ``.env``
+    верны. Причина — ``src/core/logging.py`` выбирает рендер по TTY, и
+    человекочитаемый печатает `one_per_token=False`, а JSON —
+    `"one_per_token": false`.
+
+    ЦЕНА ТАКОЙ ОШИБКИ ВЫШЕ, ЧЕМ КАЖЕТСЯ. Проверка, кричащая на верной системе,
+    обесценивает себя целиком: следующий её сигнал прочтут как очередной шум.
+    """
+    for line in (_JSON_POSITIONS, _CONSOLE_POSITIONS):
+        code, _ = _ask_lib(line, _POSITIONS_FIELDS)
+        assert code == 0, line[:60]
+
+    code, _ = _ask_lib(_CONSOLE_NOTIFY, (
+        "notify_signals_enabled=false notify_trades_enabled=true "
+        "notify_daily_summary_utc=06:00 notify_trades_max_per_hour=0"
+    ))
+    assert code == 0
+
+
+def test_the_startup_check_scans_every_line_not_only_the_last() -> None:
+    """Дефект 1, вторая половина: служба позиций печатает величины ДВАЖДЫ.
+
+    ``src/positions_main.py`` и ``src/positions/runner.run()`` зовут
+    ``startup_fields()`` каждый по разу. Первая редакция брала ``tail -1``, и
+    вердикт зависел от порядка строк — к настройкам отношения не имеющего.
+
+    Здесь нужная строка идёт ПЕРВОЙ, а последняя не несёт ничего: проверка
+    обязана пройти.
+    """
+    logs = _CONSOLE_POSITIONS + "\n" + "2026-09-13T09:58:28Z [info] positions_iteration=1 opened=0"
+    code, _ = _ask_lib(logs, _POSITIONS_FIELDS)
+    assert code == 0
+
+    # И ОБРАТНО: если величины не несёт НИ ОДНА строка, проверка падает и
+    # называет недостающие. Иначе «исправление» ложных тревог превратилось бы
+    # в проверку, которая не срабатывает никогда.
+    code, missing = _ask_lib(
+        "2026-09-13T09:58:28Z [info] positions_iteration=1", _POSITIONS_FIELDS
+    )
+    assert code == 1
+    assert "logic_version=7" in missing
+
+
+def test_the_startup_check_does_not_match_a_wrong_value_by_prefix() -> None:
+    """Сравнение с границами: `budget_usd=0` не должно совпадать с `0.5`.
+
+    Без пробелов по краям проверка молча пропускала бы неверную настройку —
+    то есть стала бы вредна ровно там, где полезна.
+    """
+    wrong = _CONSOLE_POSITIONS.replace("budget_usd=0.0", "budget_usd=0.5")
+    code, _ = _ask_lib(wrong, "budget_usd=0.0")
+    assert code == 1
+    code, _ = _ask_lib(wrong, "budget_usd=0")
+    assert code == 1, "префиксное совпадение пропустило бы неверный бюджет"
+
+
+def test_the_targets_check_compares_only_rows_that_existed_at_snapshot() -> None:
+    """Дефект 2: `signal_targets` растёт непрерывно, и сумма по всей таблице лжёт.
+
+    ЧТО СЛУЧИЛОСЬ НА БОЮ. Два прогона с разницей в две минуты, без ночного
+    пересчёта между ними, дали разные суммы: `2b6a7d7c…` → `38511cab…`. Ни
+    одна старая строка не менялась — просто появились новые: у
+    ``signal_targets`` есть ``frozen_at DEFAULT now()``, и она пополняется с
+    каждым сигналом. §14.1 ТЗ прямо велит считать рост продакшн-таблиц нормой.
+
+    ЧТО ПРОВЕРЯЕТСЯ ТЕПЕРЬ: не переписана ли хоть одна строка, существовавшая
+    ДО развёртывания. Ровно это и требует §13.1.6.
+    """
+    snapshot = _SNAPSHOT.read_text("utf-8")
+    verify = _VERIFY.read_text("utf-8")
+
+    # Граница снимается с часов БАЗЫ и кладётся в слепок.
+    assert 'BOUNDARY="$(psql_q "SELECT now();")"' in snapshot
+    assert "targets_boundary=" in snapshot
+    assert 'BOUNDARY="$(before_val targets_boundary)"' in verify
+
+    # У каждой таблицы свой столбец времени появления строки, и они не
+    # перепутаны: computed_at — когда цель посчитана, frozen_at — когда
+    # приморожена к сигналу.
+    for body in (snapshot, verify):
+        assert '"risk_targets:computed_at"' in body
+        assert '"signal_targets:frozen_at"' in body
+        assert "WHERE t.${column} <= '${BOUNDARY}'::timestamptz" in body
+
+    # Сумма по ВСЕЙ таблице больше нигде не считается — иначе дефект вернулся бы.
+    assert "FROM ${table} t;" not in verify
+    assert "FROM ${table} t;" not in snapshot
+    # Рост таблицы печатается наблюдением, а не находкой.
+    assert "_rows_since_snapshot" in verify
+
+
+def test_the_daily_summary_metric_survives_a_container_recreate() -> None:
+    """Дефект 3: число читалось из журнала и обнулялось при --force-recreate.
+
+    Было 1, стало 0 — при том, что сводка отправлена и никуда не делась. Это
+    тот же класс, что §14.3 ТЗ («журнал контейнера, запущенного через
+    run --rm, исчезает вместе с ним»), только про другую команду.
+
+    ИСТОЧНИК ВЗЯТ ТОТ, ЧТО ПИШЕТ САМА СЛУЖБА И ТОЛЬКО ПОСЛЕ УСПЕШНОЙ ОТПРАВКИ,
+    и лежит он в томе, переживающем пересоздание контейнеров.
+    """
+    verify = _VERIFY.read_text("utf-8")
+    assert 'redis_get "notify:daily_trades:last_day"' in verify
+    # Ключ тот самый, что ставит служба, — не переписан в скрипт по памяти.
+    assert daily_trades.LAST_SENT_KEY == "notify:daily_trades:last_day"
+    # Отметка ставится ПОСЛЕ отправки, иначе одна неудача сети стоила бы суток
+    # без сводки; проверяется порядком строк в модуле.
+    source = (_ROOT / "src" / "notify" / "daily_trades.py").read_text("utf-8")
+    assert source.index("ok = await send_message(text)") < source.index(
+        "LAST_SENT_KEY, now.strftime"
+    )
+    # Том Redis — именованный, то есть переживает пересоздание контейнера.
+    compose = (_ROOT / "docker-compose.yml").read_text("utf-8")
+    assert "redis_data:/data" in compose
+    assert re.search(r"^volumes:\n(?:.*\n)*?  redis_data:", compose, re.M)
+
+
+def test_the_migration_header_names_a_command_that_actually_works() -> None:
+    """Дефект 4: путь /docker-entrypoint-initdb.d/migrations/… не существует.
+
+    В ``docker-compose.yml`` смонтирован ОДИН файл
+    (``./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro``), каталога
+    ``migrations`` внутри контейнера нет вовсе — команда из шапки падала.
+
+    ИНСТРУКЦИЯ, КОТОРАЯ НЕ РАБОТАЕТ, ХУЖЕ ОТСУТСТВУЮЩЕЙ: отсутствующую ищут, а
+    по этой владелец сначала делает, потом разбирается, почему не вышло.
+    """
+    compose = (_ROOT / "docker-compose.yml").read_text("utf-8")
+    assert "./db/migrations" not in compose, (
+        "каталог миграций смонтирован — шапки можно вернуть к пути в контейнере"
+    )
+    for name in ("028_position_rejections.sql",
+                 "028_position_rejections_rollback.sql"):
+        body = (_MIGRATIONS / name).read_text("utf-8")
+        # ПРОВЕРЯЮТСЯ КОМАНДНЫЕ СТРОКИ, А НЕ ВЕСЬ ТЕКСТ: несуществующий путь
+        # назван в шапке ещё раз — в пояснении, почему он не годится. Ловить
+        # его там значило бы ловить собственное объяснение.
+        commands = [
+            line for line in body.split("\n")
+            if "psql -U" in line or "ON_ERROR_STOP" in line
+        ]
+        assert commands, name
+        for line in commands:
+            assert "/docker-entrypoint-initdb.d/migrations/" not in line, (
+                name, line
+            )
+        assert f"-f - < db/migrations/{name}" in body, name
+        # ON_ERROR_STOP обязателен: без него psql доходит до конца файла с
+        # кодом 0, и миграция выглядит применённой, будучи применённой
+        # наполовину.
+        assert "-v ON_ERROR_STOP=1" in body, name
+
+
+def test_the_snapshot_says_how_to_get_itself_onto_the_server() -> None:
+    """Дефект 5: §15 велит снять слепок ДО слияния, а скрипт лежит в ветке.
+
+    Курица и яйцо: на сервере скрипта ещё нет, а рабочий склад трогать нельзя —
+    слияние и есть то изменение, которое слепок обязан опередить.
+
+    СПОСОБ НЕ ДОЛЖЕН МЕНЯТЬ РАБОЧЕЕ ДЕРЕВО. ``git show <ветка>:<файл>`` печатает
+    содержимое в стандартный вывод и не трогает ни дерево, ни индекс, ни
+    текущую ветку. ``checkout``, ``merge`` и ``stash`` для этого не годятся —
+    любой из них меняет ровно то, что слепок измеряет.
+    """
+    header = _SNAPSHOT.read_text("utf-8").split("set -uo pipefail", 1)[0]
+    assert "git fetch origin" in header
+    assert "git show origin/" in header
+    assert ":deploy/snapshot_9_3.sh" in header
+    for forbidden in ("git checkout", "git merge", "git stash", "git pull"):
+        assert forbidden not in header, forbidden
+
+
+def test_the_metrics_file_accumulates_instead_of_being_wiped() -> None:
+    """Дефект 2 показала сверка ДВУХ прогонов — а файл метрик их не хранил.
+
+    Первая редакция затирала файл на каждом прогоне (``: > "${METRICS}"``), и
+    сравнить прогон с прогоном было нечем. Теперь прогоны дописываются и
+    разделены заголовком.
+    """
+    verify = _VERIFY.read_text("utf-8")
+    assert ': > "${METRICS}"' not in verify
+    assert '=== прогон %s ===' in verify
+    assert '>> "${METRICS}"' in verify
