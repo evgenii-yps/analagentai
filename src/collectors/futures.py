@@ -27,6 +27,7 @@ class FuturesCollector(BaseCollector):
         self.exchange = exchange
         self.instrument_id = instrument_id
         self.swap_symbol = swap_symbol
+        self._log = self._log.bind(exchange=exchange.id)
 
     async def collect_once(self) -> None:
         """Собирает funding rate и open interest (каждый независимо)."""

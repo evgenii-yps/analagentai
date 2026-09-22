@@ -26,6 +26,7 @@ class TradesCollector(BaseCollector):
         self.exchange = exchange
         self.instrument_id = instrument_id
         self.symbol = symbol
+        self._log = self._log.bind(exchange=exchange.id)
 
     async def collect_once(self) -> None:
         """Запрашивает сделки и сохраняет их (дедуп по (instrument_id, trade_id))."""

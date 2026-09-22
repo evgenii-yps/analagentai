@@ -52,6 +52,17 @@ class Settings(BaseSettings):
     TRADES_INTERVAL: int = 15           # сек между опросами сделок
     FUTURES_INTERVAL: int = 60          # сек между опросами funding/OI
 
+    # --- OKX testnet (ТЗ «Подключение OKX testnet») ---
+    # Продакшн сейчас читает OKX БЕЗ ключей (только публичные эндпоинты —
+    # свечи, стакан, сделки, funding, OI) — это поведение НЕ МЕНЯЕТСЯ.
+    # TESTNET переключает клиента на песочницу OKX (тот же домен, ccxt
+    # выставляет её параметром ``sandbox``), которая ТРЕБУЕТ подписанных
+    # запросов — отсюда и три ключа ниже.
+    TESTNET: bool = False
+    OKX_API_KEY: str = ""
+    OKX_SECRET_KEY: str = ""
+    OKX_PASSPHRASE: str = ""
+
     # --- Аналитические агенты (Этап 3) ---
     AGENT_TIMEFRAME: str = "1h"   # таймфрейм для Market Agent
     AGENT_INTERVAL: int = 60      # сек между запусками агентов
@@ -770,6 +781,33 @@ class Settings(BaseSettings):
                 "«версия логики неизвестна» и настоящей версией быть не может"
             )
         return value
+
+    @model_validator(mode="after")
+    def _okx_testnet_requires_credentials(self) -> "Settings":
+        """OKX testnet не поднимается без явных ключей.
+
+        Продакшн (``EXCHANGE=okx``, ``TESTNET=false``) ключей НЕ требует и
+        требовать не начинает: он читает только публичные эндпоинты OKX, как и
+        раньше. Песочница OKX подписанные запросы требует ВСЕГДА — пустой ключ
+        обязан ронять сервис на старте, а не проявляться авторизационной
+        ошибкой на каждой итерации коллектора через сутки молчания.
+        """
+        if self.EXCHANGE == "okx" and self.TESTNET:
+            missing = [
+                name
+                for name, value in (
+                    ("OKX_API_KEY", self.OKX_API_KEY),
+                    ("OKX_SECRET_KEY", self.OKX_SECRET_KEY),
+                    ("OKX_PASSPHRASE", self.OKX_PASSPHRASE),
+                )
+                if not value
+            ]
+            if missing:
+                raise ValueError(
+                    "EXCHANGE=okx TESTNET=true требует непустых: "
+                    + ", ".join(missing)
+                )
+        return self
 
     @property
     def bot_allowed_chat_ids(self) -> set[str]:

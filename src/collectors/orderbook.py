@@ -25,6 +25,7 @@ class OrderBookCollector(BaseCollector):
         self.instrument_id = instrument_id
         self.symbol = symbol
         self.depth = depth
+        self._log = self._log.bind(exchange=exchange.id)
 
     async def collect_once(self) -> None:
         """Запрашивает снимок стакана и сохраняет его (spread/объёмы считает БД-слой)."""

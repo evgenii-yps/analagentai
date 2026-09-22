@@ -26,6 +26,7 @@ async def run() -> None:
     log.info(
         "Запуск коллектора Agent Trade (Этап 2, состав инструментов — Этап 8.1)",
         exchange=settings.EXCHANGE,
+        testnet=settings.TESTNET,
         pairs=[pair.label for pair in pairs],
         tokens=[pair.token for pair in pairs],
     )
@@ -34,7 +35,13 @@ async def run() -> None:
     await db.connect()
     # Прогреваем клиент Redis заранее (heartbeat-ключи будут писаться коллекторами).
     get_redis()
-    exchange = create_exchange(settings.EXCHANGE)
+    exchange = create_exchange(
+        settings.EXCHANGE,
+        testnet=settings.TESTNET,
+        api_key=settings.OKX_API_KEY,
+        secret_key=settings.OKX_SECRET_KEY,
+        passphrase=settings.OKX_PASSPHRASE,
+    )
 
     tasks: list[asyncio.Task[None]] = []
     try:

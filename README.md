@@ -219,6 +219,40 @@ curl -fsSL https://raw.githubusercontent.com/evgenii-yps/analagentai/claude/depl
 `SWAP_SYMBOL`, `TIMEFRAMES`, `OHLCV_INTERVAL`, `ORDERBOOK_INTERVAL`,
 `ORDERBOOK_DEPTH`, `TRADES_INTERVAL`, `FUTURES_INTERVAL`.
 
+### OKX testnet
+
+Биржа выбирается одной переменной `EXCHANGE=binance|okx` — коллекторы (OHLCV,
+стакан, сделки, funding/OI) работают с обеими одинаково, ccxt сглаживает
+различия форматов символов и лимитов. Продакшн разворачивается с `EXCHANGE=okx`
+(см. `deploy/install.sh`) и ключей не требует вовсе: читает только публичные
+эндпоинты биржи.
+
+`TESTNET=true` (имеет смысл только вместе с `EXCHANGE=okx`) переключает клиента
+на песочницу OKX. В отличие от продакшна песочница требует подписанные запросы
+всегда, поэтому нужны три ключа:
+
+1. Зайдите на OKX → **Profile → My API** (<https://www.okx.com/account/my-api>).
+2. **Create V5 API Key** → отметьте **Demo trading** («Testnet»/песочница) при
+   создании ключа → права **Read** достаточно для сбора данных → задайте
+   passphrase (её вы придумываете сами, OKX её не выдаёт).
+3. Впишите в `.env`:
+   ```bash
+   EXCHANGE=okx
+   TESTNET=true
+   OKX_API_KEY=...
+   OKX_SECRET_KEY=...
+   OKX_PASSPHRASE=...
+   ```
+   Пустой ключ при `TESTNET=true` роняет сервис на старте понятной ошибкой
+   (`EXCHANGE=okx TESTNET=true требует непустых: ...`) — сервис никогда не
+   стартует «наполовину» с песочницей, о которую он не может авторизоваться.
+4. Проверьте доступность до `docker compose up`: `python -m src.healthcheck`
+   печатает `OKX testnet: OK`/`FAIL` (проверка включается в общий итог ТОЛЬКО
+   при `EXCHANGE=okx TESTNET=true` — на продакшн эта команда не влияет).
+5. Символ, недоступный на OKX (или временно не отвечающий), коллектор
+   пропускает с warning в логе и продолжает работу — данные по остальным
+   инструментам собираются как обычно (graceful degradation, §3.3 ТЗ).
+
 ## Аналитические агенты (Этап 3)
 
 Отдельный сервис `agents` (тот же образ, команда `python -m src.agents_main`)

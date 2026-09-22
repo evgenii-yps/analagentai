@@ -8,8 +8,19 @@ import ccxt.async_support as ccxt
 
 from src.core.http import EXCHANGE_USER_AGENT, exchange_headers
 
+# Биржи, которые умеет собирать проект. Список закрытый — опечатка в EXCHANGE
+# обязана ронять сервис понятной ошибкой, а не падать позже на несуществующем
+# методе ccxt.
+SUPPORTED_EXCHANGES = ("binance", "okx")
 
-def create_exchange(exchange_id: str) -> ccxt.Exchange:
+
+def create_exchange(
+    exchange_id: str,
+    testnet: bool = False,
+    api_key: str = "",
+    secret_key: str = "",
+    passphrase: str = "",
+) -> ccxt.Exchange:
     """Создаёт экземпляр ccxt-биржи с включённым rate-limit.
 
     Один экземпляр на процесс. По завершении работы закрывается через
@@ -31,7 +42,22 @@ def create_exchange(exchange_id: str) -> ccxt.Exchange:
     ``userAgent`` сам, но только если запрос идёт его собственным путём; явные
     ``headers`` покрывают и остальные случаи, а совпадающие значения друг другу
     не противоречат.
+
+    ``testnet`` — ТОЛЬКО для ``exchange_id == "okx"``: включает песочницу ccxt
+    (``sandbox: True`` — тот же домен ``www.okx.com``, но ccxt подставляет
+    заголовок ``x-simulated-trading`` и переключает подпись запросов). Продакшн
+    (``testnet=False``) НЕ меняется: клиент, как и раньше, ходит только по
+    публичным эндпоинтам и без ключей. Песочница OKX требует подписанные
+    запросы всегда — пустой ключ здесь обязан падать явной ошибкой, а не
+    авторизационным отказом биржи на первой же итерации коллектора.
+    Параметр вынесен из ``Settings`` намеренно: функция не читает глобальный
+    синглтон и проверяется без него (как ``ensure_instruments``).
     """
+    if exchange_id not in SUPPORTED_EXCHANGES:
+        raise ValueError(
+            f"Биржа {exchange_id!r} не поддерживается: {', '.join(SUPPORTED_EXCHANGES)}"
+        )
+
     config: dict[str, object] = {
         "enableRateLimit": True,
         "userAgent": EXCHANGE_USER_AGENT,
@@ -40,6 +66,22 @@ def create_exchange(exchange_id: str) -> ccxt.Exchange:
     ca_file = os.environ.get("SSL_CERT_FILE")
     if ca_file:
         config["cafile"] = ca_file
+
+    if testnet:
+        if exchange_id != "okx":
+            raise ValueError(
+                f"testnet=True поддерживается только для okx, получено "
+                f"exchange_id={exchange_id!r}"
+            )
+        if not (api_key and secret_key and passphrase):
+            raise ValueError(
+                "OKX testnet требует непустых api_key, secret_key, passphrase "
+                "(в .env: OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE)"
+            )
+        config["sandbox"] = True
+        config["apiKey"] = api_key
+        config["secret"] = secret_key
+        config["password"] = passphrase
 
     exchange_class = getattr(ccxt, exchange_id)
     return exchange_class(config)
