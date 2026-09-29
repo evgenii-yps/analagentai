@@ -685,6 +685,13 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # контрольного варианта с signal_outcomes_barrier — тогда сравнение вариантов
 # недействительно целиком.
 40 4 * * * ${APP_USER} cd ${APP_DIR} && /usr/bin/docker compose --profile tools run --rm --no-deps barrier python -m src.trailing_main >> ${APP_DIR}/logs/trailing.log 2>&1
+# Этап 9.4 A.2 Очистка кэша сборки Docker — воскресенье 04:00 UTC. Журнал ведёт
+# сам скрипт (logs/docker_gc.log), поэтому вывод cron отбрасывается.
+0 4 * * 0 ${APP_USER} ${APP_DIR}/scripts/docker_gc.sh >/dev/null 2>&1
+# Этап 9.4 C.3 Недельная выгрузка копии во внешнее хранилище — воскресенье
+# 04:30 UTC, ПОСЛЕ docker_gc (04:00). Запуск от root: настройки rclone лежат в
+# /root/.config/rclone/rclone.conf (root, 600). Журнал ведёт сам скрипт.
+30 4 * * 0 root ${APP_DIR}/scripts/remote_backup.sh >/dev/null 2>&1
 EOF
     log "Cron-задачи установлены (/etc/cron.d/agent-trade)."
 
