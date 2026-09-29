@@ -970,7 +970,11 @@ def test_migration_028_is_the_next_free_number_and_has_a_rollback() -> None:
     names = sorted(p.name for p in _MIGRATIONS.glob("0*.sql"))
     assert "028_position_rejections.sql" in names
     assert "028_position_rejections_rollback.sql" in names
-    assert not any(name.startswith("029_") for name in names)
+    # 029 занята этапом 9.4 (свёртка замеров), а не «ничем»: номер 028 остаётся
+    # следующим свободным ДЛЯ ЭТАПА 9.3, и других 029-х миграций быть не должно.
+    assert [n for n in names if n.startswith("029_")] in (
+        [], ["029_measure_rollups.sql", "029_measure_rollups_rollback.sql"]
+    )
     body = (_MIGRATIONS / "028_position_rejections.sql").read_text("utf-8")
     assert body.count("BEGIN;") == 1 and body.rstrip().endswith("COMMIT;")
     rollback = (

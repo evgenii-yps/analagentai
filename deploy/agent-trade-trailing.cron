@@ -37,4 +37,7 @@
 SHELL=/bin/bash
 PATH=/usr/local/bin:/usr/bin:/bin
 
-40 4 * * * agent cd /opt/agent-trade && /usr/bin/docker compose --profile tools run --rm --no-deps barrier python -m src.trailing_main >> /opt/agent-trade/logs/trailing.log 2>&1
+# ОТКЛЮЧЕНО НАСОВСЕМ (Этап 9.4, решение заказчика): замер 9.1.3 завершён, вывод
+# получен. Чтобы включить обратно при пересмотре замера — docs/maintenance.md,
+# раздел «Замер подвижного выхода: включить обратно».
+# 40 4 * * * agent cd /opt/agent-trade && /usr/bin/docker compose --profile tools run --rm --no-deps barrier python -m src.trailing_main >> /opt/agent-trade/logs/trailing.log 2>&1

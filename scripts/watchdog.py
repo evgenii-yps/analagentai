@@ -6,7 +6,15 @@ Telegram, если:
 
 * контейнер не в состоянии ``running``;
 * heartbeat сервиса не обновлялся дольше 5× интервала его цикла;
-* свободное место на диске меньше 15%.
+* свободное место на диске меньше двух порогов (Этап 9.4, блок E):
+  ``WATCHDOG_DISK_CRIT_PCT`` (15) — тревога, антиспам 1 раз в час, и
+  ``WATCHDOG_DISK_WARN_PCT`` (25) — раннее предупреждение, не чаще 1 раза в
+  24 часа под отдельным ключом антиспама.
+
+Раз в сутки вотчдог дописывает строку ``дата;занято_ГБ;свободно_процент`` в
+``logs/disk_usage.csv``; по последним 14 записям считается средний суточный
+прирост, и оба сообщения несут оценку «до порога 15% осталось N суток» (пока
+записей меньше 7 — «недостаточно данных»).
 
 Анти-спам: не чаще одного алерта в час по одной и той же причине (состояние
 хранится в Redis: ключ ``watchdog:alert:<причина>`` с TTL 3600, атомарный
@@ -27,6 +35,11 @@ import urllib.request
 from datetime import UTC, datetime
 
 APP_DIR = os.environ.get("APP_DIR", "/opt/agent-trade")
+
+# Прогноз диска — общий модуль с суточной сводкой (одна реализация расчёта).
+sys.path.insert(0, os.path.join(APP_DIR, "src", "health"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "health"))
+import disk_forecast  # noqa: E402
 
 CONTAINERS = ["postgres", "redis", "collector", "agents", "decision", "notify", "evaluator",
               "bot", "positions"]
@@ -52,7 +65,6 @@ HEARTBEATS: list[tuple[str, str, int, str]] = [
     ("positions:heartbeat", "POSITION_INTERVAL", 60, "positions"),
 ]
 
-DISK_MIN_FREE_PCT = float(os.environ.get("WATCHDOG_DISK_MIN_FREE_PCT", "15"))
 
 
 def _log(msg: str) -> None:
@@ -75,6 +87,34 @@ def _env_file() -> dict[str, str]:
 
 ENV = _env_file()
 
+DISK_ANTISPAM_CRIT_SEC = 3600          # тревога: не чаще раза в час
+DISK_ANTISPAM_WARN_SEC = 24 * 3600     # предупреждение: не чаще раза в сутки
+DISK_USAGE_CSV = os.path.join(APP_DIR, "logs", "disk_usage.csv")
+
+
+def _pct_setting(*keys: str, default: float) -> float:
+    """Порог из окружения или .env; первое найденное имя из ``keys``.
+
+    Хвостовой комментарий в .env (``KEY=15   # пояснение``) отбрасывается.
+    Окружение процесса перекрывает .env — так предупреждение проверяется
+    принудительно: ``WATCHDOG_DISK_WARN_PCT=90 scripts/watchdog.py``.
+    """
+    for key in keys:
+        raw = os.environ.get(key, ENV.get(key))
+        if raw is None:
+            continue
+        raw = raw.split("#", 1)[0].strip()
+        if raw:
+            return float(raw)
+    return default
+
+
+# Пороги свободного места, %. В боевом .env заданы явно (Этап 9.4 §8); умолчания
+# — страховка. Прежнее имя WATCHDOG_DISK_MIN_FREE_PCT читается как запасное для
+# CRIT, чтобы старый .env продолжал работать.
+DISK_CRIT_PCT = _pct_setting("WATCHDOG_DISK_CRIT_PCT", "WATCHDOG_DISK_MIN_FREE_PCT", default=15.0)
+DISK_WARN_PCT = _pct_setting("WATCHDOG_DISK_WARN_PCT", default=25.0)
+
 
 def _run(cmd: list[str], timeout: int = 60) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
@@ -96,13 +136,13 @@ def _redis_get(key: str) -> str:
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
-def _alert_allowed(reason: str, redis_up: bool) -> bool:
-    """True — если по этой причине можно слать алерт (анти-спам 1/час)."""
+def _alert_allowed(reason: str, redis_up: bool, ttl_sec: int = 3600) -> bool:
+    """True — если по этой причине можно слать алерт (анти-спам, по умолчанию 1/час)."""
     if not redis_up:
         # Redis недоступен — дедуп невозможен, но и сам Redis лежит: алертим.
         return True
     r = _compose("exec", "-T", "redis", "redis-cli",
-                 "SET", f"watchdog:alert:{reason}", "1", "EX", "3600", "NX")
+                 "SET", f"watchdog:alert:{reason}", "1", "EX", str(ttl_sec), "NX")
     return r.returncode == 0 and r.stdout.strip().upper() == "OK"
 
 
@@ -154,20 +194,69 @@ def _container_states() -> dict[str, str]:
     return states
 
 
-def _disk_free_pct() -> float | None:
-    """Свободно на корне ФС, %. None — если не удалось определить."""
-    r = _run(["df", "-P", "/"])
+def _disk_usage() -> tuple[float, float] | None:
+    """(занято ГБ, свободно %) корневой ФС по данным ``df``. None — не удалось.
+
+    Доля считается по тем же величинам, что и «Use%» в ``df`` (занято против
+    занято+доступно), но без округления до целых процентов.
+    """
+    r = _run(["df", "-P", "-B1", "/"])
     rows = r.stdout.splitlines()
     if len(rows) < 2:
         return None
     parts = rows[1].split()
-    if len(parts) < 5:
+    if len(parts) < 4:
         return None
     try:
-        used_pct = float(parts[4].rstrip("%"))
-        return 100.0 - used_pct
+        used, avail = float(parts[2]), float(parts[3])
     except ValueError:
         return None
+    if used + avail <= 0:
+        return None
+    return used / 1024**3, avail / (used + avail) * 100.0
+
+
+def _disk_free_pct() -> float | None:
+    """Свободно на корне ФС, %. None — если не удалось определить."""
+    usage = _disk_usage()
+    return None if usage is None else usage[1]
+
+
+def disk_forecast_text(used_gb: float, free_pct: float, crit_pct: float = DISK_CRIT_PCT,
+                       csv_path: str = DISK_USAGE_CSV) -> str:
+    """Оценка «до порога осталось N суток» по ``logs/disk_usage.csv``."""
+    capacity_gb = used_gb / (1.0 - free_pct / 100.0) if free_pct < 100.0 else used_gb
+    records = disk_forecast.read_records(csv_path)
+    days = disk_forecast.days_to_threshold(records, capacity_gb, crit_pct)
+    return disk_forecast.describe(days, crit_pct)
+
+
+def disk_alerts(free_pct: float, forecast: str, redis_up: bool) -> list[str]:
+    """Сообщения по двум порогам диска (без записи в журнал).
+
+    Ниже CRIT — тревога (антиспам 1/час, ключ ``disk``); ниже WARN, но не ниже
+    CRIT — предупреждение (антиспам 24 ч, отдельный ключ ``disk_warn``). При
+    прохождении CRIT предупреждение не дублируется: тревога уже несёт то же.
+    """
+    alerts: list[str] = []
+    if free_pct < DISK_CRIT_PCT:
+        _log(f"Мало места на диске: свободно {free_pct:.0f}% (< {DISK_CRIT_PCT:.0f}%). {forecast}.")
+        if _alert_allowed("disk", redis_up, DISK_ANTISPAM_CRIT_SEC):
+            alerts.append(
+                f"💾 Мало места на диске: свободно {free_pct:.0f}% "
+                f"(порог {DISK_CRIT_PCT:.0f}%). {forecast}"
+            )
+    elif free_pct < DISK_WARN_PCT:
+        _log(f"Предупреждение: свободно {free_pct:.0f}% (< {DISK_WARN_PCT:.0f}%). {forecast}.")
+        if _alert_allowed("disk_warn", redis_up, DISK_ANTISPAM_WARN_SEC):
+            alerts.append(
+                f"🟡 Место на диске убывает: свободно {free_pct:.0f}% "
+                f"(предупреждение при {DISK_WARN_PCT:.0f}%, тревога при {DISK_CRIT_PCT:.0f}%). "
+                f"{forecast}"
+            )
+        else:
+            _log("Предупреждение о диске подавлено антиспамом (уже сообщали за последние 24 ч).")
+    return alerts
 
 
 def main() -> int:
@@ -222,15 +311,26 @@ def main() -> int:
                 if _alert_allowed(f"heartbeat:{key}", redis_up):
                     alerts.append(f"💓 Heartbeat <b>{key}</b> устарел ({detail})")
 
-    # 3) Свободное место на диске.
-    free_pct = _disk_free_pct()
-    if free_pct is not None and free_pct < DISK_MIN_FREE_PCT:
-        _log(f"Мало места на диске: свободно {free_pct:.0f}% (< {DISK_MIN_FREE_PCT:.0f}%).")
-        if _alert_allowed("disk", redis_up):
-            alerts.append(
-                f"💾 Мало места на диске: свободно {free_pct:.0f}% "
-                f"(порог {DISK_MIN_FREE_PCT:.0f}%)"
-            )
+    # 3) Свободное место на диске: два порога и прогноз.
+    usage = _disk_usage()
+    free_pct = None if usage is None else usage[1]
+    _log(
+        f"Пороги диска: предупреждение при свободных < {DISK_WARN_PCT:.0f}%, "
+        f"тревога при < {DISK_CRIT_PCT:.0f}%."
+    )
+    if usage is not None:
+        used_gb, free_now = usage
+        try:
+            if disk_forecast.append_daily(
+                DISK_USAGE_CSV, datetime.now(UTC).date(), used_gb, free_now
+            ):
+                _log(f"Дописана суточная запись в {DISK_USAGE_CSV}: занято {used_gb:.2f} ГБ, "
+                     f"свободно {free_now:.2f}%.")
+        except OSError as exc:
+            _log(f"Не удалось дописать {DISK_USAGE_CSV}: {exc}")
+        forecast = disk_forecast_text(used_gb, free_now)
+        _log(f"Диск: занято {used_gb:.2f} ГБ, свободно {free_now:.1f}%. {forecast}.")
+        alerts.extend(disk_alerts(free_now, forecast, redis_up))
 
     if not down and free_pct is not None and not alerts:
         _log("Всё в норме. Действий не требуется.")
