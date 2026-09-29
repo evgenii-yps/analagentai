@@ -11,6 +11,13 @@
   которые не удаляются никогда;
 * ``position_rejections`` — старше ``RETENTION_POSITION_REJECTIONS_DAYS``
   (по умолчанию 90; §7.1 ТЗ 9.3).
+* ``trailing_outcomes`` / ``strategy_outcomes`` (Этап 9.4, блок D) — НЕ общим путём:
+  обе остаются в ``PROTECTED_TABLES``. Свёртка в ``*_daily`` и компактные таблицы пар
+  и удаление деталей — отдельный модуль ``scripts/measure_rollup.py`` со своими
+  ограждениями (счёт должен сойтись, писатели сняты с cron, первое удаление — только
+  командой ``--measure-delete`` с подтверждением числом). Ручные команды:
+  ``--measure-dry-run``, ``--measure-snapshot``, ``--measure-delete``,
+  ``--measure-sizes``, ``--measure-compact``.
 
 СНАЧАЛА СВЁРТКА, ПОТОМ УДАЛЕНИЕ. Сырая лента сделок живёт трое суток, но её
 содержательная часть остаётся навсегда: перед удалением задача сворачивает
@@ -40,11 +47,17 @@
 
 from __future__ import annotations
 
+import argparse
 import os
 import subprocess
 import sys
 import time
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+
+try:  # импорт пакетом (тесты) или запуск файлом из cron (каталог скрипта в sys.path)
+    from scripts import measure_rollup
+except ImportError:
+    import measure_rollup  # type: ignore[no-redef]
 
 APP_DIR = os.environ.get("APP_DIR", "/opt/agent-trade")
 
@@ -396,12 +409,19 @@ RETENTION_RULES: list[tuple[str, int, str]] = [
 RETENTION_RULES = [rule for rule in RETENTION_RULES if rule[1] > 0]
 
 
-def _psql(sql: str) -> str:
-    """Выполняет SQL в контейнере postgres, возвращает stdout (обрезанный)."""
+def _psql(*sqls: str) -> str:
+    """Выполняет SQL в контейнере postgres, возвращает stdout (обрезанный).
+
+    Каждый аргумент — отдельный ``-c`` (нужно для ``VACUUM``, который нельзя
+    выполнять внутри транзакции); одна строка с несколькими командами
+    выполняется одной транзакцией.
+    """
     cmd = [
         "docker", "compose", "exec", "-T", "postgres",
-        "psql", "-U", PG_USER, "-d", PG_DB, "-t", "-A", "-c", sql,
+        "psql", "-U", PG_USER, "-d", PG_DB, "-t", "-A",
     ]
+    for sql in sqls:
+        cmd += ["-c", sql]
     result = subprocess.run(
         cmd, cwd=APP_DIR, capture_output=True, text=True, check=True
     )
@@ -451,8 +471,77 @@ def _delete_in_batches(table: str, days: int, extra_where: str = "") -> int:
     return total
 
 
-def main() -> int:
+def _measure_cap_days() -> int:
+    """``MEASURE_DETAIL_RETENTION_DAYS`` — задаётся в .env явно (Этап 9.4 §7)."""
+    return measure_rollup.retention_days(_env_value("MEASURE_DETAIL_RETENTION_DAYS", ""))
+
+
+def measure_command(args: argparse.Namespace) -> int:
+    """Ручные команды блока D (Этап 9.4). Общие правила хранения при них НЕ выполняются."""
+    out_dir = os.path.join(APP_DIR, "analysis_out")
+    try:
+        if args.measure_dry_run:
+            measure_rollup.dry_run(_psql, cap_days=_measure_cap_days())
+        elif args.measure_delete:
+            if args.confirm_trailing is None or args.confirm_strategy is None:
+                _log("ОШИБКА: --measure-delete требует --confirm-trailing N и "
+                     "--confirm-strategy M (числа из прогона --measure-dry-run).")
+                return 2
+            return measure_rollup.delete_command(
+                _psql, cap_days=_measure_cap_days(),
+                confirm_trailing=args.confirm_trailing,
+                confirm_strategy=args.confirm_strategy, batch=BATCH, pause=PAUSE_SEC)
+        elif args.measure_snapshot:
+            label = args.measure_snapshot
+            upto = (date.fromisoformat(args.upto) if args.upto
+                    else measure_rollup.settle_cutoff())
+            path = os.path.join(out_dir, f"measure_rollups_{label}.txt")
+            digests = measure_rollup.snapshot(_psql, path, upto)
+            for table, digest in digests.items():
+                _log(f"{table}: sha256 {digest}")
+            _log(f"Слепок (сутки <= {upto}) записан: {path}. Повторите с тем же --upto "
+                 f"{upto} и сравните файлы: cmp")
+        elif args.measure_sizes:
+            measure_rollup.sizes(_psql, args.measure_sizes,
+                                 os.path.join(APP_DIR, "logs", "measure_sizes.log"))
+        elif args.measure_compact:
+            return measure_rollup.compact(_psql)
+    except measure_rollup.MeasureError as exc:
+        _log(f"ОТКАЗ: {exc}")
+        return 1
+    except subprocess.CalledProcessError as exc:
+        _log(f"ОШИБКА SQL: {(exc.stderr or '').strip() or exc}")
+        return 1
+    return 0
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Политика хранения данных. Без флагов — ночной прогон (cron). "
+                    "Флаги --measure-* — ручные команды блока D этапа 9.4.")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--measure-dry-run", action="store_true",
+                       help="свёртка замеров и отчёт «сколько будет удалено»; ничего не удаляет")
+    group.add_argument("--measure-delete", action="store_true",
+                       help="первое удаление деталей замеров (нужно подтверждение числами)")
+    group.add_argument("--measure-snapshot", metavar="МЕТКА",
+                       help="слепок свёрток в analysis_out/measure_rollups_<МЕТКА>.txt")
+    group.add_argument("--measure-sizes", metavar="МЕТКА",
+                       help="размеры таблиц замеров и df (три точки замера места)")
+    group.add_argument("--measure-compact", action="store_true",
+                       help="VACUUM FULL обеих таблиц замеров (возвращает место диску)")
+    parser.add_argument("--confirm-trailing", type=int, default=None)
+    parser.add_argument("--confirm-strategy", type=int, default=None)
+    parser.add_argument("--upto", default=None, help="верхние сутки слепка, ГГГГ-ММ-ДД")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
     """Прогоняет правила хранения. Возвращает 0 при успехе, 1 при ошибке."""
+    args = parse_args(argv)
+    if (args.measure_dry_run or args.measure_delete or args.measure_snapshot
+            or args.measure_sizes or args.measure_compact):
+        return measure_command(args)
     _log("=== Политика хранения данных (Этап 8.1 §4) ===")
     _log(
         "Никогда не удаляются: часовые (и любые не 1m) свечи, "
@@ -569,6 +658,21 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001
             had_error = True
             _log(f"ОШИБКА при очистке {table}: {exc}")
+
+    # 4. Замеры (Этап 9.4, блок D): свёртка всегда, удаление деталей — только после
+    # первого подтверждённого удаления. Своё ограждение, а не общий путь выше:
+    # обе таблицы в PROTECTED_TABLES и через _delete_in_batches не удаляются.
+    try:
+        if not measure_rollup.nightly(
+            _psql, cap_days=_measure_cap_days(), batch=BATCH, pause=PAUSE_SEC
+        ):
+            had_error = True
+    except measure_rollup.MeasureError as exc:
+        had_error = True
+        _log(f"ОШИБКА замеров: {exc}")
+    except subprocess.CalledProcessError as exc:
+        had_error = True
+        _log(f"ОШИБКА замеров: {(exc.stderr or '').strip() or exc}")
 
     if had_error:
         _log("Завершено с ошибками (см. выше).")

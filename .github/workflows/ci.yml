@@ -10,6 +10,24 @@ jobs:
     env:
       # Пароль обязателен для импорта конфига в тестах.
       POSTGRES_PASSWORD: ci_test_password
+      # Настоящий PostgreSQL для тестов SQL свёртки замеров (Этап 9.4, блок D).
+      # Без него tests/test_stage_9_4_d.py пропускается.
+      PGTEST_HOST: localhost
+      PGTEST_PORT: "5432"
+      PGTEST_USER: postgres
+      PGPASSWORD: ci_test_password
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: ci_test_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
 

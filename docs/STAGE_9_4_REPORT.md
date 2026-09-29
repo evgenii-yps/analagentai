@@ -9,7 +9,7 @@
 | **A** Docker: журналы, автоочистка кэша | код готов: `deploy/docker-daemon.json`, `deploy/merge_docker_daemon.py`, `scripts/docker_gc.sh`, cron |
 | **B** хранение копий | код готов: `scripts/backup_db.sh` |
 | **C** внешняя выгрузка | код готов: `scripts/remote_backup.sh`, `deploy/install_rclone.sh`; **нужна авторизация Google Drive** (§4) |
-| **D** свёртка замеров | **СТОП по ТЗ D.1: реализации нет.** Доклад — §3. Жду подтверждения заказчика |
+| **D** свёртка замеров | код готов (§3) с учётом трёх поправок заказчика: миграция 029, `scripts/measure_rollup.py`, флаги `retention.py`; проверено на настоящем PostgreSQL 16. **На боевой базе не применялось, ничего не удалено** — порядок §3.7, удаление только после вашего подтверждения по цифрам прогона |
 | **E** вотчдог, два порога, прогноз | код готов: `scripts/watchdog.py`, `src/health/disk_forecast.py`, `src/health/daily_report.py` |
 | **F** runbook | `docs/maintenance.md` |
 
@@ -17,7 +17,7 @@
 к боевому серверу (`46.224.52.105`). Поэтому ни один критерий приёмки §10
 **не закрыт выводом с боевого сервера** — по правилу от 13.09 отчёт без вывода
 команды не засчитывается. В репозитории проверено то, что можно проверить без
-сервера (§6: `ruff` чисто, `pytest` 1165 passed на Python 3.12, скрипты прогнаны
+сервера (§6: `ruff` чисто, `pytest` зелёный на Python 3.12, скрипты прогнаны
 настоящим запуском с подставными docker/curl/rclone). Порядок снятия боевых
 выводов — §5, по критериям — §7.
 
@@ -106,178 +106,196 @@
 
 | # | что | решение |
 |---|---|---|
-| 1 | ТЗ: «восемь новых переменных» (п. 10.11) | Фактически **десять**: B — 3, C — 4, E — 2, D — 1 (`MEASURE_DETAIL_RETENTION_DAYS`, добавляется вместе с блоком D). Все — в `.env.example`; в боевой `.env` нужны явно (§5, шаг 2) |
+| 1 | ТЗ: «восемь новых переменных» (п. 10.11) | Фактически **десять**: B — 3, C — 4, E — 2, D — 1 (`MEASURE_DETAIL_RETENTION_DAYS`). Все — в `.env.example`; в боевой `.env` нужны явно (§5, шаг 2) |
 | 2 | `deploy/backup_db.sh` в ТЗ | файл `scripts/backup_db.sh` |
 | 3 | A.1 «`systemctl restart docker`» | недостаточно, см. §1.A; используется `down` + загрузка |
 | 4 | Cron внешней выгрузки | от `root` (настройки rclone в `/root`) |
 | 5 | Журнал systemd 575 МБ не ограничен — в ТЗ назван причиной, но в блоках A–F **нет задачи** на него | предложение: `SystemMaxUse=200M` в `/etc/systemd/journald.conf.d/`. Не сделано — вне scope IN. Скажите, включать ли |
 | 6 | Ручные дампы в `/root` (1.8 ГБ) удалены вручную, штатного правила нет | вне scope; отмечено |
-| 7 | B, откат: «копия за 7-е сутки выгружается наружу вручную» | понято как **7-й по свежести файл** (`ls -1 backups \| sort -r \| sed -n 7p`), выгружается в `gdrive:AgentTrade/manual` (не ротируется). Если имелся в виду другой файл — поправьте |
+| 7 | B, откат: копия, выгружаемая наружу вручную | по вашему решению — **самый свежий файл**; выгружается в `gdrive:AgentTrade/manual` (не ротируется) |
 | 8 | Обёртки `sudo -u agent` | rclone и правки `/etc` — через `sudo` (root); всё про docker — `sudo -u agent`. `remote_backup.sh` запускается от root |
 
-## 3. Доклад D.1 (БЛОКИРУЮЩИЙ: реализация блока D не начата)
+## 3. Блок D — свёртка таблиц замеров (после подтверждения доклада D.1)
 
-### 3.1. Фактический DDL
+Заказчик принял DDL и объёмы (вывод `report_9_4_d1.sql`) и утвердил три поправки. Ниже —
+что реализовано, расчёт размеров, ответ на вопрос о `strategy_outcomes`, порядок действий
+и то, что требует вашего решения. **Ничего не удалено, миграция на боевой базе не применена.**
 
-**Ограничение честности.** Доступа к боевой базе нет, поэтому ниже DDL **из
-миграций репозитория** (`016_strategy_outcomes.sql`, `017_trailing_outcomes.sql`;
-в `src/core/db.py` те же схемы продублированы для `CREATE IF NOT EXISTS`). Это не
-то же самое, что DDL боевой базы: миграции могли быть применены с отличиями.
-Боевой DDL снимается **одной командой, только чтение** (`scripts/report_9_4_d1.sql`,
-§5 шаг 0а) — она же даёт размеры, число строк, состав по версиям и суткам и
-признак «пишет ли кто-то сейчас». Прошу приложить её вывод к подтверждению.
+### 3.1. Решения заказчика, как они реализованы
 
-`trailing_outcomes` (PK `(signal_id, horizon_h, activation_ratio, retrace_ratio)`):
-`signal_id BIGINT → signals(id)`, `horizon_h SMALLINT`, `activation_ratio NUMERIC(4,2)`,
-`retrace_ratio NUMERIC(4,2)`, `logic_version SMALLINT`, `direction TEXT`,
-`price_at_signal NUMERIC(20,8)`, `target_pct`, `stop_pct`, `cost_pct NUMERIC(10,6)`,
-`exit_reason TEXT` (`target|stop|trail|timeout|ambiguous|no_data`), `hit_at TIMESTAMPTZ`,
-`bars_to_hit INT`, `net_pnl_pct NUMERIC(12,6)`, `peak_pct`, `mae_pct`, `mfe_pct
-NUMERIC(12,6)`, `resolution TEXT` (`1m|1h`), `computed_at TIMESTAMPTZ`. Индексы:
-`(logic_version, activation_ratio, retrace_ratio, horizon_h)`, `(exit_reason,
-horizon_h)`. Тринадцать вариантов (A,R): (0,0) — контроль «фиксированная цель», и
-12 подвижных 4×3. **Инструмента и времени сигнала в таблице нет** — берутся
-соединением с `signals` (`instrument_id`, `ts`).
+| решение | как выполнено |
+|---|---|
+| **П.1** граница хранения — версия логики | `scripts/measure_rollup.py::_rule_allows`: детали версий **старше текущей** сворачиваются и удаляются независимо от возраста; переход на новую `LOGIC_VERSION` автоматически переводит предыдущую в удаляемые (тест `test_переход_на_новую_версию…`). «Текущая» — последнее окно `logic_version_windows` |
+| **П.2** `trailing_outcomes` завершён | таблица в `FROZEN_TABLES`: сворачивается и удаляется **вся**; `trailing_main` **отключён насовсем** — строка закомментирована в `deploy/install.sh`, `deploy/agent-trade-trailing.cron` и (на сервере) при выполнении шага 9 порядка ниже; как включить обратно — `docs/maintenance.md` |
+| **П.2** `strategy_outcomes` продолжается | `baseline_main` (04:25) работает; детали **текущей** версии хранятся полностью, сворачиваются только версии 5 и 6 (и любая будущая — после смены версии) |
+| **П.2** временное снятие обоих писателей на окно удаления | обязательный шаг 1 порядка; `--measure-delete` и `--measure-compact` **сами читают `/etc/cron.d`** и отказывают, если в нём есть активные строки `trailing_main`/`baseline_main` (проверено тестами) |
+| **П.3** удаление не освобождает диск | отдельная команда `--measure-compact` (`VACUUM (FULL, ANALYZE)`) с проверкой свободного места (таблица с индексами + запас 1 ГБ — по факту `df`), проверкой зависимостей и активных запросов, `lock_timeout 60s`; три точки замера `--measure-sizes` (данные / индексы / всего + `df`, в `logs/measure_sizes.log`) |
+| состав свёрток | как согласовано (колонки — `db/migrations/029_measure_rollups.sql`) |
+| `trailing_pairs_compact`, `strategy_pairs_compact` | утверждена первая; вторая — по рекомендации (3.4). Обе строят точное воспроизведение (3.3) |
 
-`strategy_outcomes` (PK `(strategy, instrument_id, entry_ts, horizon_h)`):
-`strategy TEXT` (`always_buy|always_sell|coin_flip|system|grid_buy|grid_sell`),
-`instrument_id INT`, `entry_ts TIMESTAMPTZ`, `horizon_h SMALLINT`, `signal_id BIGINT`
-(NULL у сетки), `logic_version SMALLINT`, `direction TEXT`, `price_at_entry`,
-`target_pct`, `target_source TEXT`, `stop_pct`, `cost_pct`, `outcome TEXT`
-(`target|stop|timeout|ambiguous|no_data`), `hit_at`, `net_pnl_pct NUMERIC(12,6)`,
-`mae_pct`, `mfe_pct`, `resolution TEXT`, `seed BIGINT` (только `coin_flip`),
-`computed_at`. Индексы: `(signal_id, horizon_h, strategy)`, `(strategy, horizon_h,
-outcome)`.
+**Закрытая проверка (по п. 7 вывода заказчика):** ни представлений, ни триггеров, ни
+функций, ни внешних ссылок на обе таблицы нет — структурных препятствий к изменению
+схемы нет. Команда `--measure-compact` **повторяет эту проверку перед блокировкой и
+печатает числа** (`Зависимости и активность: представления: 0; триггеры: 0; функции: 0;
+внешние ссылки на таблицы: 0; активные запросы к таблицам: 0`) — вывод войдёт в отчёт
+по шагу 10 порядка. Читателей у обеих таблиц нет (доклад D.1: грепом по исходникам).
 
-Объёмы по данным ТЗ и кода: `trailing_outcomes` 2179 МБ (1 707 940 строк на момент
-отчёта 9.1.3), `strategy_outcomes` 864 МБ.
+### 3.2. Что построено
 
-### 3.2. Ответ на вопрос 1 — кто пишет и работает ли сейчас
+* `db/migrations/029_measure_rollups.sql` (+ `_rollback.sql`): `trailing_outcomes_daily`,
+  `strategy_outcomes_daily`, `trailing_pairs_compact`, `strategy_pairs_compact`,
+  `measure_rollup_state`. Путь ручного применения в шапках — **реальный** (`< файл` через
+  stdin с хоста): каталог `db/migrations` в контейнер **не смонтирован** (смонтирован
+  только `db/init.sql`), `/docker-entrypoint-initdb.d/migrations/` не годится.
+* `scripts/measure_rollup.py` — вся логика; `scripts/retention.py` вызывает её ночным шагом
+  и ручными флагами `--measure-dry-run | --measure-snapshot | --measure-delete |
+  --measure-sizes | --measure-compact`. Отдельной ночной задачи нет.
+* Свёртка: только завершённые сутки (день ≤ сегодня − 3), **каждые сутки одной
+  транзакцией** (итоги + компактные пары), `ON CONFLICT DO NOTHING`, идемпотентна.
+  День — `signals.ts` (UTC) для trailing и `entry_ts` (UTC) для strategy, `logic_version`
+  в ключе (сутки смены версии дают две строки — тест).
+* Удаление — только там, где счёт сошёлся **трижды**: строк деталей = сумме `n_rows`
+  свёртки = строкам компактной таблицы, и сумма итогов в деньгах в деталях = сумме в
+  компактной таблице (до миллионной доли процента). Иначе сутки пропускаются и
+  печатаются. При неудаче свёртки удаление пропускается целиком.
+* Первое удаление — только `--measure-delete` с подтверждением ЧИСЛАМИ из прогона
+  «только счёт» (иначе отказ); после успеха ставится флаг `delete_armed` **в базе**
+  (при восстановлении из копии он вернётся вместе с данными), и далее ночной прогон
+  удаляет сам — так «предыдущая версия автоматически переходит в свёрнутое состояние».
+* Обе исходные таблицы **остаются в `PROTECTED_TABLES`** (`verify_8_9/8_10` продолжают
+  проходить; общий путь удаления `retention.py` их по-прежнему отвергает — тест).
+* Проверено на **настоящем PostgreSQL 16** (28 тестов, `tests/test_stage_9_4_d.py`; в CI
+  добавлен сервис postgres): сумма/среднее/квартили против независимого расчёта;
+  компактная таблица **против `scripts/trailing_stats.collect`** по каждой паре (та же
+  причина отсева и те же тринадцать значений, до знака); мутации (правило `<=` вместо
+  `<`, ослабление сверки) тестами ловятся.
 
-Писателей **два**, оба — ночные задачи cron, обе идут в контейнере `barrier`
-профиля `tools`:
+### 3.3. Что воспроизводится из свёрнутого
 
-| таблица | писатель | cron |
-|---|---|---|
-| `strategy_outcomes` | `src/baseline_main.py` → `src/baseline/runner.py` → `DB.save_strategy_outcome` (`db.py:1102`) | 04:25 UTC, `deploy/agent-trade-baseline.cron`, строка в `deploy/install.sh` |
-| `trailing_outcomes` | `src/trailing_main.py` → `src/trailing/runner.py` → `DB.save_trailing_outcomes` (`db.py:2839`) | 04:40 UTC, `deploy/agent-trade-trailing.cron`, строка в `deploy/install.sh` |
+* `trailing_pairs_compact`: по строке на пару (сигнал, горизонт): `logic_version`, `n_rows`,
+  **самый ранний `computed_at` пары** (граница «старое/новое» в 9.1.3 идёт по нему),
+  `exclude_reason` (`incomplete|no_data|ambiguous` — правило `collect()` дословно) и тринадцать
+  итогов `v00..v12` в порядке `VARIANTS` в миллионных долях процента (INT4, без потери точности).
+  Время сигнала и токен берутся из вечных `signals`/`instruments` по `signal_id`. Этого
+  достаточно для парного бутстрэпа, перестановочной проверки и половины по времени.
+* `strategy_pairs_compact`: по строке на пару (сигнал, горизонт, версия): итоги
+  `system / always_buy / always_sell / coin_flip` (NULL — нет итога). Направление, «отправлен
+  человеку», токен — из `signals`. Сетки (`grid_*`) не привязаны к сигналам, попарно не
+  сравниваются и представлены только суточными итогами.
+* **Что НЕ воспроизводится и почему это нормально:** построчные `target_pct/stop_pct/cost_pct`,
+  `hit_at`, `bars_to_hit` конкретных сделок и `mae/mfe` по строкам — в суточных итогах
+  остаются как средние/медианы. Процентили посуточные и не сливаются в процентили за период.
 
-**Работают ли сейчас:** по ТЗ §1 таблицы «продолжают расти» — значит, работают.
-Подтверждается запросом п. 3 файла `report_9_4_d1.sql` (`max(computed_at)`,
-строки за 24 ч/7 дней) и `/etc/cron.d/`, `tail logs/baseline.log logs/trailing.log`.
+### 3.4. Размер (по измерению на боевом объёме, а не по прикидке)
 
-**Предложение (отдельный пункт): отключить обоих писателей** — закомментировать две
-строки cron (в `/etc/cron.d/` на сервере и в `deploy/install.sh`/`deploy/*.cron`
-репозитория); код не трогается, включить обратно — раскомментировать. Это не
-косметика, а **условие безопасности блока D** — установлено чтением кода:
+Прогон на настоящем PostgreSQL с 3 594 292 строками `trailing_outcomes` (13 сут., 276 484 пар;
+таблица 713 МБ) дал: `trailing_pairs_compact` **44 МБ с индексом = 159 Б на пару**, суточные
+итоги 664 кБ на 3 172 строки; свёртка 13 суток — 29 с, сверка — 1.4 с, удаление — 15 с.
+Перенос на боевые 9 750 559 строк (**750 043 пары**, а не ~130 тыс., как я оценивал в первом
+докладе — эта оценка исходила из 1.7 млн строк 9.1.3):
 
-* оба писателя идемпотентны через «уже посчитанные пары», а множество пар берётся
-  **из самой таблицы** (`get_trailing_pairs_done`, `get_strategy_pairs_done`), тогда
-  как список пар для расчёта — из `signal_outcomes_barrier` за **всю историю
-  текущей версии** (`get_trailing_anchors`: нет ограничения по давности,
-  `--since` по умолчанию пуст);
-* значит, удалённые детали ночью будут сочтены «недосчитанными» и **посчитаны заново**
-  — а минутных свечей старше 30 суток уже нет (`RETENTION_1M_DAYS=30`), и строка
-  запишется с `resolution='1h'`/`no_data`. Детали «воскреснут» в худшем разрешении
-  под тем же ключом, а таблица снова начнёт расти;
-* контроль `check_trailing_control` (сверка с `signal_outcomes_barrier`) при
-  отсутствии удалённых пар даёт `missing`, и ночная задача вернёт код 1.
+| что | оценка |
+|---|---|
+| `trailing_pairs_compact` (все версии) | **≈ 120 МБ** (по версиям 5–6 — ≈ 60 МБ) |
+| `trailing_outcomes_daily` | ≈ 2–3 МБ |
+| `strategy_outcomes_daily` | единицы МБ |
+| `strategy_pairs_compact` | ≤ 37 МБ на версии 5–6 (верхняя граница: ≤ 374 тыс. пар × ~100 Б); строится для всех версий, у текущей + ~35 МБ, растёт ~2 МБ/сутки |
+| **освободится** | trailing 2 179 МБ − 123 ≈ **2.05 ГБ**; strategy v5–6 ≈ 426 МБ − 37 ≈ **0.39 ГБ**; **итого ≈ 2.4 ГБ** (заказчик ожидал 2.6 ГБ; разница — компактные таблицы) |
 
-Если заказчик не хочет отключать писателей — альтернатива требует правки
-`src/trailing/runner.py` и `src/baseline/runner.py` (ограничить окно расчёта
-`MEASURE_DETAIL_RETENTION_DAYS`); это код замера, но не запрещённые ТЗ каталоги.
-Рекомендую отключение: замер 9.1.3 завершён.
+Точные числа даст прогон «только счёт» (шаг 5 порядка) — **до любого удаления**. Если 120 МБ
+компактной trailing кажется много: вариант «только версии 5–6» вдвое меньше; версия 7 в
+замере 9.1.3 не участвовала (он снят при `LOGIC_VERSION=5`). По умолчанию сохранены **все**
+версии — экономия 60 МБ не стоит риска потерять воспроизводимость; скажите, если нужно иначе.
 
-### 3.3. Ответ на вопрос 2 — читает ли что-то, кроме скриптов анализа
+### 3.5. Ответ на вопрос: компактная таблица пар для `strategy_outcomes` версий 5 и 6
 
-Проверено грепом по исходникам (`grep -rn -E "trailing_outcomes|strategy_outcomes"`
-по `*.py *.sql *.sh *.yml`):
+**Да, реализована, размер сопоставим с trailing.** Сравнение системы со случайностью
+(`baseline_bootstrap.py`, `09_baseline_compare.sql`) идёт **попарно** по `(signal_id, horizon_h)`
+между `system` и тремя базовыми стратегиями; без пар осталась бы только разность средних
+без доверительного интервала — а по правилу проекта именно интервал делает разницу
+измерением. Размер ≤ 37 МБ на две версии. Сетки в пары не входят по построению (у них нет
+`signal_id`) и в попарное сравнение не входят и сейчас.
 
-* `src/agents/`, `src/decision/`, `src/positions/`, `src/evaluator*`, `src/export*`,
-  `src/calibration*`, `backtest/`, `live_*.py` — **ни одного упоминания**.
-* Читатели вне писателей:
-  * `DB.fetch_trailing_resample_batch` (`db.py:2182`, `FROM trailing_outcomes t JOIN signals`)
-    ← `scripts/trailing_resample_9_1_3.py` и `tests/memory/`;
-  * `scripts/trailing_stats.py:116` (`FROM trailing_outcomes`) — три защиты от подгонки;
-  * `analysis/sql/09_baseline_compare.sql` (`FROM strategy_outcomes`);
-  * `DB.get_strategy_stats_snapshot`, `count/get/delete_strategy_outcomes_unsettled`
-    ← только `scripts/repair_9_1_strategy_settle.py` (одноразовый ремонт 9.1.1);
-  * `DB.check_trailing_control` (`db.py:2904`) ← `trailing/runner.compute` (контроль
-    писателя, см. 3.2);
-  * `deploy/verify_8_9.sh`, `verify_8_10.sh`, `verify_9_1.sh` — приёмочные проверки
-    прошлых этапов; `verify_8_9/8_10` **проверяют, что таблицы входят в
-    `PROTECTED_TABLES` в `scripts/retention.py`**, и при выходе из списка напишут
-    «НЕ защищена — вернуть».
-* Внешних читателей (Sheets/Notion-выгрузка, Telegram-бот, суточная сводка) нет.
+### 3.6. ЧТО ТРЕБУЕТ ВАШЕГО РЕШЕНИЯ
 
-**Вывод: горячий путь и все сервисы таблицы не читают.** Читают только скрипты
-анализа замеров, ночной контроль писателя и старые приёмочные скрипты.
+1. **Поправки 1 и 2 расходятся по текущей версии `strategy_outcomes`.** П.1: «не глубже
+   `MEASURE_DETAIL_RETENTION_DAYS`» (30 суток); п.2: «детали текущей версии хранятся
+   полностью, без прореживания». Реализовано по п.2 (безопаснее: удалённое не вернуть, а
+   вопрос о преимуществе над случайностью открыт). Значит, `MEASURE_DETAIL_RETENTION_DAYS`
+   **читается, проверяется и печатается, но ни к какой таблице сейчас не применяется**
+   (`CAPPED_TABLES` пуст; это осознанная правка кода). Версия 7 достигнет 30 суток примерно
+   **12 октября**. Решение нужно до этой даты: оставить как есть, либо включить потолок
+   для `strategy_outcomes` (одна строка в коде + тест).
+2. **Объём компактной trailing** (3.4): все версии (≈120 МБ) или только 5–6 (≈60 МБ).
+3. Вы упомянули решения «предыдущего сообщения» (четыре расхождения по факту, шаг 0 о доставке
+   скриптов, копия для отката = самая свежая). Этого сообщения в моём контексте нет — я
+   применил только «самая свежая» (шаг 4 порядка §5 исправлен) и «журнал systemd — по вашему
+   решению». Пришлите остальное текстом, если оно влияет на работу.
 
-### 3.4. Что это значит для реализации (предупреждения)
+### 3.7. Порядок блока D на сервере (по одной команде, из `/opt/agent-trade`)
 
-1. **`PROTECTED_TABLES`.** Обе таблицы защищены кодом от любого удаления, и защита
-   проверяется перед каждым `DELETE`. Предлагаю **оставить их в списке** (verify
-   старых этапов остаются валидными) и добавить отдельный узкий путь
-   `_delete_measure_details()`, который удаляет **только** после сверки: по каждым
-   суткам, подлежащим удалению, `count(*)` деталей == сумме `n_rows` свёртки за эти
-   сутки. Это строже, чем «свёртка не упала».
-2. **Свёртка не воспроизводит вывод 9.1.3 полностью.** Вывод 9.1.3 получен
-   `trailing_stats.py`: парный бутстрэп (10 000 пересборок), перестановочная
-   проверка разброса и проверка на независимой половине. Всем трём нужны значения
-   **по парам (сигнал, горизонт) сразу по тринадцати вариантам** — из суточных
-   агрегатов «сутки × инструмент × версия × вариант» они не восстанавливаются, как
-   ни выбирать набор показателей. Из свёртки получатся точно: число наблюдений,
-   распределение исходов, среднее (по `sum/n`), средняя разность с контролем
-   (по парным суммам), приближённые доверительные интервалы; **не получатся**:
-   бутстрэп-интервалы, перестановочный разброс, вердикт «на независимых данных».
-   **Решение заказчика:** (а) принять; (б) рекомендую — добавить третью, маленькую
-   таблицу `trailing_pairs_compact` (по строке на пару: `signal_id, horizon_h,
-   logic_version` и тринадцать `net_pnl_pct` массивом; ≈130 тыс. пар ≈ 15–20 МБ) —
-   она даёт **точное** воспроизведение всех трёх защит. Это расширение сверх ТЗ,
-   без подтверждения не делаю.
-3. **Ключ «день».** У `trailing_outcomes` нет времени сигнала и инструмента — они
-   берутся из `signals` (`ts::date`, `instrument_id`); у `strategy_outcomes` день —
-   `entry_ts::date`. День — по UTC. Не по `computed_at`: строка дня D считается на
-   следующую-послеследующую ночь.
-4. **Завершённость суток.** Сутки D свёртываются только когда `D + 1 сутки +
-   максимальный горизонт (24 ч) + запас` уже позади; свёртка `ON CONFLICT DO NOTHING`
-   (образец `agent_outputs_daily`), а неполные сутки никогда не сворачиваются, чтобы
-   не зафиксировать неполный итог навсегда.
-5. **Гранулярность и показатели** — ниже, нужно ваше «да».
+Шаги 5–8 выполняйте **в один календарный день UTC** (граница «завершённых суток» сдвигается
+в 00:00 UTC, а ночной прогон в 03:40 свёртывает новые сутки — числа подтверждения после этого
+изменятся, и `--measure-delete` откажет; тогда просто повторите шаг 5).
 
-### 3.5. Предложенный состав свёртки (на подтверждение)
+1. **Снять писателей** (копия расписания — для отката):
+   ```
+   sudo mkdir -p /root/cron.before_D && sudo cp -a /etc/cron.d/agent-trade* /root/cron.before_D/
+   sudo sed -i -E 's,^([^#].*src\.(baseline_main|trailing_main).*)$,# \1,' /etc/cron.d/agent-trade*
+   grep -n -E "baseline_main|trailing_main" /etc/cron.d/*
+   pgrep -af "baseline_main|trailing_main"
+   sudo -u agent crontab -l; sudo crontab -l
+   ```
+   Ожидание: все найденные строки начинаются с `#`; `pgrep` пуст; в личных crontab писателей нет
+   (ограждение читает только `/etc/cron.d`, личные crontab проверяет человек).
+2. **Отдельная копия базы, вне ротации, 30 суток** (`backup_db.sh` удалит её сам по истечении срока):
+   ```
+   sudo -u agent mkdir -p backups/manual
+   sudo -u agent bash -c 'set -o pipefail; docker compose exec -T postgres pg_dump -U agenttrade -Fc agenttrade | gzip -c > backups/manual/pre_9_4_d_$(date -u +%F).dump.gz'
+   gzip -t backups/manual/pre_9_4_d_*.dump.gz && ls -l backups/manual
+   sudo rclone copy backups/manual/pre_9_4_d_$(date -u +%F).dump.gz gdrive:AgentTrade/manual
+   ```
+   Ожидание: `gzip -t` без вывода, размер ~0.5–0.6 ГБ, файл в облаке.
+3. **Миграция и переменная:**
+   ```
+   sudo -u agent docker compose exec -T postgres psql -U agenttrade -d agenttrade < db/migrations/029_measure_rollups.sql
+   echo "MEASURE_DETAIL_RETENTION_DAYS=30" | sudo -u agent tee -a .env
+   ```
+   Ожидание: `COMMIT`; проверить `grep -c MEASURE_DETAIL_RETENTION_DAYS .env` = 1.
+4. **Замер места «до»:** `sudo -u agent python3 scripts/retention.py --measure-sizes 1_до_удаления`
+5. **Прогон «только счёт»** (строит свёртки — они производные и безвредны, деталей не трогает):
+   `sudo -u agent python3 scripts/retention.py --measure-dry-run | tee analysis_out/measure_dry_run.txt`
+   Отчёт: по каждой таблице и версии — сколько строк удалится, сколько останется по правилу,
+   сколько строк свёртки, размеры компактных таблиц, строка с числами подтверждения.
+6. **Слепок свёрток «до»** (граница фиксируется явно):
+   `U=$(date -u -d '3 days ago' +%F); sudo -u agent python3 scripts/retention.py --measure-snapshot до --upto $U`
+7. **Ваше подтверждение по цифрам шага 5.**
+8. **Удаление** — числа берутся дословно из шага 5:
+   `sudo -u agent python3 scripts/retention.py --measure-delete --confirm-trailing N --confirm-strategy M`
+   Затем `--measure-snapshot после --upto $U` и
+   `cmp analysis_out/measure_rollups_до.txt analysis_out/measure_rollups_после.txt && echo БАЙТ_В_БАЙТ`.
+9. **Замер «после удаления», уплотнение, замер «после уплотнения», `df`:**
+   ```
+   sudo -u agent python3 scripts/retention.py --measure-sizes 2_после_удаления
+   sudo -u agent python3 scripts/retention.py --measure-compact
+   sudo -u agent python3 scripts/retention.py --measure-sizes 3_после_уплотнения
+   df -h /
+   ```
+   Ожидание: `df` после шага 2 почти не изменился, после уплотнения — упал; индексы по обеим
+   таблицам печатаются отдельно. Пока идёт `VACUUM FULL`, обеим таблицам нужна пауза — писателей нет.
+10. **Вернуть `baseline_main`, `trailing_main` НЕ возвращать:**
+    ```
+    sudo cp -a /root/cron.before_D/. /etc/cron.d/
+    sudo sed -i -E 's,^([^#].*src\.trailing_main.*)$,# \1,' /etc/cron.d/agent-trade*
+    grep -n -E "baseline_main|trailing_main" /etc/cron.d/*
+    ```
+    Ожидание: `baseline_main` — без `#`, `trailing_main` — с `#`. На следующее утро проверить
+    `tail logs/baseline.log`.
 
-**`trailing_outcomes_daily`**, PK `(day, instrument_id, logic_version, horizon_h,
-activation_ratio, retrace_ratio)` (ключевое измерение замера — **вариант выхода (A,R)
-× горизонт**; `logic_version` в PK, сутки смены версии дают две строки):
-`n_rows`; исходы `n_target, n_stop, n_trail, n_timeout, n_ambiguous, n_no_data`;
-`n_resolution_1m, n_resolution_1h`; по `net_pnl_pct` (только строки с итогом):
-`n_pnl, sum_pnl, sum_sq_pnl, avg_pnl, p10, p25, p50, p75, p90`; `avg_peak_pct,
-avg_mae_pct, avg_mfe_pct, avg_bars_to_hit`; `avg_target_pct, avg_stop_pct,
-avg_cost_pct`; парные величины к контролю (0,0) на парах с полным набором из
-тринадцати итогов: `n_pairs_full, sum_diff_vs_fixed, sum_sq_diff_vs_fixed`.
-Ожидаемое число строк: ≈ (число суток) × 5 × 4 × 13 на версию — порядка 10 тыс.
-строк, единицы МБ (меньше ожидавшихся ТЗ ~100 МБ).
-
-**`strategy_outcomes_daily`**, PK `(day, instrument_id, logic_version, strategy,
-horizon_h)` (ключевое измерение — **стратегия × горизонт**): `n_rows`; исходы
-`n_target, n_stop, n_timeout, n_ambiguous, n_no_data`; `n_resolution_1m/1h`;
-`n_pnl, sum_pnl, sum_sq_pnl, avg_pnl, p10…p90`; `avg_mae_pct, avg_mfe_pct`;
-`avg_target_pct, avg_stop_pct, avg_cost_pct`; парные к `system` на общих
-`(signal_id, horizon_h)` (кроме сеток, у которых сигнала нет — там NULL):
-`n_pairs_vs_system, sum_diff_vs_system, sum_sq_diff_vs_system`.
-
-Оговорка: процентили посуточные и **не сливаются в процентили за период** — это
-свойство любых агрегатов; точные числа за период даёт `sum/n`.
-
-### 3.6. Что я жду от заказчика по D
-1. Вывод `report_9_4_d1.sql` (боевой DDL и факты).
-2. «Да/нет» по составу §3.5 и по третьей таблице `trailing_pairs_compact` (§3.4 п. 2).
-3. «Да/нет» на отключение двух писателей (§3.2).
-4. После этого — реализация D.2, откат `db/migrations/029_…_rollback.sql` (с
-   реальным путём применения внутри контейнера — не `/docker-entrypoint-initdb.d/`),
-   затем D.3: слепок «до/после», отдельная копия на 30 суток, прогон «только
-   посчитать», отчёт, и удаление **отдельной командой** после подтверждения.
+**Откат блока D:** детали — из копии шага 2 (`pg_restore` в новую базу и обратный перенос
+недостающих таблиц; SQL-пути возврата удалённых строк нет); свёртки — `029_measure_rollups_rollback.sql`
+(осторожно: после удаления деталей свёртки единственный след замера); писатели — `cp -a` из
+`/root/cron.before_D` (кроме `trailing_main`, см. `docs/maintenance.md`, там же обязательный `--since`).
 
 ## 4. Инструкция заказчику: авторизация Google Drive (C.2)
 
@@ -352,10 +370,10 @@ sudo rclone about gdrive:
    * 0а. Доклад D.1, факты: `sudo -u agent docker compose exec -T postgres psql -U agenttrade -d agenttrade < scripts/report_9_4_d1.sql > analysis_out/report_9_4_d1.txt`
 1. `sudo -u agent git pull` (ветка после слияния).
 2. **Прописать 10 переменных в боевой `.env` явно** (критерий 10.11). Проверить:
-   `grep -E "^(BACKUP_KEEP_DAILY|BACKUP_KEEP_MONTHLY|BACKUP_DIR_MAX_GB|REMOTE_BACKUP_ENABLED|REMOTE_BACKUP_REMOTE|REMOTE_BACKUP_PATH|REMOTE_BACKUP_KEEP|WATCHDOG_DISK_CRIT_PCT|WATCHDOG_DISK_WARN_PCT)=" .env`
-   — должно быть 9 строк (десятая, `MEASURE_DETAIL_RETENTION_DAYS`, — с блоком D). Значения — из `.env.example`.
+   `grep -E "^(BACKUP_KEEP_DAILY|BACKUP_KEEP_MONTHLY|BACKUP_DIR_MAX_GB|REMOTE_BACKUP_ENABLED|REMOTE_BACKUP_REMOTE|REMOTE_BACKUP_PATH|REMOTE_BACKUP_KEEP|WATCHDOG_DISK_CRIT_PCT|WATCHDOG_DISK_WARN_PCT|MEASURE_DETAIL_RETENTION_DAYS)=" .env`
+   — должно быть 10 строк (добавить в шаблон запроса `|MEASURE_DETAIL_RETENTION_DAYS`). Значения — из `.env.example`.
 3. **Google Drive** (§4): rclone, авторизация, `rclone about`. Свободно < 7 ГБ — стоп.
-4. **Копия для отката B:** `f=$(ls -1 backups | grep -E '^agenttrade_[0-9-]{10}\.dump\.gz$' | sort -r | sed -n 7p); echo $f; sudo rclone copy "backups/$f" gdrive:AgentTrade/manual`
+4. **Копия для отката B:** `f=$(ls -1 backups | grep -E '^agenttrade_[0-9-]{10}\.dump\.gz$' | sort -r | sed -n 1p); echo $f; sudo rclone copy "backups/$f" gdrive:AgentTrade/manual`
 5. **Тест выгрузки:** `sudo scripts/remote_backup.sh` → в конце «Готово: выгрузка … прошла»; `sudo rclone lsjson gdrive:AgentTrade/backups`.
 6. **Имитация сбоя (10.6):** `sudo REMOTE_BACKUP_REMOTE=net_takogo scripts/remote_backup.sh; echo "код=$?"` → сообщение в Telegram и `код=1`.
 7. **Cron:** `sudo bash deploy/add_cron_9_4.sh` (печатает строки docker_gc и remote_backup; критерий 10.3: `grep -E "docker_gc|remote_backup" /etc/cron.d/agent-trade`).
@@ -365,33 +383,36 @@ sudo rclone about gdrive:
 10. **Вотчдог (10.10):** `sudo -u agent python3 scripts/watchdog.py` — видны «Пороги диска…» и создан `logs/disk_usage.csv`; принудительное предупреждение:
     `sudo -u agent env WATCHDOG_DISK_WARN_PCT=99 python3 scripts/watchdog.py` дважды подряд — первый раз сообщение уходит, второй — «подавлено антиспамом»;
     после проверки: `sudo -u agent docker compose exec -T redis redis-cli DEL watchdog:alert:disk_warn`.
-11. **Окно обслуживания с перезагрузкой (A.1, 10.1):** `docs/maintenance.md`, шаги 1–6.
-12. **Слепок «после» (10.13):** `sudo -u agent bash deploy/snapshot_9_4.sh after` → три `OK`.
+11. **Блок D (свёртка замеров):** §3.7 — десять шагов; удаление только после вашего подтверждения по цифрам прогона «только счёт».
+12. **Окно обслуживания с перезагрузкой (A.1, 10.1):** `docs/maintenance.md`, шаги 1–6.
+13. **Слепок «после» (10.13):** `sudo -u agent bash deploy/snapshot_9_4.sh after` → три `OK`.
 
 ## 6. Проверки в репозитории
 
 * `ruff check .` — чисто.
-* `pytest` — 1165 passed, 98 skipped (Python 3.12, как в проекте); новые 38 тестов —
-  `tests/test_stage_9_4.py`: ротация суточных/месячных, порча настроек, превышение
+* `pytest` — все зелёные (Python 3.12, как в проекте); новые тесты —
+  `tests/test_stage_9_4.py` (39): ротация суточных/месячных, порча настроек, превышение
   потолка, `docker_gc` без `-a`, слияние `daemon.json`, выгрузка (успех, несовпадение
   размера, неверное хранилище, `ENABLED=false`, ротация в хранилище, отсутствие токена
   в журнале), прогноз диска (меньше 7 записей, прирост, окно 14, пропуски суток,
   нулевой прирост), два порога и антиспам, строки сводки, граница этапа (нет правок в
-  `src/agents/`, `src/decision/`, `src/positions/`).
+  `src/agents/`, `src/decision/`, `src/positions/`); `tests/test_stage_9_4_d.py` (28, блок D,
+  на настоящем PostgreSQL 16; в CI поднимается сервис postgres).
 * Граница ТЗ соблюдена: `LOGIC_VERSION` не менялся, ни один файл в запрещённых каталогах не тронут.
 
 ## 7. Критерии приёмки: чего не хватает
 
 | # | критерий | состояние |
 |---|---|---|
-| 10.1 | `docker inspect`: max-size 20m, max-file 3 | ждёт окна (§5 шаг 11) |
+| 10.1 | `docker inspect`: max-size 20m, max-file 3 | ждёт окна (§5 шаг 12) |
 | 10.2 | `docker_gc` отработал, кэш < 1 ГБ | ждёт сервера |
 | 10.3 | строки в `/etc/cron.d/agent-trade` | ждёт сервера |
 | 10.4 | ровно 7 суточных, объём посчитан | ждёт сервера |
 | 10.5 | `rclone about`, выгрузка, размер совпал | ждёт авторизации |
 | 10.6 | имитация сбоя → Telegram, код ≠ 0 | ждёт rclone на сервере (в песочнице — пройдено тестом) |
-| 10.7 | доклад D.1 | **предоставлен (§3), ждёт подтверждения** |
-| 10.8–10.9 | слепки свёртки, таблицы свёртки | **не начаты, ждут D.1** |
+| 10.7 | доклад D.1 | **предоставлен и подтверждён заказчиком до какого-либо удаления** (поправки — §3.1) |
+| 10.8 | слепки свёртки до/после совпали побайтно; отдельная копия базы | код и `cmp` готовы (§3.7 шаги 2, 6, 8); в тесте на настоящем PostgreSQL слепки совпали; **боевой прогон ждёт вашего подтверждения по цифрам** |
+| 10.9 | обе таблицы свёртки заполнены, «было / стало» | ждёт сервера (§3.7 шаги 4, 5, 9) |
 | 10.10 | оба порога, 24 ч, CSV | ждёт сервера |
 | 10.11 | 10 переменных в боевом `.env` | ждёт сервера |
 | 10.12 | `docs/maintenance.md` | **есть** |
@@ -407,7 +428,7 @@ sudo rclone about gdrive:
   файлы не вернуть — поэтому шаг 4 (копия наружу).
 * **C:** `REMOTE_BACKUP_ENABLED=false`. Полностью: убрать строку cron, `sudo rm /root/.config/rclone/rclone.conf`,
   отозвать доступ в Google (§4, шаг 7).
-* **D:** реализации нет — откатывать нечего.
+* **D:** см. §3.7, «Откат блока D» (детали — только из копии шага 2; `029_..._rollback.sql` удаляет лишь производные таблицы).
 * **E:** вернуть прежний `scripts/watchdog.py` (`git checkout 0e2c34b -- scripts/watchdog.py`);
   `src/health/disk_forecast.py` и правки `daily_report.py` без вотчдога безвредны.
 
@@ -422,5 +443,5 @@ sudo rclone about gdrive:
 | | занято | свободно |
 |---|---|---|
 | на момент выдачи ТЗ (по ТЗ, после ручной чистки) | ~21.5 ГБ | ~16 ГБ |
-| после этапа (A, B, C, E, F) | **не измерено** — снимается шагом 12 | ожидается ≈ +4.2 ГБ (копии) |
-| после блока D (свёртка) | после D | ожидается ещё ≈ +3 ГБ в базе и ≈ −⅓ размера суточных копий |
+| после этапа (A, B, C, E, F) | **не измерено** — снимается шагом 13 | ожидается ≈ +4.2 ГБ (копии) |
+| после блока D (свёртка) | после шагов 4 / 9 §3.7: три точки, числами | ожидается ещё ≈ +2.4 ГБ (§3.4) и суточные копии легче примерно на треть; суточный прирост базы ≈ 90 → ≈ 26 МБ (+≈ 2 МБ компактные пары) |

@@ -16,8 +16,10 @@
 #     объёмом. СВЕРХ ПРАВИЛА НИЧЕГО НЕ УДАЛЯЕТСЯ: превышение означает, что
 #     выросла база, и это повод для решения человека, а не для тихого удаления.
 #
-# Файлы вне шаблона agenttrade_<дата>[.monthly].dump.gz (например, ручная копия
-# перед этапом в backups/manual/) ротацией не затрагиваются никогда.
+# Файлы вне шаблона agenttrade_<дата>[.monthly].dump.gz ротацией по числу не
+# затрагиваются никогда. Исключение одно: ручные копии перед рискованными
+# операциями backups/manual/pre_*.dump.gz (Этап 9.4, D.3) хранятся 30 суток по
+# времени изменения файла и потом удаляются — «вне ротации на 30 суток».
 #
 # Запускается из cron под пользователем ``agent`` (входит в группу docker),
 # ежедневно в 03:10 UTC.
@@ -107,6 +109,15 @@ rotate() {  # $1 = регулярное выражение имени, $2 = ск
 }
 rotate "$DAILY_RE" "$BACKUP_KEEP_DAILY" "суточный"
 rotate "$MONTHLY_RE" "$BACKUP_KEEP_MONTHLY" "месячный"
+
+# Ручные копии перед рискованными операциями: 30 суток, потом удаляются.
+MANUAL_KEEP_DAYS=30
+if [[ -d "$BACKUP_DIR/manual" ]]; then
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        rm -f "$f" && log "Удалена ручная копия старше ${MANUAL_KEEP_DAYS} суток: $f"
+    done < <(find "$BACKUP_DIR/manual" -maxdepth 1 -type f -name 'pre_*.dump.gz' -mtime "+${MANUAL_KEEP_DAYS}")
+fi
 
 n_daily="$(ls -1 "$BACKUP_DIR" | grep -c -E "$DAILY_RE" || true)"
 n_monthly="$(ls -1 "$BACKUP_DIR" | grep -c -E "$MONTHLY_RE" || true)"

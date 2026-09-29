@@ -14,7 +14,7 @@ import os
 import stat
 import subprocess
 import sys
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import pytest
@@ -138,6 +138,22 @@ def test_b_посторонние_файлы_ротацией_не_затраг�
     (manual / "pre_9_4.dump.gz").write_bytes(b"keep")
     _run(sandbox, "backup_db.sh", {"BACKUP_TODAY": "2026-09-30"})
     assert (manual / "pre_9_4.dump.gz").exists()
+
+
+def test_b_ручная_копия_pre_живёт_30_суток_и_потом_удаляется(sandbox):
+    _touch_backups(sandbox["app"], DAILY_14)
+    manual = sandbox["app"] / "backups" / "manual"
+    manual.mkdir()
+    fresh, old, other = (manual / "pre_9_4_d_2026-09-29.dump.gz",
+                         manual / "pre_9_4_d_2026-08-01.dump.gz", manual / "note.txt")
+    for f in (fresh, old, other):
+        f.write_bytes(b"x")
+    stale = datetime.now().timestamp() - 31 * 86400
+    os.utime(old, (stale, stale))
+    os.utime(other, (stale, stale))
+    _run(sandbox, "backup_db.sh", {"BACKUP_TODAY": "2026-09-30"})
+    assert fresh.exists() and other.exists()      # свежая и посторонний файл целы
+    assert not old.exists()                        # старше 30 суток — удалена
 
 
 @pytest.mark.parametrize("bad", ["0", "abc", ""])
