@@ -337,8 +337,8 @@ def test_правило_trailing_всё_strategy_только_старые_ве�
     _rollup_all(env)
     current = mr.current_logic_version(env.psql)
     assert current == 7
-    t = mr.plan_deletion(env.psql, mr.TRAILING, current=current, cap_days=30)
-    s = mr.plan_deletion(env.psql, mr.STRATEGY, current=current, cap_days=30)
+    t = mr.plan_deletion(env.psql, mr.TRAILING, current=current)
+    s = mr.plan_deletion(env.psql, mr.STRATEGY, current=current)
     # trailing (заморожена): под удаление все завершённые сутки ВСЕХ версий, включая текущую.
     assert {e.logic_version for e in t.eligible} == {5, 6, 7}
     assert t.mismatched == []
@@ -356,16 +356,19 @@ def test_переход_на_новую_версию_переводит_пред
     _rollup_all(env)
     env.psql(f"INSERT INTO logic_version_windows (logic_version, started_at) "
              f"VALUES (8, '{TODAY}');")
-    s = mr.plan_deletion(env.psql, mr.STRATEGY, current=mr.current_logic_version(env.psql),
-                         cap_days=30)
+    s = mr.plan_deletion(env.psql, mr.STRATEGY, current=mr.current_logic_version(env.psql),)
     assert {e.logic_version for e in s.eligible} == {5, 6, 7}
 
 
-def test_потолок_возраста_не_применяется_пока_список_пуст(env):
+def test_календарный_потолок_не_применяется_нигде(env):
+    """Решение 29.09.2026: граница хранения — только версия логики, потолка по возрасту нет."""
     _rollup_all(env)
-    s = mr.plan_deletion(env.psql, mr.STRATEGY, current=7, cap_days=1)
+    s = mr.plan_deletion(env.psql, mr.STRATEGY, current=7)
     assert 7 not in {e.logic_version for e in s.eligible}
-    assert mr.CAPPED_TABLES == frozenset()
+    assert not hasattr(mr, "CAPPED_TABLES")
+    assert "cap_days" not in mr.plan_deletion.__code__.co_varnames
+    note = mr.retention_days_note(30)
+    assert "не применяется" in note and "решение 29.09.2026" in note
 
 
 def test_расхождение_счёта_блокирует_удаление_только_этих_суток(env):
@@ -374,7 +377,7 @@ def test_расхождение_счёта_блокирует_удаление_�
     env.psql(f"UPDATE {mr.TRAILING_DAILY} SET n_rows = n_rows + 1 WHERE day = '{day}' "
              f"AND instrument_id = 1 AND horizon_h = 1 AND activation_ratio = 0.25 "
              f"AND retrace_ratio = 0.20;")
-    plan = mr.plan_deletion(env.psql, mr.TRAILING, current=7, cap_days=30)
+    plan = mr.plan_deletion(env.psql, mr.TRAILING, current=7)
     assert day in {d for d, _, _ in plan.mismatched}
     assert day not in {e.day for e in plan.eligible}
     assert len(plan.eligible) > 3                                     # остальные сутки целы
@@ -384,7 +387,7 @@ def test_расхождение_счёта_блокирует_удаление_�
     env.psql(f"UPDATE {mr.TRAILING_COMPACT} SET v00 = v00 + 1 WHERE day = '{other}' "
              f"AND exclude_reason IS NULL AND ctid = (SELECT min(ctid) FROM {mr.TRAILING_COMPACT} "
              f"WHERE day = '{other}' AND exclude_reason IS NULL);")
-    plan = mr.plan_deletion(env.psql, mr.TRAILING, current=7, cap_days=30)
+    plan = mr.plan_deletion(env.psql, mr.TRAILING, current=7)
     assert other in {d for d, _, _ in plan.mismatched}
 
 
@@ -393,7 +396,7 @@ def test_расхождение_компактной_strategy_блокирует
     day = TODAY - timedelta(days=11)
     env.psql(f"DELETE FROM {mr.STRATEGY_COMPACT} WHERE day = '{day}' AND signal_id = "
              f"(SELECT min(signal_id) FROM {mr.STRATEGY_COMPACT} WHERE day = '{day}');")
-    plan = mr.plan_deletion(env.psql, mr.STRATEGY, current=7, cap_days=30)
+    plan = mr.plan_deletion(env.psql, mr.STRATEGY, current=7)
     assert day in {d for d, _, _ in plan.mismatched}
 
 
@@ -402,10 +405,10 @@ def test_расхождение_компактной_strategy_блокирует
 
 def _delete(env, cron, plans_confirm=None, **kw):
     current = mr.current_logic_version(env.psql)
-    t = mr.plan_deletion(env.psql, mr.TRAILING, current=current, cap_days=30)
-    s = mr.plan_deletion(env.psql, mr.STRATEGY, current=current, cap_days=30)
+    t = mr.plan_deletion(env.psql, mr.TRAILING, current=current)
+    s = mr.plan_deletion(env.psql, mr.STRATEGY, current=current)
     return mr.delete_command(
-        env.psql, cap_days=30,
+        env.psql,
         confirm_trailing=t.delete_rows if plans_confirm is None else plans_confirm[0],
         confirm_strategy=s.delete_rows if plans_confirm is None else plans_confirm[1],
         batch=50, pause=0, cron_dir=str(cron), **kw), t, s
@@ -450,7 +453,7 @@ def test_удаление_отклоняется_пока_писатели_в_cr
         "25 4 * * * agent cd /x && docker compose run barrier python -m src.baseline_main\n",
         encoding="utf-8")
     with pytest.raises(mr.MeasureError, match="писатели"):
-        mr.delete_command(env.psql, cap_days=30, confirm_trailing=0, confirm_strategy=0,
+        mr.delete_command(env.psql, confirm_trailing=0, confirm_strategy=0,
                           batch=50, pause=0, cron_dir=str(d))
     # Закомментированная строка писателем не считается; пустой каталог — «неизвестно».
     assert mr.writers_active(str(d)) == {"trailing_main": True, "baseline_main": True}
@@ -459,15 +462,59 @@ def test_удаление_отклоняется_пока_писатели_в_cr
 
 def test_удаление_без_свёртки_невозможно(env, cron):
     """Сутки, которые не свёрнуты, в план не попадают: число подтверждения будет нулевым."""
-    t = mr.plan_deletion(env.psql, mr.TRAILING, current=7, cap_days=30)
+    t = mr.plan_deletion(env.psql, mr.TRAILING, current=7)
     assert t.eligible == [] and t.delete_rows == 0
-    assert all("свёртк" in why or "строк деталей" in why for _, _, why in t.mismatched)
+    assert all("≠ строк в свёртке 0" in why for _, _, why in t.mismatched)
+
+
+def test_отказ_называет_несошедшееся_сравнение_и_числа(env, cron):
+    """Отказ без диагностики — тупик: должно быть видно, КАКОЕ сравнение и с какими числами."""
+    _rollup_all(env)
+    t = mr.plan_deletion(env.psql, mr.TRAILING, current=7)
+    s = mr.plan_deletion(env.psql, mr.STRATEGY, current=7)
+    day = TODAY - timedelta(days=11)
+    n = int(env.psql(f"SELECT sum(n_rows) FROM {mr.TRAILING_DAILY} WHERE day = '{day}';"))
+    env.psql(f"UPDATE {mr.TRAILING_DAILY} SET n_rows = n_rows + 1 WHERE day = '{day}' "
+             f"AND instrument_id = 1 AND horizon_h = 1 AND activation_ratio = 0.25 "
+             f"AND retrace_ratio = 0.20;")
+    env.psql(f"UPDATE {mr.TRAILING_COMPACT} SET v00 = v00 + 1 WHERE ctid = (SELECT min(ctid) "
+             f"FROM {mr.TRAILING_COMPACT} WHERE day = '{day}' AND exclude_reason IS NULL);")
+    with pytest.raises(mr.MeasureError) as err:
+        mr.delete_command(env.psql, confirm_trailing=t.delete_rows,
+                          confirm_strategy=s.delete_rows, batch=50, pause=0, cron_dir=str(cron))
+    text = str(err.value)
+    assert f"сутки {day}" in text
+    assert f"строк деталей {n} ≠ строк в свёртке {n + 1}" in text     # первое сравнение
+    assert "сумма итогов: в деталях" in text and "≠ в компактной таблице" in text  # третье
+    assert "сверка не сошлась" in text and "НЕ штатная смена даты" in text
+    assert f"подтверждено {t.delete_rows}, сейчас к удалению" in text
+    assert _count(env, f"SELECT count(*) FROM {mr.TRAILING} t JOIN signals s "
+                       f"ON s.id = t.signal_id WHERE s.ts < '{CUTOFF + timedelta(days=1)}'") > 0
+
+
+def test_отказ_при_сдвиге_даты_не_путает_с_расхождением_сверки(env, cron):
+    _rollup_all(env)
+    t = mr.plan_deletion(env.psql, mr.TRAILING, current=7)
+    s = mr.plan_deletion(env.psql, mr.STRATEGY, current=7)
+    with pytest.raises(mr.MeasureError) as err:
+        mr.delete_command(env.psql, confirm_trailing=t.delete_rows - 1,
+                          confirm_strategy=s.delete_rows, batch=50, pause=0, cron_dir=str(cron))
+    text = str(err.value)
+    assert "Расхождений сверки нет" in text and "Повторите прогон" in text
+    assert f"подтверждено {t.delete_rows - 1}, сейчас к удалению {t.delete_rows}" in text
+    assert f"подтверждено {s.delete_rows}, сейчас к удалению {s.delete_rows} (совпало)" in text
+
+
+def test_несвёрнутые_сутки_диагностируются_как_нет_в_свёртке(env):
+    plan = mr.plan_deletion(env.psql, mr.STRATEGY, current=7)     # свёртка не строилась
+    assert plan.delete_rows == 0 and plan.mismatched
+    assert all("≠ строк в свёртке 0" in why for _, _, why in plan.mismatched)
 
 
 def test_ночной_прогон_без_разрешения_ничего_не_удаляет(env, cron):
     before = _count(env, f"SELECT count(*) FROM {mr.TRAILING}") + _count(
         env, f"SELECT count(*) FROM {mr.STRATEGY}")
-    assert mr.nightly(env.psql, cap_days=30, cron_dir=str(cron), batch=50, pause=0)
+    assert mr.nightly(env.psql, cron_dir=str(cron), batch=50, pause=0)
     after = _count(env, f"SELECT count(*) FROM {mr.TRAILING}") + _count(
         env, f"SELECT count(*) FROM {mr.STRATEGY}")
     assert before == after
@@ -478,7 +525,7 @@ def test_ночной_прогон_с_разрешением_удаляет_по
     mr.rollup(env.psql, mr.TRAILING)
     mr.rollup(env.psql, mr.STRATEGY)
     mr.arm(env.psql)
-    assert mr.nightly(env.psql, cap_days=30, cron_dir=str(cron), batch=50, pause=0)
+    assert mr.nightly(env.psql, cron_dir=str(cron), batch=50, pause=0)
     assert _count(env, f"SELECT count(*) FROM {mr.STRATEGY} WHERE logic_version < 7") == 0
     assert _count(env, f"SELECT count(*) FROM {mr.STRATEGY} WHERE logic_version = 7") > 0
 
@@ -491,13 +538,13 @@ def test_ночной_прогон_пропускает_trailing_пока_пис
         encoding="utf-8")
     mr.arm(env.psql)
     before = _count(env, f"SELECT count(*) FROM {mr.TRAILING}")
-    assert mr.nightly(env.psql, cap_days=30, cron_dir=str(d), batch=50, pause=0)
+    assert mr.nightly(env.psql, cron_dir=str(d), batch=50, pause=0)
     assert _count(env, f"SELECT count(*) FROM {mr.TRAILING}") == before
 
 
 def test_ночной_прогон_без_миграции_не_ошибка(env, cron):
     env.exec_file(ROOT / "db" / "migrations" / "029_measure_rollups_rollback.sql")
-    assert mr.nightly(env.psql, cap_days=30, cron_dir=str(cron), batch=50, pause=0) is True
+    assert mr.nightly(env.psql, cron_dir=str(cron), batch=50, pause=0) is True
 
 
 def test_свёртка_после_удаления_не_возрождает_детали(env, cron):
@@ -541,7 +588,7 @@ def test_размеры_печатаются_числами(env, tmp_path):
 
 def test_прогон_только_счёт_ничего_не_удаляет(env, capsys):
     before = _count(env, f"SELECT count(*) FROM {mr.TRAILING}")
-    plans = mr.dry_run(env.psql, cap_days=30)
+    plans = mr.dry_run(env.psql)
     out = capsys.readouterr().out
     assert _count(env, f"SELECT count(*) FROM {mr.TRAILING}") == before
     assert f"--confirm-trailing {plans[mr.TRAILING].delete_rows}" in out

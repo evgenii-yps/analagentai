@@ -472,7 +472,8 @@ def _delete_in_batches(table: str, days: int, extra_where: str = "") -> int:
 
 
 def _measure_cap_days() -> int:
-    """``MEASURE_DETAIL_RETENTION_DAYS`` — задаётся в .env явно (Этап 9.4 §7)."""
+    """``MEASURE_DETAIL_RETENTION_DAYS`` — задаётся в .env явно и проверяется, но НЕ
+    ПРИМЕНЯЕТСЯ (решение заказчика 29.09.2026: граница хранения — версия логики)."""
     return measure_rollup.retention_days(_env_value("MEASURE_DETAIL_RETENTION_DAYS", ""))
 
 
@@ -488,7 +489,7 @@ def measure_command(args: argparse.Namespace) -> int:
                      "--confirm-strategy M (числа из прогона --measure-dry-run).")
                 return 2
             return measure_rollup.delete_command(
-                _psql, cap_days=_measure_cap_days(),
+                _psql,
                 confirm_trailing=args.confirm_trailing,
                 confirm_strategy=args.confirm_strategy, batch=BATCH, pause=PAUSE_SEC)
         elif args.measure_snapshot:
@@ -663,9 +664,8 @@ def main(argv: list[str] | None = None) -> int:
     # первого подтверждённого удаления. Своё ограждение, а не общий путь выше:
     # обе таблицы в PROTECTED_TABLES и через _delete_in_batches не удаляются.
     try:
-        if not measure_rollup.nightly(
-            _psql, cap_days=_measure_cap_days(), batch=BATCH, pause=PAUSE_SEC
-        ):
+        _log("Замеры: " + measure_rollup.retention_days_note(_measure_cap_days()))
+        if not measure_rollup.nightly(_psql, batch=BATCH, pause=PAUSE_SEC):
             had_error = True
     except measure_rollup.MeasureError as exc:
         had_error = True

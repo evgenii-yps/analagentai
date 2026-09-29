@@ -22,10 +22,14 @@
     «есть ли у системы преимущество над случайным входом» не решён.
     Переход на новую версию автоматически переводит предыдущую в свёрнутое
     состояние.
-  * ``MEASURE_DETAIL_RETENTION_DAYS`` — потолок возраста деталей ТЕКУЩЕЙ версии для
-    таблиц из :data:`CAPPED_TABLES`. Сейчас список пуст (поправка 2: текущая версия
-    ``strategy_outcomes`` без потолка), значение читается, печатается и проверяется,
-    но ни к одной таблице не применяется.
+  * ``MEASURE_DETAIL_RETENTION_DAYS`` — НЕ ПРИМЕНЯЕТСЯ ни к одной таблице: граница
+    хранения определяется только версией логики (решение заказчика 29.09.2026;
+    поправка 1 в части календарного потолка отменена). Значение читается, печатается
+    и проверяется на «целое >= 1», но никакого удаления по возрасту в коде нет и
+    включающей строки нет. ИЗ ЭТОГО СЛЕДУЕТ, что рост ``strategy_outcomes`` (~26 МБ в
+    сутки) ничем не ограничен по построению — это принятое решение, а не упущение;
+    вопрос возвращается при закрытии вопроса о преимуществе над случайностью либо при
+    срабатывании раннего порога вотчдога (25% свободного места).
 
 ПОРЯДОК ОБЯЗАТЕЛЕН И ОБЕСПЕЧЕН КОДОМ
   1. Свёртка идёт по ЗАВЕРШЁННЫМ суткам (``день <= сегодня - SETTLE_DAYS``), каждые
@@ -77,11 +81,6 @@ SETTLE_DAYS = 3
 
 # Поправка 2: замер 9.1.3 завершён, таблица замораживается — сворачивается вся.
 FROZEN_TABLES: frozenset[str] = frozenset({TRAILING})
-# Таблицы, у которых детали ТЕКУЩЕЙ версии старше MEASURE_DETAIL_RETENTION_DAYS
-# тоже удаляются. Пусто по решению заказчика (поправка 2): замер strategy_outcomes
-# продолжается, детали текущей версии хранятся полностью. Чтобы включить потолок,
-# добавить сюда STRATEGY — это осознанная правка кода, а не значение из .env.
-CAPPED_TABLES: frozenset[str] = frozenset()
 
 # Порядок вариантов v00..v12 повторяет ``src.trailing.rule.VARIANTS`` (сверяется тестом).
 ACTIVATION_RATIOS = (0.25, 0.50, 0.75, 1.00)
@@ -416,15 +415,15 @@ class Plan:
         return sum(e.n_rows for e in self.eligible)
 
 
-def _rule_allows(table: str, day: date, version: int, current: int | None,
-                 cap_days: int, today: date) -> bool:
-    """Правило поправок 1–2: какие (сутки, версия) деталей вправе удаляться."""
+def _rule_allows(table: str, version: int, current: int | None) -> bool:
+    """Правило хранения: какие версии деталей вправе удаляться (возраст не учитывается).
+
+    Замороженная таблица — все версии. Иначе — версии СТАРШЕ текущей; детали текущей
+    версии хранятся полностью (решение заказчика 29.09.2026).
+    """
     if table in FROZEN_TABLES:
         return True
-    if current is not None and version < current:
-        return True
-    return (table in CAPPED_TABLES and current is not None and version == current
-            and day < today - timedelta(days=cap_days))
+    return current is not None and version < current
 
 
 def _reconcile_trailing_sql(cutoff: date) -> str:
@@ -489,7 +488,36 @@ def _reconcile_strategy_sql(cutoff: date) -> str:
     """
 
 
-def plan_deletion(psql: Psql, table: str, *, current: int | None, cap_days: int,
+def _diagnose_trailing(row: list[str]) -> list[str]:
+    """Какие из трёх сравнений trailing не сошлись — с числами. Пусто — всё сошлось."""
+    n, rol, com = _int(row[2]), _int(row[3]), _int(row[4])
+    sm_det, sm_com = _int(row[5]), _int(row[6])
+    failed = []
+    if n != rol:
+        failed.append(f"строк деталей {n} ≠ строк в свёртке {rol}")
+    if n != com:
+        failed.append(f"строк деталей {n} ≠ строк в компактной таблице {com}")
+    if sm_det != sm_com:
+        failed.append(f"сумма итогов: в деталях {sm_det} ≠ в компактной таблице {sm_com}")
+    return failed
+
+
+def _diagnose_strategy(row: list[str]) -> list[str]:
+    """То же для strategy: свёртка, число пар, сумма итогов."""
+    n, rol = _int(row[2]), _int(row[3])
+    pairs_det, pairs_com = _int(row[4]), _int(row[5])
+    sm_det, sm_com = _int(row[6]), _int(row[7])
+    failed = []
+    if n != rol:
+        failed.append(f"строк деталей {n} ≠ строк в свёртке {rol}")
+    if pairs_det != pairs_com:
+        failed.append(f"пар в деталях {pairs_det} ≠ пар в компактной таблице {pairs_com}")
+    if sm_det != sm_com:
+        failed.append(f"сумма итогов: в деталях {sm_det} ≠ в компактной таблице {sm_com}")
+    return failed
+
+
+def plan_deletion(psql: Psql, table: str, *, current: int | None,
                   cutoff: date | None = None, today: date | None = None) -> Plan:
     """Считает, какие (сутки, версия) деталей можно удалить, и почему остальные нельзя."""
     today = today or datetime.now(UTC).date()
@@ -500,21 +528,16 @@ def plan_deletion(psql: Psql, table: str, *, current: int | None, cap_days: int,
         day = date.fromisoformat(row[0])
         version = _int(row[1])
         n = _int(row[2])
-        allowed = _rule_allows(table, day, version, current, cap_days, today)
+        allowed = _rule_allows(table, version, current)
         total, doomed = plan.per_version.get(version, (0, 0))
         if not allowed:
             plan.kept_by_rule += n
             plan.per_version[version] = (total + n, doomed)
             continue
-        if table == TRAILING:
-            ok = n == _int(row[3]) == _int(row[4]) and _int(row[5]) == _int(row[6])
-            why = (f"строк деталей {n}, в свёртке {_int(row[3])}, в компактной {_int(row[4])}; "
-                   f"сумма итогов {_int(row[5])} против {_int(row[6])}")
-        else:
-            ok = (n == _int(row[3]) and _int(row[4]) == _int(row[5])
-                  and _int(row[6]) == _int(row[7]))
-            why = (f"строк деталей {n}, в свёртке {_int(row[3])}; пар {_int(row[4])} против "
-                   f"{_int(row[5])}; сумма итогов {_int(row[6])} против {_int(row[7])}")
+        failed = (_diagnose_trailing(row) if table == TRAILING
+                  else _diagnose_strategy(row))
+        ok = not failed
+        why = "; ".join(failed)
         if ok:
             plan.eligible.append(DayVersion(day, version, n))
             plan.per_version[version] = (total + n, doomed + n)
@@ -565,9 +588,9 @@ def arm(psql: Psql) -> None:
 # Команды
 # ---------------------------------------------------------------------------
 
-def _plans(psql: Psql, cap_days: int) -> tuple[int | None, dict[str, Plan]]:
+def _plans(psql: Psql) -> tuple[int | None, dict[str, Plan]]:
     current = current_logic_version(psql)
-    plans = {t: plan_deletion(psql, t, current=current, cap_days=cap_days)
+    plans = {t: plan_deletion(psql, t, current=current)
              for t in (TRAILING, STRATEGY)}
     return current, plans
 
@@ -598,7 +621,7 @@ def report_plans(psql: Psql, plans: dict[str, Plan], current: int | None) -> Non
             _log(f"    НЕ СОШЛОСЬ (удаление пропущено): {day} v{version}: {why}")
 
 
-def dry_run(psql: Psql, *, cap_days: int) -> dict[str, Plan]:
+def dry_run(psql: Psql, *, cap_days: int | None = None) -> dict[str, Plan]:
     """Режим «только посчитать, не удалять» (D.3.3): свёртка + отчёт, удаления нет."""
     if not tables_exist(psql):
         raise MeasureError("миграция 029 не применена — нужны таблицы свёртки")
@@ -607,11 +630,8 @@ def dry_run(psql: Psql, *, cap_days: int) -> dict[str, Plan]:
         res = rollup(psql, table)
         _log(f"{table}: свёрнуто суток {len(res.days)}; строк итогов +{res.daily_rows}; "
              f"компактных пар +{res.compact_rows}")
-    current, plans = _plans(psql, cap_days)
-    capped = ("применяется к: " + ", ".join(sorted(CAPPED_TABLES)) if CAPPED_TABLES
-              else "ни к одной таблице — поправка 2")
-    _log(f"Текущая версия логики: {current}; потолок "
-         f"MEASURE_DETAIL_RETENTION_DAYS={cap_days} ({capped})")
+    current, plans = _plans(psql)
+    _log(f"Текущая версия логики: {current}. {retention_days_note(cap_days)}")
     report_plans(psql, plans, current)
     for t in (TRAILING, STRATEGY, *DERIVED_TABLES):
         _log("размер: " + _size_line(psql, t))
@@ -623,7 +643,45 @@ def dry_run(psql: Psql, *, cap_days: int) -> dict[str, Plan]:
     return plans
 
 
-def delete_command(psql: Psql, *, cap_days: int, confirm_trailing: int, confirm_strategy: int,
+NOT_APPLIED_NOTE = ("не применяется; граница хранения определяется версией логики, "
+                    "решение 29.09.2026")
+
+
+def retention_days_note(cap_days: int | None) -> str:
+    """Строка журнала о ``MEASURE_DETAIL_RETENTION_DAYS``: значение и «не применяется»."""
+    shown = "не задано" if cap_days is None else str(cap_days)
+    return f"MEASURE_DETAIL_RETENTION_DAYS={shown} ({NOT_APPLIED_NOTE})"
+
+
+def refusal_message(plans: dict[str, Plan], want: dict[str, int]) -> str:
+    """Диагностика отказа: КАКОЕ сравнение не сошлось и с какими числами.
+
+    Причин две, и они различаются. Расхождение сверки — сутки, у которых не сошлись
+    строки деталей / свёртки / компактной таблицы или сумма итогов (перечень ниже).
+    Иначе число к удалению просто отличается от подтверждённого: с момента прогона
+    «только счёт» сменилась дата UTC или ночная свёртка добавила сутки.
+    """
+    lines = [f"числа подтверждения не совпали с расчётом (граница завершённых суток: "
+             f"{settle_cutoff()}):"]
+    for table, plan in plans.items():
+        lines.append(f"  {table}: подтверждено {want[table]}, сейчас к удалению {plan.delete_rows}"
+                     + ("" if plan.delete_rows != want[table] else " (совпало)"))
+        for day, version, why in plan.mismatched[:10]:
+            lines.append(f"    сверка не сошлась: сутки {day}, версия {version}: {why}")
+        if len(plan.mismatched) > 10:
+            lines.append(f"    … и ещё суток с расхождением: {len(plan.mismatched) - 10}")
+    if any(plan.mismatched for plan in plans.values()):
+        lines.append("Причина: расхождение сверки (сутки выше в удаление не входят). Это НЕ "
+                     "штатная смена даты — сверка в базе нарушена; удаление не выполняется, "
+                     "разберитесь до повторного прогона.")
+    else:
+        lines.append("Расхождений сверки нет: изменилось лишь множество завершённых суток "
+                     "(смена даты UTC или ночная свёртка). Повторите прогон «только счёт» и "
+                     "подтвердите новые числа.")
+    return "\n".join(lines)
+
+
+def delete_command(psql: Psql, *, confirm_trailing: int, confirm_strategy: int,
                    batch: int, pause: float, cron_dir: str = "/etc/cron.d") -> int:
     """Первое (ручное) удаление деталей. Возвращает 0 — успех.
 
@@ -641,16 +699,13 @@ def delete_command(psql: Psql, *, cap_days: int, confirm_trailing: int, confirm_
     if running:
         raise MeasureError("в cron остались писатели замеров: " + ", ".join(running)
                            + " — снимите их (docs/STAGE_9_4_REPORT.md, блок D)")
-    current, plans = _plans(psql, cap_days)
+    current, plans = _plans(psql)
     if current is None:
         raise MeasureError("текущая версия логики не определена (logic_version_windows пуста)")
     report_plans(psql, plans, current)
     want = {TRAILING: confirm_trailing, STRATEGY: confirm_strategy}
-    for table, plan in plans.items():
-        if plan.delete_rows != want[table]:
-            raise MeasureError(
-                f"{table}: к удалению {plan.delete_rows} строк, подтверждено {want[table]} — "
-                "состояние изменилось после прогона «только счёт»; повторите прогон")
+    if any(plan.delete_rows != want[table] for table, plan in plans.items()):
+        raise MeasureError(refusal_message(plans, want))
     total = 0
     for table, plan in plans.items():
         n = delete_details(psql, plan, batch=batch, pause=pause)
@@ -662,7 +717,7 @@ def delete_command(psql: Psql, *, cap_days: int, confirm_trailing: int, confirm_
     return 0
 
 
-def nightly(psql: Psql, *, cap_days: int, cron_dir: str = "/etc/cron.d",
+def nightly(psql: Psql, *, cron_dir: str = "/etc/cron.d",
             batch: int, pause: float) -> bool:
     """Ночной шаг: свёртка всегда; удаление — только если разрешено (флаг + писатели).
 
@@ -699,7 +754,7 @@ def nightly(psql: Psql, *, cap_days: int, cron_dir: str = "/etc/cron.d",
                  "с cron (или cron не прочитан).")
             continue
         try:
-            plan = plan_deletion(psql, table, current=current, cap_days=cap_days)
+            plan = plan_deletion(psql, table, current=current)
             for day, version, why in plan.mismatched:
                 _log(f"{table}: сутки {day} v{version} НЕ СОШЛИСЬ, пропущены: {why}")
             deleted = delete_details(psql, plan, batch=batch, pause=pause)

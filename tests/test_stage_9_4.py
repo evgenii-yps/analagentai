@@ -540,3 +540,78 @@ def test_граница_этап_не_трогает_сигнальный_код
     ).stdout.splitlines()
     forbidden = [f for f in out if f.startswith(("src/agents/", "src/decision/", "src/positions/"))]
     assert forbidden == []
+
+
+# --- Блок A: журнал systemd; блок D: проверка снятия писателей ---------------
+
+
+def _journald(tmp_path: Path, text: str) -> tuple[Path, subprocess.CompletedProcess]:
+    conf = tmp_path / "journald.conf"
+    conf.write_text(text, encoding="utf-8")
+    res = subprocess.run(
+        ["bash", str(ROOT / "deploy" / "journald_limit.sh")],
+        env={**os.environ, "JOURNALD_CONF": str(conf), "NO_RESTART": "1"},
+        capture_output=True, text=True, check=False)
+    return conf, res
+
+
+def test_a_journald_закомментированная_строка_заменяется(tmp_path):
+    conf, res = _journald(tmp_path, "[Journal]\n#SystemMaxUse=\n#Storage=auto\n")
+    assert res.returncode == 0, res.stderr
+    assert conf.read_text(encoding="utf-8").splitlines() == [
+        "[Journal]", "SystemMaxUse=200M", "#Storage=auto"]
+    assert list(tmp_path.glob("journald.conf.bak-*"))
+
+
+def test_a_journald_чужое_значение_заменяется_и_повторный_запуск_ничего_не_меняет(tmp_path):
+    conf, _ = _journald(tmp_path, "[Journal]\nSystemMaxUse=1G\nSystemMaxUse=500M\n")
+    text = conf.read_text(encoding="utf-8")
+    assert text.count("SystemMaxUse=200M") == 1
+    assert "\nSystemMaxUse=500M" not in text                # лишнее активное — закомментировано
+    res = subprocess.run(
+        ["bash", str(ROOT / "deploy" / "journald_limit.sh")],
+        env={**os.environ, "JOURNALD_CONF": str(conf), "NO_RESTART": "1"},
+        capture_output=True, text=True, check=False)
+    assert "изменений нет" in res.stdout and conf.read_text(encoding="utf-8") == text
+
+
+def test_a_journald_без_строки_добавляется_в_раздел_journal(tmp_path):
+    conf, _ = _journald(tmp_path, "[Journal]\nStorage=persistent\n")
+    assert conf.read_text(encoding="utf-8").splitlines()[:2] == ["[Journal]", "SystemMaxUse=200M"]
+    other = tmp_path / "sub"
+    other.mkdir()
+    conf2, _ = _journald(other, "# пусто\n")
+    assert conf2.read_text(encoding="utf-8").endswith("[Journal]\nSystemMaxUse=200M\n")
+
+
+def _check(tmp_path: Path, files: dict[str, str]):
+    d = tmp_path / "crons"
+    d.mkdir(exist_ok=True)
+    for name, body in files.items():
+        (d / name).write_text(body, encoding="utf-8")
+    return subprocess.run(
+        ["bash", str(ROOT / "deploy" / "check_writers_off.sh")],
+        env={**os.environ, "CHECK_DIRS": str(d), "CHECK_ALLOW_NONROOT": "1",
+             "CHECK_SKIP_SYSTEM": "1"}, capture_output=True, text=True, check=False)
+
+
+def test_d_проверка_писателей_закомментированное_не_считается(tmp_path):
+    res = _check(tmp_path, {"agent-trade": "# 40 4 * * * agent python -m src.trailing_main\n"
+                                           "  # 25 4 * * * agent python -m src.baseline_main\n"})
+    assert res.returncode == 0 and "OK" in res.stdout
+
+
+def test_d_проверка_писателей_находит_активную_строку_в_личном_crontab(tmp_path):
+    res = _check(tmp_path, {"agent-trade": "# trailing_main выключен\n",
+                            "root": "25 4 * * * cd /x && python -m src.baseline_main\n"})
+    assert res.returncode == 1
+    assert "АКТИВНЫЕ" in res.stdout and "baseline_main" in res.stdout and "root:1:" in res.stdout
+
+
+def test_d_проверка_писателей_требует_root_иначе_ложное_ok():
+    res = subprocess.run(
+        ["bash", str(ROOT / "deploy" / "check_writers_off.sh")],
+        env={k: v for k, v in os.environ.items() if k != "CHECK_ALLOW_NONROOT"},
+        capture_output=True, text=True, check=False)
+    if os.geteuid() != 0:
+        assert res.returncode == 2

@@ -11,6 +11,15 @@
   `/opt/agent-trade`**.
 * Время окна: **около 30–40 минут**, из них сам стек стоит 10–15 минут.
 
+## Пути до слияния PR
+
+Скрипты этапа 9.4 (`deploy/snapshot_9_4.sh`, `deploy/merge_docker_daemon.py`,
+`deploy/journald_limit.sh`, `deploy/check_writers_off.sh`) до слияния лежат в ветке PR, а не в
+рабочем дереве сервера. Доставьте их без затрагивания рабочего дерева и без перезапуска
+стека (`docs/STAGE_9_4_REPORT.md`, §5, «Шаг 0») и **до слияния используйте пути
+`/opt/agent-trade/analysis_out/pr13/deploy/…` вместо `/opt/agent-trade/deploy/…`** во всех
+командах ниже.
+
 ## 0. Когда это делать
 
 * Окно — **08:00–10:00 UTC** (11:00–13:00 МСК). Не делайте перезагрузку в промежутке
@@ -139,6 +148,15 @@ sudo python3 /opt/agent-trade/deploy/merge_docker_daemon.py
 `"max-size": "20m"`, `"max-file": "3"`; рядом сохранена копия прежнего файла
 `daemon.json.bak-…`, если он был.
 
+**Шаг 4.2. Ограничить журнал systemd до 200 МБ (`SystemMaxUse=200M`).**
+
+```
+sudo bash /opt/agent-trade/deploy/journald_limit.sh
+```
+Что должно получиться: строка `SystemMaxUse=200M`, затем `journalctl --disk-usage` показывает
+не больше 200 МБ. Прежний файл сохранён как `journald.conf.bak-…`. Контейнеры Docker это не
+затрагивает.
+
 Перезапускать docker отдельно не нужно: перезагрузка сервера сделает это сама.
 Новые настройки применяются к контейнерам, **созданным после**, — поэтому в шаге 2.2
 мы их именно убрали (`down`), а не остановили: при загрузке они создадутся заново
@@ -180,11 +198,20 @@ evaluator bot positions`), у всех состояние `running`, у имею
 `healthy` (через 1–2 минуты после старта). `starting` в первую минуту — норма.
 
 **Шаг 6.3. Настройки журналов применились (только при первом применении 9.4).**
+Проверка выполняется на контейнерах, **пересозданных** после правки `daemon.json`, а не на
+перезапущенных: `docker restart` и `restart` настройки журналов НЕ применяют, а `down` из шага
+2.2 и запуск при загрузке (`up -d`) — применяют.
 
 ```
-sudo -u agent docker inspect --format '{{.Name}} {{.HostConfig.LogConfig.Type}} {{.HostConfig.LogConfig.Config}}' $(sudo -u agent docker ps -q)
+sudo -u agent docker inspect --format '{{.Name}} {{.HostConfig.LogConfig.Type}} {{.HostConfig.LogConfig.Config}} создан {{.Created}}' $(sudo -u agent docker ps -q)
 ```
 Что должно получиться: у **каждого** контейнера `json-file map[max-file:3 max-size:20m]`.
+Затем убедитесь, что контейнеры действительно новые — их время создания позже правки файла:
+```
+stat -c 'daemon.json изменён %y' /etc/docker/daemon.json
+```
+Время «создан» у каждого контейнера должно быть **позже** этого времени. Если раньше —
+контейнер не пересоздавался, проверка недействительна: повторите шаги 2.2 и 5.
 
 **Шаг 6.4. Вотчдог видит порядок.**
 
@@ -225,7 +252,7 @@ sudo -u agent bash /opt/agent-trade/deploy/snapshot_9_4.sh after
 
 Все шесть пунктов выполнены: службы `running/healthy`, вотчдог «Всё в норме»,
 свежесть свечей в норме, слепок «после» — три `OK`, (при первом применении 9.4)
-журналы `max-size:20m`, cron возвращён.
+журналы `max-size:20m` на пересозданных контейнерах, `SystemMaxUse=200M`, cron возвращён.
 
 ## Признак неудачи
 
