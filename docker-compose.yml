@@ -142,6 +142,37 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  demo:
+    build: .
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # Этап 9.5: демо-исполнение зеркалом (тот же образ, своя команда). Сервис
+    # ПОСТОЯННЫЙ: читает public.positions и дублирует каждую виртуальную сделку
+    # рыночным ордером на ДЕМО-счёте OKX (спот; деньги не настоящие). Пишет
+    # только в demo_orders и demo_state. Единственный сервис, читающий демо-ключи
+    # OKX_DEMO_*. Выключен по умолчанию (DEMO_ENABLED=false): тогда к бирже и базе
+    # не подключается, только пишет в журнал и обновляет heartbeat.
+    # В отличие от positions ему НУЖЕН выход в интернет (биржа и Telegram), как
+    # collector. Перед включением: миграция 030 и предпроверка владельца
+    #   docker compose run --rm --no-deps demo python -m src.demo.preflight
+    command: ["python", "-m", "src.demo_main"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-m", "src.healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   evaluator:
     build: .
     env_file: .env

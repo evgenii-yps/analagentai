@@ -63,6 +63,12 @@ HEARTBEATS: list[tuple[str, str, int, str]] = [
     # UPDATE ... WHERE status = 'open', и отставшая итерация получает ноль
     # изменённых строк вместо второго закрытия.
     ("positions:heartbeat", "POSITION_INTERVAL", 60, "positions"),
+    # Этап 9.5. Перезапуск контейнера demo БЕЗОПАСЕН: ордер сначала записывается
+    # строкой в demo_orders и лишь потом уходит на биржу, а сервис при старте
+    # разбирает строки pending/sent запросом по clOrdId, не отправляя ордер
+    # повторно. В выключенном режиме (DEMO_ENABLED=false) сервис тоже обновляет
+    # heartbeat — тревоги по выключенному сервису не будет.
+    ("demo:heartbeat", "DEMO_INTERVAL", 15, "demo"),
 ]
 
 
