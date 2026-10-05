@@ -33,6 +33,11 @@ import urllib.parse
 import urllib.request
 from datetime import UTC, datetime
 
+try:  # импорт пакетом (тесты, ``python -m``)
+    from src.health import disk_forecast
+except ImportError:  # запуск файлом из cron: каталог скрипта уже в sys.path
+    import disk_forecast  # type: ignore[no-redef]
+
 APP_DIR = os.environ.get("APP_DIR", "/opt/agent-trade")
 
 # Ожидаемые heartbeat-ключи (см. runner'ы Этапов 2–6) и env-переменная их
@@ -173,7 +178,56 @@ def section_server() -> list[str]:
         p = df_rows[1].split()
         if len(p) >= 5:
             lines.append(f"Диск /: свободно {p[3]} (занято {p[4]})")
+    lines.append(_disk_forecast_line())
+    lines.append(_remote_backup_line())
     return lines
+
+
+def _disk_forecast_line() -> str:
+    """Строка сводки «до порога 15% осталось N суток» (Этап 9.4, блок E).
+
+    Оценка та же, что в сообщениях вотчдога: считает общий модуль
+    ``disk_forecast`` по ``logs/disk_usage.csv``. Порог CRIT берётся из .env.
+    """
+    raw = os.environ.get("WATCHDOG_DISK_CRIT_PCT", ENV.get("WATCHDOG_DISK_CRIT_PCT", "15"))
+    try:
+        crit = float(raw.split("#", 1)[0].strip())
+    except ValueError:
+        crit = 15.0
+    records = disk_forecast.read_records(os.path.join(APP_DIR, "logs", "disk_usage.csv"))
+    if not records:
+        return f"Прогноз диска: {disk_forecast.NO_DATA_TEXT}"
+    last = records[-1]
+    capacity_gb = last.used_gb / (1.0 - last.free_pct / 100.0) if last.free_pct < 100.0 else 0.0
+    days = disk_forecast.days_to_threshold(records, capacity_gb, crit)
+    return f"Прогноз диска: {_esc(disk_forecast.describe(days, crit))}"
+
+
+def _remote_backup_line() -> str:
+    """Строка сводки о внешней выгрузке копии (Этап 9.4, блок C).
+
+    Читает ``logs/remote_backup.status`` (пишет ``scripts/remote_backup.sh``):
+    ``дата;ok|fail;файл;размер;подробность``. Выгрузка недельная, поэтому запись
+    старше 8 суток помечается как устаревшая.
+    """
+    path = os.path.join(APP_DIR, "logs", "remote_backup.status")
+    if ENV.get("REMOTE_BACKUP_ENABLED", "").split("#", 1)[0].strip().lower() == "false":
+        return "Внешняя копия: выгрузка отключена (REMOTE_BACKUP_ENABLED=false)"
+    if not os.path.isfile(path):
+        return "Внешняя копия: ещё не выгружалась"
+    try:
+        with open(path, encoding="utf-8") as fh:
+            day_s, result, name, size, detail = (fh.read().strip().split(";", 4) + [""] * 5)[:5]
+        day = datetime.strptime(day_s, "%Y-%m-%d").replace(tzinfo=UTC)
+    except (OSError, ValueError):
+        return "Внешняя копия: файл состояния не разобран"
+    age = (datetime.now(UTC) - day).days
+    if result != "ok":
+        return f"🔴 Внешняя копия: выгрузка {day_s} НЕ удалась ({_esc(detail)})"
+    mb = int(size) // (1024 * 1024) if size.isdigit() else 0
+    mark = "🟢" if age <= 8 else "🟠"
+    stale = "" if age <= 8 else f" — устарела, {age} сут. назад"
+    return f"{mark} Внешняя копия: {day_s}, {_esc(name)} ({mb} МБ){stale}"
 
 
 def section_containers() -> list[str]:
