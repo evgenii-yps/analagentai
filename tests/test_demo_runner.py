@@ -581,10 +581,10 @@ async def test_the_loop_calls_the_report_hook_each_iteration(pool, clock) -> Non
 
 
 async def test_ensure_state_records_mirror_since_once(pool, clock) -> None:
-    first = await runner.ensure_state(pool, "www.okx.com", clock.now())
+    first = await runner.ensure_state(pool, "www.okx.com", clock.now(), D("1000"))
     clock.advance(3600)
-    second = await runner.ensure_state(pool, "eea.okx.com", clock.now())
-    assert first == second
+    second = await runner.ensure_state(pool, "eea.okx.com", clock.now(), D("1000"))
+    assert first.mirror_since == second.mirror_since
     assert await pool.fetchval("SELECT count(*) FROM demo_state;") == 1
 
 
@@ -592,8 +592,9 @@ async def test_the_startup_fields_are_the_actual_values_without_keys(pool, clock
     ctx = build_context(pool, FakeExchange(), clock, host="eea.okx.com", interval_sec=7,
                         max_entry_delay_sec=99, min_usdt_balance=D("12"))
     fields = runner.startup_fields(ctx)
-    assert set(fields) == {"enabled", "host", "mirror_since", "interval",
-                           "max_entry_delay_sec", "min_usdt_balance", "instruments"}
+    assert {"enabled", "host", "mirror_since", "interval", "max_entry_delay_sec",
+            "min_usdt_balance", "instruments"} <= set(fields)
+    assert fields["start_capital"] == "1000" and fields["timezone"] == "Europe/Moscow"
     assert fields["host"] == "eea.okx.com" and fields["interval"] == 7
     assert fields["max_entry_delay_sec"] == 99 and fields["min_usdt_balance"] == "12"
     assert fields["instruments"] == ["BTC/USDT", "DOGE/USDT"]

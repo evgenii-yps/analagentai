@@ -195,16 +195,18 @@ def test_defaults_match_the_spec() -> None:
     assert s.OKX_DEMO_HOST == "www.okx.com"
     assert s.DEMO_INTERVAL == 15 and s.DEMO_MAX_ENTRY_DELAY_SEC == 180
     assert s.DEMO_FILL_WAIT_SEC == 10 and s.DEMO_MIN_USDT_BALANCE == 20.0
-    assert s.DEMO_REPORT_HOUR_UTC == 6
+    assert s.DEMO_START_CAPITAL_USD == 0.0
+    assert s.DEMO_NOTIFY_ENABLED is True and s.DEMO_SHEETS_ENABLED is False
+    assert not hasattr(s, "DEMO_REPORT_HOUR_UTC")      # сводка идёт после снимка суток
     assert s.demo_config_errors() == []
 
 
 def test_enabled_requires_all_three_keys_and_names_the_missing_one() -> None:
-    errors = _settings(DEMO_ENABLED=True, OKX_DEMO_API_KEY="a",
-                       OKX_DEMO_SECRET_KEY="b").demo_config_errors()
+    errors = _settings(DEMO_ENABLED=True, OKX_DEMO_API_KEY="a", OKX_DEMO_SECRET_KEY="b",
+                       DEMO_START_CAPITAL_USD=100).demo_config_errors()
     assert len(errors) == 1 and "OKX_DEMO_PASSPHRASE" in errors[0]
     ok = _settings(DEMO_ENABLED=True, OKX_DEMO_API_KEY="a", OKX_DEMO_SECRET_KEY="b",
-                   OKX_DEMO_PASSPHRASE="c")
+                   OKX_DEMO_PASSPHRASE="c", DEMO_START_CAPITAL_USD=100)
     assert ok.demo_config_errors() == []
     # значения ключей в сообщения не попадают
     bad = _settings(DEMO_ENABLED=True, OKX_DEMO_API_KEY="SECRETVALUE", OKX_DEMO_HOST="x.com")
@@ -224,5 +226,21 @@ def test_a_demo_typo_does_not_break_settings_for_other_services() -> None:
 
 def test_numeric_ranges() -> None:
     assert _settings(DEMO_INTERVAL=0).demo_config_errors()
-    assert _settings(DEMO_REPORT_HOUR_UTC=24).demo_config_errors()
     assert _settings(DEMO_MIN_USDT_BALANCE=-1).demo_config_errors()
+
+
+def test_start_capital_must_be_positive_when_enabled() -> None:
+    keys = {"OKX_DEMO_API_KEY": "a", "OKX_DEMO_SECRET_KEY": "b", "OKX_DEMO_PASSPHRASE": "c"}
+    for bad in (0.0, -5.0):
+        errors = _settings(DEMO_ENABLED=True, DEMO_START_CAPITAL_USD=bad,
+                           **keys).demo_config_errors()
+        assert len(errors) == 1 and "DEMO_START_CAPITAL_USD" in errors[0]
+    good = _settings(DEMO_ENABLED=True, DEMO_START_CAPITAL_USD=1000, **keys)
+    assert good.demo_config_errors() == []
+    # выключенный сервис капитала не требует
+    assert _settings(DEMO_ENABLED=False, DEMO_START_CAPITAL_USD=0).demo_config_errors() == []
+
+
+def test_an_old_env_with_the_removed_report_hour_is_still_accepted() -> None:
+    s = Settings(POSTGRES_PASSWORD="x", _env_file=None, DEMO_REPORT_HOUR_UTC=6)
+    assert s.demo_config_errors() == []

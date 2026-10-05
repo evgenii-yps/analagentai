@@ -43,14 +43,14 @@ echo "Момент запуска (UTC): $(date -u +%FT%TZ)"
 echo
 
 # --- 1. Миграция применена ---------------------------------------------------
-echo "1. Миграция 030 (таблицы demo_orders и demo_state)"
-present="$(psql_q "SELECT (to_regclass('public.demo_orders') IS NOT NULL)::int + (to_regclass('public.demo_state') IS NOT NULL)::int;")"
+echo "1. Миграция 030 (таблицы demo_orders, demo_state, demo_balance_daily)"
+present="$(psql_q "SELECT (to_regclass('public.demo_orders') IS NOT NULL)::int + (to_regclass('public.demo_state') IS NOT NULL)::int + (to_regclass('public.demo_balance_daily') IS NOT NULL)::int;")"
 if [ -z "${present}" ]; then
   skip "база не отвечает — наличие таблиц проверить нечем"
-elif [ "${present}" = "2" ]; then
-  ok "обе таблицы есть"
+elif [ "${present}" = "3" ]; then
+  ok "все три таблицы есть"
 else
-  bad "таблиц меньше двух (найдено ${present}) — примените db/migrations/030_demo_orders.sql"
+  bad "таблиц меньше трёх (найдено ${present}) — примените db/migrations/030_demo_orders.sql"
 fi
 
 # --- 2. Контейнер demo запущен -----------------------------------------------
@@ -102,21 +102,21 @@ else
 fi
 echo "  ⓘ DEMO_ENABLED в .env: $(env_val DEMO_ENABLED)"
 
-# --- 5. Границы по коду: запись только в demo_orders и demo_state -------------
+# --- 5. Границы по коду: запись только в demo_orders, demo_state, demo_balance_daily ---
 echo "5. Запись сервиса в чужие таблицы (по коду src/demo и src/demo_main.py)"
 if [ ! -d "${APP_DIR}/src/demo" ]; then
   skip "каталога src/demo нет"
 else
   targets="$(grep -rhoiE 'INSERT[[:space:]]+INTO[[:space:]]+[a-z_.]+|UPDATE[[:space:]]+[a-z_.]+[[:space:]]+SET|DELETE[[:space:]]+FROM[[:space:]]+[a-z_.]+' \
-      "${APP_DIR}/src/demo" "${APP_DIR}/src/demo_main.py" 2>/dev/null \
+      "${APP_DIR}/src/demo" "${APP_DIR}/src/demo_main.py" "${APP_DIR}/src/export/demo_sheets.py" 2>/dev/null \
     | sed -E 's/^(insert[[:space:]]+into|update|delete[[:space:]]+from)[[:space:]]+//I; s/[[:space:]]+set$//I; s/^public\.//' \
     | tr 'A-Z' 'a-z' | sort -u || true)"
-  foreign="$(printf '%s\n' "${targets}" | grep -vxE 'demo_orders|demo_state|' || true)"
+  foreign="$(printf '%s\n' "${targets}" | grep -vxE 'demo_orders|demo_state|demo_balance_daily|' || true)"
   echo "  ⓘ цели записи в коде: $(printf '%s' "${targets}" | tr '\n' ' ')"
   if [ -n "${foreign}" ]; then
     bad "код пишет в чужие таблицы: $(printf '%s' "${foreign}" | tr '\n' ' ')"
   else
-    ok "пишет только в demo_orders и demo_state"
+    ok "пишет только в demo_orders, demo_state и demo_balance_daily"
   fi
 fi
 
@@ -157,6 +157,18 @@ else
   echo "  ⓘ lost=${lost}, rejected=${rej}"
   if [ "${lost}" = "0" ]; then ok "lost = 0"; else bad "lost = ${lost}: ордер не найден на бирже по clOrdId"; fi
   if [ "${rej}" = "0" ]; then ok "rejected = 0"; else echo "  ⚠️ rejected = ${rej}: разберите error_text в demo_orders"; fi
+fi
+
+# --- 9. Снимки конца суток -------------------------------------------------------
+echo "9. Снимки конца суток (demo_balance_daily)"
+snaps="$(psql_q "SELECT count(*) FROM demo_balance_daily;")"
+last="$(psql_q "SELECT to_char(max(day), 'YYYY-MM-DD') FROM demo_balance_daily;")"
+dups="$(psql_q "SELECT count(*) FROM (SELECT day FROM demo_balance_daily GROUP BY day HAVING count(*) > 1) d;")"
+if [ -z "${snaps}" ]; then
+  skip "таблицу снимков прочитать не удалось"
+else
+  echo "  ⓘ снимков: ${snaps}; последний за: ${last:-нет}; поздних (late): $(psql_q "SELECT count(*) FROM demo_balance_daily WHERE late;")"
+  if [ "${dups}" = "0" ]; then ok "по одному снимку на сутки"; else bad "есть сутки с несколькими снимками"; fi
 fi
 
 echo

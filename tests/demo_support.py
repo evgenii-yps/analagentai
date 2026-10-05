@@ -88,7 +88,8 @@ async def open_pool(db: str) -> asyncpg.Pool:
 async def reset_data(pool: asyncpg.Pool) -> None:
     """Очищает данные теста и заводит два спотовых инструмента (BTC, DOGE)."""
     await pool.execute(
-        "TRUNCATE demo_orders, demo_state, positions, signals, instruments "
+        "TRUNCATE demo_balance_daily, demo_orders, demo_state, positions, signals, "
+        "instruments, ohlcv "
         "RESTART IDENTITY CASCADE;"
     )
     await pool.execute(
@@ -145,21 +146,68 @@ async def add_position(
 async def insert_buy_filled(
     pool: asyncpg.Pool, position_id: int, *, symbol: str = "BTC/USDT",
     filled_qty: str = "0.00003332", fee: str = "0.00000003", fee_ccy: str = "BTC",
-    avg_price: str = "60060", cost_usd: str = "2.0",
+    avg_price: str = "60060", cost_usd: str = "2.0", fee_usd: str | None = None,
+    filled_at=None,
 ) -> None:
     """Готовая выполненная покупка — как будто сервис её уже сделал."""
     inst = await pool.fetchrow("SELECT id FROM instruments WHERE symbol = $1;", symbol)
     pos = await pool.fetchrow("SELECT opened_at, entry_price FROM positions WHERE id = $1;",
                               position_id)
+    if fee_usd is None:
+        fee_usd = str(Decimal(fee) * Decimal(avg_price)) if fee_ccy != "USDT" else fee
     await pool.execute(
         "INSERT INTO demo_orders (position_id, instrument_id, leg, status, cl_ord_id, "
         "symbol, host, requested_cost_usd, filled_qty, avg_price, cost_usd, fee, "
-        "fee_ccy, virtual_price, virtual_ts, filled_at) "
+        "fee_ccy, virtual_price, virtual_ts, filled_at, fee_usd) "
         "VALUES ($1, $2, 'buy', 'filled', $3, $4, 'www.okx.com', 2, $5, $6, $7, $8, "
-        "$9, $10, $11, $11)",
+        "$9, $10, $11, $12, $13)",
         position_id, inst["id"], f"at95b{position_id}", symbol,
         Decimal(filled_qty), Decimal(avg_price), Decimal(cost_usd), Decimal(fee), fee_ccy,
-        pos["entry_price"], pos["opened_at"],
+        pos["entry_price"], pos["opened_at"], filled_at or pos["opened_at"],
+        Decimal(fee_usd),
+    )
+
+
+async def insert_sell_filled(
+    pool: asyncpg.Pool, position_id: int, *, symbol: str = "BTC/USDT",
+    filled_qty: str = "0.00003329", cost_usd: str = "2.04", fee: str = "0.002",
+    fee_ccy: str = "USDT", avg_price: str = "61000", filled_at=None,
+    exit_reason: str | None = "target", equity_after: str | None = None,
+    virtual_price: str = "60600",
+) -> None:
+    """Готовая выполненная продажа (продажа на бирже: комиссия — в USDT)."""
+    inst = await pool.fetchrow("SELECT id FROM instruments WHERE symbol = $1;", symbol)
+    pos = await pool.fetchrow("SELECT closed_at FROM positions WHERE id = $1;", position_id)
+    when = filled_at or pos["closed_at"]
+    fee_usd = Decimal(fee) if fee_ccy == "USDT" else Decimal(fee) * Decimal(avg_price)
+    await pool.execute(
+        "INSERT INTO demo_orders (position_id, instrument_id, leg, status, cl_ord_id, "
+        "symbol, host, requested_qty, filled_qty, avg_price, cost_usd, fee, fee_ccy, "
+        "virtual_price, virtual_ts, filled_at, fee_usd, exit_reason, equity_after_usd) "
+        "VALUES ($1, $2, 'sell', 'filled', $3, $4, 'www.okx.com', $5, $5, $6, $7, $8, $9, "
+        "$10, $11, $11, $12, $13, $14)",
+        position_id, inst["id"], f"at95s{position_id}", symbol, Decimal(filled_qty),
+        Decimal(avg_price), Decimal(cost_usd), Decimal(fee), fee_ccy, Decimal(virtual_price),
+        when, fee_usd, exit_reason, Decimal(equity_after) if equity_after else None,
+    )
+
+
+async def add_candle(pool: asyncpg.Pool, symbol: str, close: float, ts) -> None:
+    """Минутная свеча в ohlcv — запасной источник цены открытой ноги."""
+    inst = await pool.fetchrow("SELECT id FROM instruments WHERE symbol = $1;", symbol)
+    await pool.execute(
+        "INSERT INTO ohlcv (instrument_id, timeframe, ts, open, high, low, close, volume) "
+        "VALUES ($1, '1m', $2, $3, $3, $3, $3, 1) ON CONFLICT DO NOTHING;",
+        inst["id"], ts, close,
+    )
+
+
+async def set_state(pool: asyncpg.Pool, start_capital: float, mirror_since) -> None:
+    await pool.execute(
+        "INSERT INTO demo_state (id, mirror_since, host, start_capital) "
+        "VALUES (1, $1, 'www.okx.com', $2) ON CONFLICT (id) DO UPDATE SET "
+        "mirror_since = $1, start_capital = $2;",
+        mirror_since, Decimal(str(start_capital)),
     )
 
 
@@ -174,6 +222,8 @@ class FakeRedis:
     def __init__(self) -> None:
         self.data: dict[str, str] = {}
         self.ttl: dict[str, int | None] = {}
+        self.lists: dict[str, list[str]] = {}
+        self.zsets: dict[str, dict[str, float]] = {}
 
     async def set(self, key: str, value: str, nx: bool = False, ex: int | None = None) -> bool:
         if nx and key in self.data:
@@ -186,7 +236,34 @@ class FakeRedis:
         return self.data.get(key)
 
     async def delete(self, key: str) -> int:
-        return 1 if self.data.pop(key, None) is not None else 0
+        existed = self.data.pop(key, None) is not None or key in self.lists
+        self.lists.pop(key, None)
+        return 1 if existed else 0
+
+    async def expire(self, key: str, seconds: int) -> bool:
+        self.ttl[key] = seconds
+        return key in self.data or key in self.zsets or key in self.lists
+
+    async def rpush(self, key: str, *values: str) -> int:
+        self.lists.setdefault(key, []).extend(values)
+        return len(self.lists[key])
+
+    async def lrange(self, key: str, start: int, stop: int) -> list[str]:
+        return list(self.lists.get(key, []))
+
+    async def zadd(self, key: str, mapping: dict[str, float]) -> int:
+        self.zsets.setdefault(key, {}).update(mapping)
+        return len(mapping)
+
+    async def zremrangebyscore(self, key: str, low: str | float, high: float) -> int:
+        zset = self.zsets.get(key, {})
+        dead = [m for m, score in zset.items() if score <= high]
+        for member in dead:
+            del zset[member]
+        return len(dead)
+
+    async def zcard(self, key: str) -> int:
+        return len(self.zsets.get(key, {}))
 
 
 @dataclass
@@ -242,6 +319,8 @@ class FakeExchange:
     calls: list[tuple] = field(default_factory=list)
     fail_markets: bool = False
     fail_balance: Exception | None = None
+    fail_tickers: bool = False
+    missing_tickers: tuple[str, ...] = ()
     _polls: dict[str, int] = field(default_factory=dict)
     _seq: int = 0
 
@@ -264,6 +343,13 @@ class FakeExchange:
         if self.fail_balance is not None:
             raise self.fail_balance
         return {"USDT": {"free": float(self.usdt)}}
+
+    async def fetch_tickers(self, symbols: list[str] | None = None) -> dict[str, Any]:
+        self.calls.append(("fetch_tickers", tuple(symbols or ())))
+        if self.fail_tickers:
+            raise ccxt.NetworkError("тикеры недоступны")
+        return {s: {"last": self.prices[s]} for s in (symbols or self.prices)
+                if s not in self.missing_tickers}
 
     async def fetch_time(self) -> int:
         return int(datetime.now(UTC).timestamp() * 1000)
@@ -368,12 +454,14 @@ def build_context(
         sink.append(text)
         return True
 
+    start_capital = Decimal(str(config.pop("start_capital", 1000)))
     cfg = runner.DemoConfig(host=config.pop("host", "www.okx.com"), **config)
     return runner.Context(
         pool=pool, exchange=exchange, redis=redis or FakeRedis(), config=cfg,
         symbols=symbols or ["BTC/USDT", "DOGE/USDT"], secrets=SECRETS,
         notify=notify, now=clock.now, sleep=no_sleep,
         mirror_since=mirror_since or clock.now() - timedelta(minutes=10),
+        start_capital=start_capital,
     )
 
 
@@ -407,7 +495,7 @@ def capture_demo_logs(monkeypatch) -> Iterator[CapturedLogs]:
     import structlog
     import structlog.testing
 
-    from src.demo import report, runner
+    from src.demo import ledger, messages, report, runner
 
     logs = CapturedLogs()
     proxy = structlog.wrap_logger(
@@ -415,6 +503,8 @@ def capture_demo_logs(monkeypatch) -> Iterator[CapturedLogs]:
     ).bind(component="demo")
     monkeypatch.setattr(runner, "_log", proxy)
     monkeypatch.setattr(report, "_log", proxy)
+    monkeypatch.setattr(ledger, "_log", proxy)
+    monkeypatch.setattr(messages, "_log", proxy)
     with structlog.testing.capture_logs() as entries:
         logs.global_entries = entries
         yield logs

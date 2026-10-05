@@ -41,8 +41,11 @@ sys.path.insert(0, os.path.join(APP_DIR, "src", "health"))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "health"))
 import disk_forecast  # noqa: E402
 
+# Этап 9.5: контейнер demo в списке (решение архитектора). Он работает и при
+# DEMO_ENABLED=false (простаивает и пишет heartbeat), поэтому «не running» — всегда сбой:
+# упавший контейнер должен замечаться и по состоянию, а не только по heartbeat.
 CONTAINERS = ["postgres", "redis", "collector", "agents", "decision", "notify", "evaluator",
-              "bot", "positions"]
+              "bot", "positions", "demo"]
 
 # heartbeat-ключ -> (env интервала, дефолт, имя контейнера-владельца).
 HEARTBEATS: list[tuple[str, str, int, str]] = [

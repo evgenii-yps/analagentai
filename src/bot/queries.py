@@ -11,12 +11,15 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 import asyncpg
 import structlog
 
 from src.core.user_settings import USER_SETTINGS_DDL
+from src.demo import ledger
 
 _log = structlog.get_logger().bind(component="bot-queries")
 
@@ -621,6 +624,53 @@ class BotQueries:
         return {
             "open_count": open_count,
             "pauses": [(str(r["symbol"]), float(r["left_sec"])) for r in rows],
+        }
+
+    # --- /demo (Этап 9.5, редакция 2, §7 ТЗ) ---
+
+    async def demo_overview(self, days: int = 7) -> dict[str, Any] | None:
+        """Баланс демо-счёта, открытые демо-сделки и итог за окно. ТОЛЬКО ЧТЕНИЕ.
+
+        ``None`` — демо-исполнение ещё не стартовало (нет таблиц или строки ``demo_state``).
+        Баланс считается собственным учётом (``src.demo.ledger``): цены открытых ног —
+        последняя закрытая минутная свеча из ``ohlcv``, у бота нет клиента биржи.
+        """
+        try:
+            start = await ledger.read_start_capital(self._pool)
+        except asyncpg.UndefinedTableError:
+            return None
+        if start is None:
+            return None
+        state = await ledger.compute_state(self._pool, start)
+        legs = await ledger.value_legs(self._pool, await ledger.fetch_held_legs(self._pool))
+        deadlines = {
+            int(r["id"]): r["deadline_at"] for r in await self._pool.fetch(
+                "SELECT id, deadline_at FROM positions WHERE id = ANY($1::bigint[]);",
+                [int(leg["position_id"]) for leg in legs],
+            )
+        } if legs else {}
+        open_trades = []
+        for leg in legs:
+            spent = Decimal(str(leg["cost_usd"])) + ledger.usdt_fee(
+                leg.get("fee_usd"), leg["fee_ccy"]
+            )
+            open_trades.append({
+                "position_id": int(leg["position_id"]),
+                "token": str(leg["symbol"]).split("/", 1)[0],
+                "entry_price": Decimal(str(leg["avg_price"])),
+                "current_pct": (leg["value"] / spent - 1) * 100 if spent > 0 else None,
+                "deadline_at": deadlines.get(int(leg["position_id"])),
+            })
+        since = datetime.now(UTC) - timedelta(days=days)
+        pairs = await ledger.fetch_pairs(self._pool, since, None)
+        profits = [ledger.pair_profit(p) for p in pairs]
+        return {
+            "state": state,
+            "open_trades": open_trades,
+            "days": days,
+            "closed": len(pairs),
+            "wins": sum(1 for p in profits if p > 0),
+            "profit_usd": sum(profits, Decimal(0)),
         }
 
     async def positions_capital(self) -> dict[str, Any]:

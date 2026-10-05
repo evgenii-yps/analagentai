@@ -59,14 +59,18 @@ HEARTBEATS: list[tuple[str, str, int]] = [
     # простоя цель и предел не будут замечены никогда, потому что бары уйдут за
     # отметку last_checked_ts только вместе с их разбором.
     ("positions:heartbeat", "POSITION_INTERVAL", 60),
+    # Этап 9.5: демо-исполнение. Сервис пишет heartbeat и при DEMO_ENABLED=false.
+    ("demo:heartbeat", "DEMO_INTERVAL", 15),
 ]
 
 # Этап 9.1.1 §4: контейнер positions добавлен вместе со своим heartbeat.
 # Перечень контейнеров и перечень heartbeat-ключей обязаны описывать ОДИН И ТОТ
 # ЖЕ стек: сервис, чей heartbeat в отчёте есть, а контейнер не назван, читается
 # как «ключ протух сам по себе».
+# Этап 9.5: контейнер demo добавлен вместе со своим heartbeat (решение архитектора) —
+# перечни контейнеров и heartbeat-ключей описывают один и тот же стек.
 CONTAINERS = ["postgres", "redis", "collector", "agents", "decision", "notify", "evaluator",
-              "bot", "positions"]
+              "bot", "positions", "demo"]
 
 # Потоки данных для проверки «тихой» поломки: (подпись, таблица).
 DATA_STREAMS = [

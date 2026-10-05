@@ -96,7 +96,9 @@ async def _main() -> None:
         )
         # mirror_since фиксируется ПОСЛЕ создания клиента: упавший старт (например,
         # из-за ключа) не должен начинать отсчёт зеркалирования.
-        mirror_since = await runner.ensure_state(db.pool, config.host, datetime.now(UTC))
+        state = await runner.ensure_state(
+            db.pool, config.host, datetime.now(UTC), config.start_capital_usd
+        )
         ctx = runner.Context(
             pool=db.pool,
             exchange=exchange,
@@ -106,7 +108,8 @@ async def _main() -> None:
             secrets=(settings.OKX_DEMO_API_KEY, settings.OKX_DEMO_SECRET_KEY,
                      settings.OKX_DEMO_PASSPHRASE),
             notify=send_message,
-            mirror_since=mirror_since,
+            mirror_since=state.mirror_since,
+            start_capital=state.start_capital,
         )
         if settings.EXCHANGE != "okx":
             log.warning("demo_exchange_mismatch=1", exchange=settings.EXCHANGE,

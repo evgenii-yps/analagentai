@@ -40,14 +40,16 @@ from __future__ import annotations
 import argparse
 import asyncio
 import html
+from datetime import UTC, datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import asyncpg
 import structlog
 
 from src.core.config import mask_secret, settings
 from src.core.logging import setup_logging
-from src.export import notion, queries, sheets
+from src.export import demo_sheets, notion, queries, sheets
 from src.export.transform import (
     CORRELATION_HEADER,
     INDEPENDENT_DISCLAIMER,
@@ -595,6 +597,38 @@ async def _export_trades(
     return (created, updated)
 
 
+async def _export_demo_sheets(
+    conn: asyncpg.Connection,
+    log: structlog.types.WrappedLogger,
+) -> tuple[int, int]:
+    """Перестраивает два демо-листа целиком (Этап 9.5, редакция 2, §6 ТЗ).
+
+    Листы «Демо OKX — сделки» и «Демо OKX — баланс по дням» пишутся режимом ``replace``;
+    строка 1 — предупреждение, строка 2 — заголовок (они идут в самом списке строк, см.
+    ``src.export.demo_sheets``). Лист торгового журнала не затрагивается. Возвращает
+    число строк сделок и число суток. Бросает :class:`ExportError`.
+    """
+    if not settings.SHEETS_WEBAPP_URL or not settings.SHEETS_SHARED_SECRET:
+        raise ExportError("не заданы SHEETS_WEBAPP_URL / SHEETS_SHARED_SECRET")
+    tz = ZoneInfo(settings.NOTIFY_TIMEZONE)
+    now = datetime.now(UTC)
+    try:
+        trades = await demo_sheets.build_trades_sheet(conn, now, tz)
+        balance = await demo_sheets.build_balance_sheet(conn, now, tz)
+    except asyncpg.UndefinedTableError as exc:
+        raise ExportError(
+            f"демо-листы: нет таблиц демо-исполнения ({exc}); примените миграцию 030"
+        ) from exc
+    for name, rows in ((demo_sheets.SHEET_TRADES, trades), (demo_sheets.SHEET_BALANCE, balance)):
+        res = await sheets.post_rows(
+            settings.SHEETS_WEBAPP_URL, settings.SHEETS_SHARED_SECRET, name, "replace", rows
+        )
+        if not res.ok:
+            raise ExportError(f"лист «{name}»: {res.error}")
+    log.info("Демо-листы пересобраны", trades=len(trades) - 2, balance_rows=len(balance) - 3)
+    return len(trades) - 2, len(balance) - 3
+
+
 async def _export_notion(
     conn: asyncpg.Connection,
     log: structlog.types.WrappedLogger,
@@ -687,6 +721,17 @@ async def _run(positions_only: bool = False) -> int:
         except ExportError as exc:
             errors.append(str(exc))
             log.error("Ошибка выгрузки торгового журнала", error=str(exc))
+
+        # ДЕМО-ЛИСТЫ (этап 9.5, редакция 2): независимая цель, как и остальные. Строятся
+        # и в режиме --positions-only: сделки живут десятки минут, и суточный интервал
+        # для них — половина сделки.
+        if settings.DEMO_SHEETS_ENABLED:
+            try:
+                demo_trades, demo_days = await _export_demo_sheets(conn, log)
+                log.info("Демо-листы: готово", trades=demo_trades, days=demo_days)
+            except ExportError as exc:
+                errors.append(str(exc))
+                log.error("Ошибка выгрузки демо-листов", error=str(exc))
 
         if not positions_only:
             try:

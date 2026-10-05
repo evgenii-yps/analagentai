@@ -8,7 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 DEMO_FILES = sorted((ROOT / "src" / "demo").glob("*.py")) + [ROOT / "src" / "demo_main.py"]
-ALLOWED_TARGETS = {"demo_orders", "demo_state"}
+ALLOWED_TARGETS = {"demo_orders", "demo_state", "demo_balance_daily"}
 
 _WRITE_RES = (
     re.compile(r"\bINSERT\s+INTO\s+(?:public\.)?([a-z_]+)", re.I),
@@ -41,7 +41,7 @@ def test_the_scanner_itself_finds_writes_split_across_literals() -> None:
     assert sql_write_targets('q = "SELECT * FROM positions"') == set()
 
 
-def test_the_demo_service_writes_only_to_demo_orders_and_demo_state() -> None:
+def test_the_demo_service_writes_only_to_its_three_tables() -> None:
     found: set[str] = set()
     for path in DEMO_FILES:
         found |= sql_write_targets(path.read_text(encoding="utf-8"))
@@ -61,6 +61,9 @@ def test_the_demo_service_has_no_ddl_and_no_writes_to_analysis_tables() -> None:
 def test_the_demo_code_does_not_import_the_trading_or_analysis_code() -> None:
     for path in DEMO_FILES:
         text = path.read_text(encoding="utf-8")
+        # Единственное исключение — чистый модуль переводов причин выхода
+        # (src.positions.messages): ТЗ требует «тот же перевод, что в positions».
+        text = text.replace("src.positions.messages", "")
         for forbidden in ("src.positions", "src.agents", "src.decision", "src.collectors",
                           "src.evaluator", "src.risk"):
             assert forbidden not in text, f"{path.name} импортирует {forbidden}"
@@ -133,13 +136,49 @@ def test_watchdog_knows_the_demo_heartbeat() -> None:
     assert '("demo:heartbeat", "DEMO_INTERVAL", 15, "demo")' in text
 
 
+def _containers(path: str) -> list[str]:
+    text = (ROOT / path).read_text(encoding="utf-8")
+    block = text.split("CONTAINERS = ", 1)[1].split("]", 1)[0]
+    return re.findall(r'"(\w+)"', block)
+
+
+def test_demo_is_watched_by_state_in_the_watchdog_and_in_the_health_summary() -> None:
+    """Упавший контейнер demo замечается по состоянию, а не только по heartbeat (§9)."""
+    for path in ("scripts/watchdog.py", "src/health/daily_report.py"):
+        containers = _containers(path)
+        assert "demo" in containers and "positions" in containers, path
+    health = (ROOT / "src" / "health" / "daily_report.py").read_text(encoding="utf-8")
+    assert '("demo:heartbeat", "DEMO_INTERVAL", 15)' in health
+    compose_services = set(re.findall(r"^  (\w+):$", (ROOT / "docker-compose.yml").read_text(
+        encoding="utf-8"), re.M))
+    assert "demo" in compose_services
+
+
+def test_the_sheets_and_the_bot_only_read_the_demo_tables() -> None:
+    """Листы (service export) и /demo (роль только для чтения) в базу не пишут."""
+    for rel in ("src/export/demo_sheets.py", "src/demo/ledger.py"):
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        targets = sql_write_targets(text)
+        if rel.endswith("demo_sheets.py"):
+            assert targets == set(), targets
+        else:
+            # единственная запись ledger — снимок суток
+            assert targets == {"demo_balance_daily"}
+    queries = (ROOT / "src" / "bot" / "queries.py").read_text(encoding="utf-8")
+    block = queries[queries.index("async def demo_overview"):queries.index(
+        "async def positions_capital")]
+    assert sql_write_targets(block) == set()
+
+
 def test_env_example_declares_every_new_setting_and_leaves_keys_empty() -> None:
     env = (ROOT / ".env.example").read_text(encoding="utf-8")
     for key in ("DEMO_ENABLED", "OKX_DEMO_API_KEY", "OKX_DEMO_SECRET_KEY",
                 "OKX_DEMO_PASSPHRASE", "OKX_DEMO_HOST", "DEMO_INTERVAL",
                 "DEMO_MAX_ENTRY_DELAY_SEC", "DEMO_FILL_WAIT_SEC", "DEMO_MIN_USDT_BALANCE",
-                "DEMO_REPORT_HOUR_UTC"):
+                "DEMO_START_CAPITAL_USD", "DEMO_NOTIFY_ENABLED", "DEMO_SHEETS_ENABLED"):
         assert re.search(rf"^{key}=", env, re.M), key
+    # параметр удалён: в примере его нет (только слова о том, что он удалён)
+    assert not re.search(r"^DEMO_REPORT_HOUR_UTC=", env, re.M)
     for key in ("OKX_DEMO_API_KEY", "OKX_DEMO_SECRET_KEY", "OKX_DEMO_PASSPHRASE"):
         assert re.search(rf"^{key}=\s*$", env, re.M), f"{key} в .env.example должен быть пуст"
     assert re.search(r"^DEMO_ENABLED=false", env, re.M)
@@ -167,3 +206,14 @@ def test_verify_script_is_read_only() -> None:
 
 def test_the_package_is_listed_for_the_build() -> None:
     assert '"src.demo"' in (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+
+
+def test_verify_script_knows_all_three_tables() -> None:
+    text = (ROOT / "deploy" / "verify_9_5.sh").read_text(encoding="utf-8")
+    assert "grep -vxE 'demo_orders|demo_state|demo_balance_daily|'" in text
+    assert '"${present}" = "3"' in text
+    # то, что скрипт считает «чужим», по коду сервиса и листов пусто
+    found: set[str] = set()
+    for path in [*DEMO_FILES, ROOT / "src" / "export" / "demo_sheets.py"]:
+        found |= sql_write_targets(path.read_text(encoding="utf-8"))
+    assert found - ALLOWED_TARGETS == set()

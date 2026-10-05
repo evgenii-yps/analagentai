@@ -31,6 +31,8 @@ SKIP_BEFORE_START = "before_start"
 SKIP_STALE = "stale"
 SKIP_NOT_BUY = "not_buy"
 SKIP_NO_BALANCE = "no_balance"
+# Редакция 2: свободных денег учёта (cash) меньше суммы покупки.
+SKIP_NO_CAPITAL = "no_capital"
 # Пропуск ПРОДАЖИ: купленного меньше минимального ордера биржи.
 SKIP_DUST = "below_min_size"
 

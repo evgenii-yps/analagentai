@@ -37,7 +37,7 @@ DECISION_EMOJI = {"buy": "🟢", "sell": "🔴", "wait": "⚪"}
 # Известные команды (для маршрутизации и подсказки в /help).
 KNOWN_COMMANDS = (
     "start", "help", "status", "last", "signal", "agents", "stats", "summary",
-    "settings", "positions",
+    "settings", "positions", "demo",
 )
 
 
@@ -199,6 +199,7 @@ def render_help() -> str:
         "/stats [24h|7d|30d|all] — как система отрабатывает (по умолчанию 7d)\n"
         "/summary — суточная сводка по запросу\n"
         "/positions — виртуальные позиции: открытые и итог за 7 дней\n"
+        "/demo — демо-счёт OKX: баланс, открытые демо-сделки и итог за 7 дней\n"
         "/help — эта справка"
     )
 
@@ -675,6 +676,60 @@ REFUSAL_RU: dict[str, str] = {
     "no_frozen_target": "нет замороженной цели",
     "no_free_capital": "не хватает свободных денег",
 }
+
+
+def render_demo(data: dict[str, Any] | None, now: datetime) -> str:
+    """/demo: баланс демо-счёта, открытые демо-сделки, итог за окно (§7 ТЗ 9.5, ред. 2).
+
+    Ордера идут на ДЕМО-счёт: деньги не настоящие, и в заголовке это названо. Баланс
+    считается собственным учётом от стартового капитала, а не по счёту биржи. Вывода о
+    прибыльности здесь нет — печатаются числа.
+    """
+    lines = [
+        "<b>🧪 Демо-счёт OKX</b>",
+        "<i>Ордера идут на демо-счёт, деньги не настоящие.</i>",
+    ]
+    if data is None:
+        lines.append("Демо-исполнение ещё не запускалось: стартовый капитал не записан.")
+        return "\n".join(lines)
+    state = data["state"]
+    diff = state.equity - state.start_capital
+    diff_pct = diff / state.start_capital * 100 if state.start_capital > 0 else None
+    lines.append(
+        f"Баланс итого: ${float(state.equity):,.2f} · с начала {float(diff):+,.2f} $ "
+        + (f"({float(diff_pct):+.2f}%)" if diff_pct is not None else "")
+    )
+    lines.append(
+        f"Свободно ${float(state.cash):,.2f} · в рынке ${float(state.in_market):,.2f} "
+        f"(стартовый капитал ${float(state.start_capital):,.2f})"
+    )
+    lines.append("")
+    trades = data["open_trades"]
+    lines.append(f"<b>Открытые демо-сделки: {len(trades)}</b>")
+    if not trades:
+        lines.append("Открытых демо-сделок нет.")
+    for trade in trades:
+        left = trade["deadline_at"] - now if trade["deadline_at"] else None
+        if left is None:
+            left_txt = "срок неизвестен"
+        elif left.total_seconds() <= 0:
+            left_txt = "срок истёк"
+        else:
+            left_txt = (f"до срока {int(left.total_seconds() // 3600)} ч "
+                        f"{int(left.total_seconds() % 3600 // 60)} мин")
+        pct = trade["current_pct"]
+        lines.append(
+            f"{esc(trade['token'])} (#{trade['position_id']}) · вход "
+            f"{esc(_num_str(trade['entry_price']))} · сейчас "
+            + (f"{float(pct):+.2f}%" if pct is not None else "—")
+            + f" · {left_txt}"
+        )
+    lines.append("")
+    lines.append(
+        f"<b>За {int(data['days'])} дней:</b> закрыто {data['closed']} · прибыльных "
+        f"{data['wins']} · сумма прибыли {float(data['profit_usd']):+,.4f} $"
+    )
+    return "\n".join(lines)
 
 
 def render_positions(

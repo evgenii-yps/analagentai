@@ -247,6 +247,8 @@ class BotPoller:
             return await self._cmd_summary(now)
         if cmd == "positions":
             return await self._cmd_positions(now)
+        if cmd == "demo":
+            return await self._cmd_demo(now)
         return handlers.render_unknown()
 
     async def _handle_callback(
@@ -471,6 +473,10 @@ class BotPoller:
         )
         db_size = await self.queries.db_size()
         return handlers.render_summary(hb_rows, data_counts, signal_counts, db_size, now)
+
+    async def _cmd_demo(self, now: datetime) -> str:
+        """/demo: демо-счёт OKX (Этап 9.5, редакция 2). Только чтение, как и весь бот."""
+        return handlers.render_demo(await self.queries.demo_overview(days=7), now)
 
     async def _cmd_positions(self, now: datetime) -> str:
         """/positions: виртуальные позиции (Этап 9.1 §10).

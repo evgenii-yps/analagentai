@@ -76,7 +76,9 @@ async def test_the_exchange_is_created_in_demo_mode_with_the_configured_host(mon
 def test_the_config_for_the_service_comes_from_settings() -> None:
     cfg = runner.DemoConfig.from_settings(make_settings(
         OKX_DEMO_HOST="eea.okx.com", DEMO_MAX_ENTRY_DELAY_SEC=99, DEMO_FILL_WAIT_SEC=3,
-        DEMO_MIN_USDT_BALANCE=12.5, DEMO_REPORT_HOUR_UTC=9))
-    assert (cfg.host, cfg.max_entry_delay_sec, cfg.fill_wait_sec, cfg.report_hour_utc) == (
-        "eea.okx.com", 99, 3, 9)
+        DEMO_MIN_USDT_BALANCE=12.5, DEMO_START_CAPITAL_USD=500, DEMO_NOTIFY_ENABLED=False,
+        NOTIFY_TRADES_MAX_PER_HOUR=7, NOTIFY_TIMEZONE="Europe/Berlin"))
+    assert (cfg.host, cfg.max_entry_delay_sec, cfg.fill_wait_sec) == ("eea.okx.com", 99, 3)
     assert str(cfg.min_usdt_balance) == "12.5" and cfg.interval_sec == 1
+    assert cfg.start_capital_usd == 500 and cfg.notify_enabled is False
+    assert cfg.trades_max_per_hour == 7 and cfg.timezone == "Europe/Berlin"

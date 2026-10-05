@@ -61,7 +61,8 @@ def test_the_migration_is_idempotent(db_name) -> None:
     apply(db_name, MIGRATION)
     apply(db_name, MIGRATION)
     assert psql_raw(db_name, "SELECT count(*) FROM information_schema.tables "
-                    "WHERE table_name IN ('demo_orders', 'demo_state');") == "2"
+                    "WHERE table_name IN ('demo_orders', 'demo_state', "
+                        "'demo_balance_daily');") == "3"
 
 
 def test_key_types_match_the_real_ddl(db_name) -> None:
@@ -104,13 +105,18 @@ def test_demo_orders_columns_follow_the_spec(db_name) -> None:
         "error_code": ("text", "YES"), "error_text": ("text", "YES"),
         "created_at": ("timestamp with time zone", "NO"),
         "updated_at": ("timestamp with time zone", "NO"),
+        # редакция 2: учёт капитала
+        "fee_usd": ("numeric", "YES"), "exit_reason": ("text", "YES"),
+        "cash_after_usd": ("numeric", "YES"), "equity_after_usd": ("numeric", "YES"),
     }
     assert set(got) == set(expected)
     for name, (kind, nullable) in expected.items():
         assert got[name][0] == kind and got[name][3] == nullable, name
     precision = {"requested_cost_usd": ("14", "6"), "requested_qty": ("28", "12"),
                  "filled_qty": ("28", "12"), "avg_price": ("20", "8"), "cost_usd": ("14", "6"),
-                 "fee": ("28", "12"), "virtual_price": ("20", "8"), "slippage_pct": ("12", "6")}
+                 "fee": ("28", "12"), "virtual_price": ("20", "8"), "slippage_pct": ("12", "6"),
+                 "fee_usd": ("14", "6"), "cash_after_usd": ("14", "6"),
+                 "equity_after_usd": ("14", "6")}
     for name, (prec, scale) in precision.items():
         assert (got[name][1], got[name][2]) == (prec, scale), name
 
@@ -205,15 +211,73 @@ async def test_required_columns_are_not_null(pool) -> None:
 
 
 async def test_demo_state_holds_exactly_one_row(pool) -> None:
-    sql = "INSERT INTO demo_state (id, mirror_since, host) VALUES ({}, {}, 'h');"
-    await pool.execute(sql.format(1, "now()"))
+    sql = "INSERT INTO demo_state (id, mirror_since, host, start_capital) " \
+          "VALUES ({}, {}, 'h', {});"
+    await pool.execute(sql.format(1, "now()", 1000))
     with pytest.raises(asyncpg.UniqueViolationError):
-        await pool.execute(sql.format(1, "now()"))
+        await pool.execute(sql.format(1, "now()", 1000))
     with pytest.raises(asyncpg.CheckViolationError):
-        await pool.execute(sql.format(2, "now()"))
+        await pool.execute(sql.format(2, "now()", 1000))
     await pool.execute("DELETE FROM demo_state;")
     with pytest.raises(asyncpg.NotNullViolationError):
-        await pool.execute(sql.format(1, "NULL"))
+        await pool.execute(sql.format(1, "NULL", 1000))
+
+
+async def test_start_capital_is_required_and_positive(pool) -> None:
+    sql = "INSERT INTO demo_state (id, mirror_since, host, start_capital) " \
+          "VALUES (1, now(), 'h', {});"
+    for bad in ("0", "-1"):
+        with pytest.raises(asyncpg.CheckViolationError):
+            await pool.execute(sql.format(bad))
+    with pytest.raises(asyncpg.NotNullViolationError):
+        await pool.execute(sql.format("NULL"))
+    await pool.execute(sql.format("1000.1234"))
+    from decimal import Decimal
+
+    assert await pool.fetchval("SELECT start_capital FROM demo_state;") == Decimal("1000.1234")
+
+
+# --- demo_balance_daily -----------------------------------------------------------
+
+
+def test_demo_balance_daily_columns_follow_the_spec(db_name) -> None:
+    got = {
+        line.split("|")[0]: line.split("|")[1:]
+        for line in psql_raw(
+            db_name,
+            "SELECT column_name || '|' || data_type || '|' || "
+            "coalesce(numeric_precision::text, '') || '|' || coalesce(numeric_scale::text, '') "
+            "|| '|' || is_nullable || '|' || coalesce(column_default, '') "
+            "FROM information_schema.columns WHERE table_name = 'demo_balance_daily';",
+        ).splitlines()
+    }
+    numeric = ("equity_open", "equity_close", "cash_close", "in_market_close", "fees_usd",
+               "max_in_market_usd")
+    integers = ("opened_count", "closed_count", "wins", "losses", "skipped_count")
+    assert set(got) == {"day", *numeric, *integers, "late", "snapshot_at"}
+    assert got["day"][0] == "date" and got["day"][3] == "NO"
+    for name in numeric:
+        assert got[name][:4] == ["numeric", "14", "6", "NO"], name
+    for name in integers:
+        assert got[name][0] == "integer" and got[name][3] == "NO", name
+    assert got["late"][0] == "boolean" and got["late"][4] == "false"
+    assert got["snapshot_at"][0] == "timestamp with time zone" and got["snapshot_at"][3] == "NO"
+
+
+async def test_demo_balance_daily_is_one_row_per_day_and_late_defaults_to_false(pool) -> None:
+    from datetime import date
+
+    sql = ("INSERT INTO demo_balance_daily (day, equity_open, equity_close, cash_close, "
+           "in_market_close, opened_count, closed_count, wins, losses, skipped_count, "
+           "fees_usd, max_in_market_usd) VALUES ($1, 1000, 1001, 990, 11, 3, 2, 1, 1, 0, "
+           "0.01, 12);")
+    await pool.execute(sql, date(2026, 10, 5))
+    with pytest.raises(asyncpg.UniqueViolationError):
+        await pool.execute(sql, date(2026, 10, 5))
+    await pool.execute(sql, date(2026, 10, 6))
+    assert await pool.fetchval("SELECT late FROM demo_balance_daily LIMIT 1;") is False
+    with pytest.raises(asyncpg.NotNullViolationError):
+        await pool.execute("INSERT INTO demo_balance_daily (day) VALUES ($1);", date(2026, 10, 7))
 
 
 async def test_numeric_precision_is_enough_for_a_two_dollar_btc_order(pool) -> None:
@@ -235,7 +299,7 @@ async def test_numeric_precision_is_enough_for_a_two_dollar_btc_order(pool) -> N
 # --- роль только для чтения -----------------------------------------------------
 
 
-def test_the_read_only_role_gets_select_on_both_tables() -> None:
+def test_the_read_only_role_gets_select_on_all_three_tables() -> None:
     created = False
     try:
         has_role = psql_raw(
@@ -245,7 +309,7 @@ def test_the_read_only_role_gets_select_on_both_tables() -> None:
             created = True
         name = build_database("demoro")
         try:
-            for table in ("demo_orders", "demo_state"):
+            for table in ("demo_orders", "demo_state", "demo_balance_daily"):
                 for right, want in (("SELECT", "t"), ("INSERT", "f"), ("UPDATE", "f")):
                     got = psql_raw(
                         name, f"SELECT has_table_privilege('agenttrade_ro', '{table}', '{right}');")
@@ -260,7 +324,7 @@ def test_the_read_only_role_gets_select_on_both_tables() -> None:
 # --- откат ------------------------------------------------------------------
 
 
-def test_the_rollback_drops_both_tables_and_leaves_positions_alone() -> None:
+def test_the_rollback_drops_all_three_tables_and_leaves_positions_alone() -> None:
     name = build_database("demorb")
     try:
         psql_raw(name, "INSERT INTO instruments (exchange, symbol, base, quote) "
@@ -269,13 +333,15 @@ def test_the_rollback_drops_both_tables_and_leaves_positions_alone() -> None:
                           "WHERE table_name = 'positions';")
         apply(name, ROLLBACK)
         assert psql_raw(name, "SELECT count(*) FROM information_schema.tables "
-                        "WHERE table_name IN ('demo_orders', 'demo_state');") == "0"
+                        "WHERE table_name IN ('demo_orders', 'demo_state', "
+                        "'demo_balance_daily');") == "0"
         assert psql_raw(name, "SELECT count(*) FROM information_schema.columns "
                         "WHERE table_name = 'positions';") == before
         apply(name, ROLLBACK)                 # откат повторяем без ошибки
         apply(name, MIGRATION)                # и миграция применяется заново
         assert psql_raw(name, "SELECT count(*) FROM information_schema.tables "
-                        "WHERE table_name IN ('demo_orders', 'demo_state');") == "2"
+                        "WHERE table_name IN ('demo_orders', 'demo_state', "
+                        "'demo_balance_daily');") == "3"
     finally:
         drop_database(name)
 

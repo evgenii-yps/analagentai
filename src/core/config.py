@@ -579,7 +579,20 @@ class Settings(BaseSettings):
     DEMO_MAX_ENTRY_DELAY_SEC: int = 180    # позже — покупка не делается (stale)
     DEMO_FILL_WAIT_SEC: int = 10           # ожидание исполнения рыночного ордера
     DEMO_MIN_USDT_BALANCE: float = 20.0    # ниже — покупки не делаются (no_balance)
-    DEMO_REPORT_HOUR_UTC: int = 6
+    # Редакция 2: демо-счёт — основной контур с собственным учётом капитала.
+    # Демо-счёт OKX выдаётся с большим набором чужих виртуальных монет, поэтому
+    # баланс системы считается НЕ по счёту, а от стартового капитала по строкам
+    # demo_orders (src/demo/ledger.py). Значение записывается в demo_state при
+    # ПЕРВОМ запуске; правка позже учёт не меняет (при расхождении — предупреждение
+    # в журнал). При DEMO_ENABLED=true обязано быть > 0.
+    DEMO_START_CAPITAL_USD: float = 0.0
+    # Сообщения об открытии и закрытии демо-сделок в Telegram. Поток режет тот же
+    # предохранитель, что и у positions: NOTIFY_TRADES_MAX_PER_HOUR (0 = без потолка).
+    DEMO_NOTIFY_ENABLED: bool = True
+    # Выгрузка двух демо-листов в Google Таблицу (пишет служба export, режим replace).
+    DEMO_SHEETS_ENABLED: bool = False
+    # Суточная сводка идёт сразу после снимка конца суток по NOTIFY_TIMEZONE
+    # (00:00); отдельного часа для неё нет (DEMO_REPORT_HOUR_UTC удалён).
 
     # --- Телеграм-бот только на чтение (Этап 6.7) ---
     BOT_ENABLED: bool = True          # выключатель сервиса бота
@@ -838,9 +851,10 @@ class Settings(BaseSettings):
             errors.append(
                 f"DEMO_MIN_USDT_BALANCE={self.DEMO_MIN_USDT_BALANCE} не может быть < 0"
             )
-        if not 0 <= self.DEMO_REPORT_HOUR_UTC <= 23:
+        if self.DEMO_ENABLED and not self.DEMO_START_CAPITAL_USD > 0:
             errors.append(
-                f"DEMO_REPORT_HOUR_UTC={self.DEMO_REPORT_HOUR_UTC} вне диапазона 0..23"
+                f"DEMO_ENABLED=true, но DEMO_START_CAPITAL_USD={self.DEMO_START_CAPITAL_USD}: "
+                "стартовый капитал учёта обязан быть > 0"
             )
         return errors
 

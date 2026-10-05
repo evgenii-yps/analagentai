@@ -38,12 +38,13 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import ccxt.async_support as ccxt
 import structlog
 
 from src.demo import exchange as demo_exchange
-from src.demo import rules
+from src.demo import ledger, messages, rules
 from src.demo.exchange import DemoGuardError
 
 _log = structlog.get_logger().bind(component="demo")
@@ -81,7 +82,12 @@ class DemoConfig:
     max_entry_delay_sec: int = 180
     fill_wait_sec: int = 10
     min_usdt_balance: Decimal = Decimal(20)
-    report_hour_utc: int = 6
+    # Редакция 2: стартовый капитал из настроек (учёт берёт его из demo_state),
+    # сообщения о сделках, потолок сообщений в час и часовой пояс суток.
+    start_capital_usd: Decimal = Decimal(0)
+    notify_enabled: bool = True
+    trades_max_per_hour: int = 0
+    timezone: str = "Europe/Moscow"
 
     @classmethod
     def from_settings(cls, cfg: Any) -> DemoConfig:
@@ -91,7 +97,10 @@ class DemoConfig:
             max_entry_delay_sec=int(cfg.DEMO_MAX_ENTRY_DELAY_SEC),
             fill_wait_sec=int(cfg.DEMO_FILL_WAIT_SEC),
             min_usdt_balance=Decimal(str(cfg.DEMO_MIN_USDT_BALANCE)),
-            report_hour_utc=int(cfg.DEMO_REPORT_HOUR_UTC),
+            start_capital_usd=Decimal(str(cfg.DEMO_START_CAPITAL_USD)),
+            notify_enabled=bool(cfg.DEMO_NOTIFY_ENABLED),
+            trades_max_per_hour=int(cfg.NOTIFY_TRADES_MAX_PER_HOUR),
+            timezone=str(cfg.NOTIFY_TIMEZONE),
         )
 
 
@@ -117,11 +126,18 @@ class Context:
     now: Callable[[], datetime] = _utcnow
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
     mirror_since: datetime | None = None
+    # Стартовый капитал учёта — из demo_state, а не из настроек (§3 ТЗ).
+    start_capital: Decimal = Decimal(0)
     markets_loaded: bool = False
     valid_symbols: set[str] = field(default_factory=set)
     halted: str | None = None
     # Свободный USDT, прочитанный на этой итерации (None — ещё не читали).
     usdt_free: Decimal | None = None
+
+    @property
+    def tz(self) -> ZoneInfo:
+        """Часовой пояс суток и сообщений (``NOTIFY_TIMEZONE``)."""
+        return ZoneInfo(self.config.timezone)
 
 
 @dataclass
@@ -135,6 +151,7 @@ class IterStats:
     skipped: dict[str, int] = field(default_factory=dict)
     dust: int = 0
     rejected: int = 0
+    no_capital: int = 0
 
     def any(self) -> bool:
         return bool(
@@ -205,24 +222,46 @@ def halt(ctx: Context, reason: str) -> None:
 # --------------------------------------------------------------------------
 
 
-async def ensure_state(pool: Any, host: str, now: datetime) -> datetime:
-    """Возвращает ``mirror_since``; при первом запуске записывает его (``now``).
+@dataclass(frozen=True)
+class DemoState:
+    """Строка ``demo_state``: начало зеркалирования, хост, стартовый капитал учёта."""
 
-    Позиции, открытые ДО этого момента, не зеркалятся НИКОГДА: иначе пришлось бы
-    продавать то, что не покупали.
+    mirror_since: datetime
+    host: str
+    start_capital: Decimal
+
+
+async def ensure_state(
+    pool: Any, host: str, now: datetime, start_capital: Decimal
+) -> DemoState:
+    """Возвращает ``demo_state``; при первом запуске записывает его (``now``, капитал).
+
+    Позиции, открытые ДО ``mirror_since``, не зеркалятся НИКОГДА: иначе пришлось бы
+    продавать то, что не покупали. Стартовый капитал записывается ОДИН РАЗ: правка
+    ``DEMO_START_CAPITAL_USD`` позже учёт не меняет, а при расхождении в журнал
+    пишется предупреждение.
     """
     await pool.execute(
-        "INSERT INTO demo_state (id, mirror_since, host) VALUES (1, $1, $2) "
-        "ON CONFLICT (id) DO NOTHING;",
-        now, host,
+        "INSERT INTO demo_state (id, mirror_since, host, start_capital) "
+        "VALUES (1, $1, $2, $3) ON CONFLICT (id) DO NOTHING;",
+        now, host, start_capital,
     )
-    row = await pool.fetchrow("SELECT mirror_since, host FROM demo_state WHERE id = 1;")
+    row = await pool.fetchrow(
+        "SELECT mirror_since, host, start_capital FROM demo_state WHERE id = 1;"
+    )
     if row["host"] != host:
         _log.warning(
             "demo_host_changed=1", state_host=row["host"], config_host=host,
             note="mirror_since не менялся; ордера пишут текущий хост",
         )
-    return row["mirror_since"]
+    recorded = Decimal(str(row["start_capital"]))
+    if recorded != Decimal(str(start_capital)):
+        _log.warning(
+            "demo_start_capital_differs=1", recorded=str(recorded),
+            configured=str(start_capital),
+            note="учёт ведётся от записанного капитала; правка настройки его не меняет",
+        )
+    return DemoState(row["mirror_since"], row["host"], recorded)
 
 
 async def ensure_markets(ctx: Context) -> bool:
@@ -266,18 +305,19 @@ async def _insert_row(
     ctx: Context, *, pos: dict[str, Any], leg: str, status: str,
     skip_reason: str | None = None, requested_cost: Decimal | None = None,
     requested_qty: Decimal | None = None, virtual_price: Any = None,
-    virtual_ts: datetime,
+    virtual_ts: datetime, exit_reason: str | None = None,
 ) -> int | None:
     """Вставляет строку ноги. ``None`` — строка уже есть (другая итерация успела)."""
     value = await ctx.pool.fetchval(
         "INSERT INTO demo_orders (position_id, instrument_id, leg, status, "
         "skip_reason, cl_ord_id, symbol, host, requested_cost_usd, requested_qty, "
-        "virtual_price, virtual_ts) "
-        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) "
+        "virtual_price, virtual_ts, exit_reason) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) "
         "ON CONFLICT DO NOTHING RETURNING id;",
         int(pos["id"]), int(pos["instrument_id"]), leg, status, skip_reason,
         rules.cl_ord_id(int(pos["id"]), leg), str(pos["symbol"]),
         ctx.config.host, requested_cost, requested_qty, virtual_price, virtual_ts,
+        exit_reason,
     )
     return int(value) if value is not None else None
 
@@ -335,7 +375,12 @@ def classify_order(order: dict[str, Any]) -> str:
 async def _record_fill(
     ctx: Context, row: dict[str, Any], order: dict[str, Any]
 ) -> None:
-    """Записывает исполнение: количество, цену, сумму, комиссию, проскальзывание, задержку."""
+    """Записывает исполнение: количество, цену, сумму, комиссию, проскальзывание, задержку.
+
+    Редакция 2: сверх этого — ``fee_usd`` (комиссия в долларах: в USDT как есть, в монете —
+    на цену исполнения), а после записи — ``cash_after_usd`` и ``equity_after_usd``
+    (состояние учёта сразу после ноги) и сообщение о сделке в Telegram.
+    """
     filled = _dec(order.get("filled")) or Decimal(0)
     avg = _dec(order.get("average"))
     cost = _dec(order.get("cost"))
@@ -344,6 +389,13 @@ async def _record_fill(
     fee = order.get("fee") or {}
     fee_cost = _dec(fee.get("cost"))
     fee_ccy = fee.get("currency")
+    fee_usd = None
+    if fee_cost is not None and avg is not None:
+        try:
+            fee_usd = rules.fee_in_usdt(fee_cost, fee_ccy, avg, str(row["symbol"]).split("/")[0])
+        except ValueError as exc:
+            _log.warning("demo_fee_not_convertible=1", cl_ord_id=row.get("cl_ord_id"),
+                         error=str(exc))
     filled_at = _ts_of(order, ctx.now())
     virtual_price = _dec(row.get("virtual_price"))
     slip = None
@@ -354,9 +406,9 @@ async def _record_fill(
         "UPDATE demo_orders SET status = 'filled', "
         "exchange_order_id = COALESCE($2, exchange_order_id), filled_qty = $3, "
         "avg_price = $4, cost_usd = $5, fee = $6, fee_ccy = $7, slippage_pct = $8, "
-        "filled_at = $9, lag_sec = $10, updated_at = now() WHERE id = $1;",
+        "filled_at = $9, lag_sec = $10, fee_usd = $11, updated_at = now() WHERE id = $1;",
         int(row["id"]), str(order["id"]) if order.get("id") else None,
-        filled, avg, cost, fee_cost, fee_ccy, slip, filled_at, lag,
+        filled, avg, cost, fee_cost, fee_ccy, slip, filled_at, lag, fee_usd,
     )
     _log.info(
         "demo_filled=1", position_id=int(row["position_id"]), leg=row["leg"],
@@ -364,6 +416,23 @@ async def _record_fill(
         avg_price=str(avg), slippage_pct=None if slip is None else f"{slip:.4f}",
         lag_sec=lag,
     )
+    await _record_balance_after(ctx, int(row["id"]))
+    await messages.notify_fill(ctx, int(row["id"]))
+
+
+async def _record_balance_after(ctx: Context, row_id: int) -> None:
+    """Пишет в исполненную строку свободные деньги и баланс сразу после ноги."""
+    try:
+        state = await ledger.ledger_state(ctx, ctx.now())
+        await ctx.pool.execute(
+            "UPDATE demo_orders SET cash_after_usd = $2, equity_after_usd = $3, "
+            "updated_at = now() WHERE id = $1;",
+            row_id, state.cash, state.equity,
+        )
+        await ledger.note_in_market(ctx, state, ctx.now())
+    except Exception as exc:  # noqa: BLE001 — учёт после ноги не важнее самой ноги
+        _log.warning("demo_balance_after_failed=1", order_id=row_id,
+                     error=_safe_error_text(ctx, exc))
 
 
 async def _settle(ctx: Context, row: dict[str, Any], order: dict[str, Any]) -> str:
@@ -540,7 +609,8 @@ async def recover(ctx: Context, stats: IterStats) -> None:
 
 
 _SELL_CANDIDATES_SQL = (
-    "SELECT p.id, p.instrument_id, p.exit_price, p.closed_at, i.symbol, i.base, "
+    "SELECT p.id, p.instrument_id, p.exit_price, p.closed_at, p.exit_reason, "
+    "i.symbol, i.base, "
     "b.filled_qty AS bought_qty, b.fee AS buy_fee, b.fee_ccy AS buy_fee_ccy "
     "FROM positions p "
     "JOIN instruments i ON i.id = p.instrument_id "
@@ -579,6 +649,7 @@ async def run_sells(ctx: Context, stats: IterStats) -> None:
                 ctx, pos=pos, leg=rules.LEG_SELL, status=rules.STATUS_DUST,
                 skip_reason=rules.SKIP_DUST, requested_qty=qty,
                 virtual_price=virtual_price, virtual_ts=virtual_ts,
+                exit_reason=pos["exit_reason"],
             )
             if row_id is not None:
                 stats.dust += 1
@@ -587,6 +658,7 @@ async def run_sells(ctx: Context, stats: IterStats) -> None:
         row_id = await _insert_row(
             ctx, pos=pos, leg=rules.LEG_SELL, status=rules.STATUS_PENDING,
             requested_qty=qty, virtual_price=virtual_price, virtual_ts=virtual_ts,
+            exit_reason=pos["exit_reason"],
         )
         if row_id is None:
             continue
@@ -680,6 +752,24 @@ async def run_buys(ctx: Context, stats: IterStats) -> None:
                 f"{ctx.config.min_usdt_balance}; покупки не делаются",
             )
             continue
+        # КАПИТАЛ УЧЁТА (редакция 2): ПОСЛЕ no_balance и ДО вставки pending. Свободные
+        # деньги — cash за вычетом сумм под ордерами, исход которых ещё неизвестен.
+        # Равенство проходит: cash == стоимости покупки — деньги на неё есть.
+        try:
+            cash = await ledger.fetch_cash(ctx.pool, ctx.start_capital) \
+                - await ledger.fetch_reserved(ctx.pool)
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("demo_cash_failed=1", error=_safe_error_text(ctx, exc))
+            return
+        if cash < cost:
+            await _skip_buy(ctx, pos, rules.SKIP_NO_CAPITAL, stats)
+            stats.no_capital += 1
+            await alert(
+                ctx, "no_capital",
+                f"свободных денег учёта ${cash:.2f} — меньше суммы покупки ${cost}; "
+                "покупки пропускаются (no_capital)",
+            )
+            continue
         row_id = await _insert_row(
             ctx, pos=pos, leg=rules.LEG_BUY, status=rules.STATUS_PENDING,
             requested_cost=cost, virtual_price=pos["entry_price"],
@@ -723,6 +813,13 @@ async def run_once(ctx: Context) -> IterStats:
     """Одна итерация: восстановление, продажи, затем покупки."""
     stats = IterStats()
     ctx.usdt_free = None
+    # Снимок конца суток и сообщения-«хвосты» не зависят от биржи и от остановки
+    # отправки ордеров: сбой в них не мешает торговле и не прерывает итерацию.
+    try:
+        await ledger.ensure_snapshots(ctx, ctx.now())
+        await messages.flush_rollup(ctx)
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("demo_snapshot_failed=1", error=_safe_error_text(ctx, exc))
     if ctx.halted:
         return stats
     if not await ensure_markets(ctx):
@@ -734,6 +831,10 @@ async def run_once(ctx: Context) -> IterStats:
     if ctx.halted:
         return stats
     await run_buys(ctx, stats)
+    try:
+        await ledger.track_max_in_market(ctx, ctx.now())
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("demo_max_in_market_failed=1", error=_safe_error_text(ctx, exc))
     return stats
 
 
@@ -750,6 +851,10 @@ def startup_fields(ctx: Context) -> dict[str, Any]:
         "interval": ctx.config.interval_sec,
         "max_entry_delay_sec": ctx.config.max_entry_delay_sec,
         "min_usdt_balance": str(ctx.config.min_usdt_balance),
+        "start_capital": str(ctx.start_capital),
+        "notify_enabled": ctx.config.notify_enabled,
+        "trades_max_per_hour": ctx.config.trades_max_per_hour,
+        "timezone": ctx.config.timezone,
         "instruments": list(ctx.symbols),
     }
 
@@ -767,7 +872,7 @@ async def run(
                 _log.info(
                     "demo_iteration=1", recovered=stats.recovered, lost=stats.lost,
                     sells=stats.sells, buys=stats.buys, skipped=stats.skipped,
-                    dust=stats.dust, rejected=stats.rejected,
+                    dust=stats.dust, rejected=stats.rejected, no_capital=stats.no_capital,
                 )
             if report is not None:
                 await report(ctx)
