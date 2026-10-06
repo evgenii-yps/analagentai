@@ -99,6 +99,101 @@ def test_the_header_really_goes_out_in_a_signed_request() -> None:
         assert "x-simulated-trading" not in live["headers"]   # без демо-режима заголовка нет
 
 
+def test_demo_client_loads_only_spot_markets_option() -> None:
+    """9.5.1: по умолчанию ccxt грузит spot/future/swap/option; демо-клиенту нужен только спот."""
+    ex = make()
+    try:
+        assert ex.options["fetchMarkets"] == {"types": ["spot"]}
+    finally:
+        asyncio.run(ex.close())
+
+
+def _instrument(inst_type: str, inst_id: str) -> dict[str, str]:
+    spot = inst_type == "SPOT"
+    return {
+        "instType": inst_type, "instId": inst_id, "uly": "", "category": "1",
+        "baseCcy": "BTC" if spot else "", "quoteCcy": "USDT" if spot else "",
+        "settleCcy": "", "ctVal": "", "ctMult": "", "ctValCcy": "", "optType": "", "stk": "",
+        "listTime": "1", "expTime": "", "lever": "", "tickSz": "0.1", "lotSz": "0.00000001",
+        "minSz": "0.00001", "ctType": "", "alias": "", "state": "live", "maxLmtSz": "9999",
+        "maxMktSz": "9999", "maxTwapSz": "", "maxIcebergSz": "", "maxTriggerSz": "",
+        "maxStopSz": "", "contTdSwTime": "", "openType": "",
+    }
+
+
+def _load_markets_with_stub(*, drop_option: bool = False) -> tuple[list[str], dict[str, Any]]:
+    """load_markets() демо-клиента на заглушке HTTP; FUTURES содержит запись с пустым instId."""
+    import json
+
+    urls: list[str] = []
+
+    class Resp:
+        status, reason, headers = 200, "OK", {"Content-Type": "application/json"}
+
+        def __init__(self, body: str) -> None:
+            self._body = body
+
+        async def text(self, errors: Any = None) -> str:
+            return self._body
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return None
+
+    def reply(url: str) -> str:
+        if "/public/instruments" in url:
+            kind = url.split("instType=")[1].split("&")[0]
+            rows = {
+                "SPOT": [_instrument("SPOT", "BTC-USDT")],
+                "FUTURES": [_instrument("FUTURES", ""), _instrument("FUTURES", "BTC-USD-261231")],
+                "SWAP": [_instrument("SWAP", "BTC-USDT-SWAP")],
+                "OPTION": [_instrument("OPTION", "BTC-USD-261231-60000-C")],
+            }[kind]
+            return json.dumps({"code": "0", "msg": "", "data": rows})
+        return json.dumps({"code": "0", "msg": "", "data": []})
+
+    class Session:
+        headers: dict[str, str] = {}
+
+        def get(self, url, **kw):
+            urls.append(str(url))
+            return Resp(reply(str(url)))
+
+        post = get
+
+        async def close(self) -> None:
+            return None
+
+    async def go() -> dict[str, Any]:
+        ex = make()
+        if drop_option:
+            del ex.options["fetchMarkets"]
+        ex.session = Session()
+        try:
+            return await ex.load_markets()
+        finally:
+            await ex.close()
+
+    markets = asyncio.run(go())
+    return urls, markets
+
+
+def test_demo_load_markets_survives_empty_instid_and_asks_spot_only() -> None:
+    """9.5.1: пустой instId в FUTURES не ломает load_markets; других типов не запрашиваем."""
+    urls, markets = _load_markets_with_stub()
+    types = {u.split("instType=")[1].split("&")[0] for u in urls if "/public/instruments" in u}
+    assert types == {"SPOT"}
+    assert "BTC/USDT" in markets
+
+
+def test_without_the_option_the_empty_instid_breaks_load_markets() -> None:
+    """9.5.1, мутация: без опции ccxt грузит все типы и падает на пустом instId."""
+    with pytest.raises(TypeError):
+        _load_markets_with_stub(drop_option=True)
+
+
 def test_create_market_buy_order_with_cost_exists_and_sends_the_cost_as_quote() -> None:
     import ccxt.async_support as ccxt
 
