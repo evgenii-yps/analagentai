@@ -367,7 +367,10 @@ _POSITIONS_SQL = (
     "FROM positions p "
     "JOIN instruments i ON i.id = p.instrument_id "
     "LEFT JOIN signals sg ON sg.id = p.signal_id "
-    "WHERE EXISTS (SELECT 1 FROM demo_orders b WHERE b.position_id = p.id AND b.leg = 'buy') "
+    "WHERE EXISTS (SELECT 1 FROM demo_orders b WHERE b.position_id = p.id AND b.leg = 'buy' "
+    # Этап 9.5.3: позиции, открытые ДО запуска демо (buy skipped / before_start), — не сделки
+    # демо-счёта, в лист владельца они не идут. Остальные пропуски остаются.
+    "AND NOT (b.status = 'skipped' AND b.skip_reason = 'before_start')) "
     "ORDER BY p.opened_at, p.id;"
 )
 

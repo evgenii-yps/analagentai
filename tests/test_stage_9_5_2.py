@@ -270,7 +270,8 @@ async def test_statuses_follow_the_spec(pool) -> None:
     opened = utc(5, 20)                    # 23:00 МСК
     ids: dict[str, int] = {}
 
-    for reason in ("no_capital", "no_balance", "stale", "before_start"):
+    # before_start в лист не попадает (Этап 9.5.3, tests/test_stage_9_5_3.py)
+    for reason in ("no_capital", "no_balance", "stale"):
         ids[reason] = await add_position(pool, opened_at=opened)
         await raw_order(pool, ids[reason], "buy", "skipped", skip_reason=reason)
     ids["rejected"] = await add_position(pool, opened_at=opened)
@@ -312,7 +313,7 @@ async def test_statuses_follow_the_spec(pool) -> None:
 
     expected_skip = {
         "no_capital": "нет свободного капитала", "no_balance": "мало USDT на демо-счёте",
-        "stale": "опоздание входа", "before_start": "позиция до запуска демо",
+        "stale": "опоздание входа",
     }
     for reason, text in expected_skip.items():
         row = rows[ids[reason]]
