@@ -101,6 +101,11 @@ else
   fi
 fi
 echo "  ⓘ DEMO_ENABLED в .env: $(env_val DEMO_ENABLED)"
+# Этап 9.5, часть 3: выключатель вывода виртуальных сделок человеку. Не задан в .env —
+# действует умолчание кода (true: виртуальные сделки видны).
+virtual_output="$(env_val VIRTUAL_OUTPUT_ENABLED)"
+echo "  ⓘ VIRTUAL_OUTPUT_ENABLED в .env: ${virtual_output:-не задан (по умолчанию true)}"
+echo "  ⓘ POSITION_NOTIFY_ENABLED: $(env_val POSITION_NOTIFY_ENABLED); SHEETS_TRADES_ENABLED: $(env_val SHEETS_TRADES_ENABLED); DEMO_SHEETS_ENABLED: $(env_val DEMO_SHEETS_ENABLED)"
 
 # --- 5. Границы по коду: запись только в demo_orders, demo_state, demo_balance_daily ---
 echo "5. Запись сервиса в чужие таблицы (по коду src/demo и src/demo_main.py)"

@@ -217,3 +217,10 @@ def test_verify_script_knows_all_three_tables() -> None:
     for path in [*DEMO_FILES, ROOT / "src" / "export" / "demo_sheets.py"]:
         found |= sql_write_targets(path.read_text(encoding="utf-8"))
     assert found - ALLOWED_TARGETS == set()
+
+
+def test_verify_script_prints_the_virtual_output_switch() -> None:
+    """Часть 3, §4.6: значение VIRTUAL_OUTPUT_ENABLED выводится, а не только читается."""
+    text = (ROOT / "deploy" / "verify_9_5.sh").read_text(encoding="utf-8")
+    assert 'env_val VIRTUAL_OUTPUT_ENABLED' in text
+    assert "VIRTUAL_OUTPUT_ENABLED в .env:" in text and "по умолчанию true" in text

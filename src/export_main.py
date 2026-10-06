@@ -670,6 +670,36 @@ async def _export_notion(
     return created
 
 
+def alert_text(
+    summary: str,
+    *,
+    positions_only: bool,
+    show_queue: bool,
+    to_open: int = 0,
+    to_close: int = 0,
+    left_sheets: int = 0,
+    left_notion: int = 0,
+) -> str:
+    """Текст алерта о сбое выгрузки.
+
+    ``show_queue`` — показывать ли счётчики виртуальной очереди торгового журнала
+    («открытий=N, закрытий=M»); ``VIRTUAL_OUTPUT_ENABLED=false`` их скрывает (§2.4 части
+    3), остальной текст алерта не меняется. При ``show_queue=True`` текст побуквенно
+    тот же, что был до этой правки.
+    """
+    if positions_only:
+        queue = (
+            f"\nНе записано в торговый журнал: открытий={to_open}, закрытий={to_close}. "
+            if show_queue else "\n"
+        )
+        return f"{summary}{queue}Повтор на следующем запуске."
+    queue = f", торговый журнал: открытий={to_open}, закрытий={to_close}" if show_queue else ""
+    return (
+        f"{summary}\nНе выгружено: Sheets={left_sheets}, Notion={left_notion}{queue}. "
+        "Повтор на следующем запуске."
+    )
+
+
 async def _run(positions_only: bool = False) -> int:
     """Основной сценарий. Возвращает код выхода (0 — успех, 1 — были ошибки)."""
     setup_logging()
@@ -742,22 +772,26 @@ async def _run(positions_only: bool = False) -> int:
                 log.error("Ошибка выгрузки в Notion", error=str(exc))
 
         if errors:
-            to_open, to_close = await queries.count_positions_pending(conn)
+            show_queue = bool(settings.VIRTUAL_OUTPUT_ENABLED)
+            # Счётчик виртуальной очереди читается только когда его покажут: при
+            # VIRTUAL_OUTPUT_ENABLED=false ни запроса, ни упоминания (§2.4 части 3).
+            to_open, to_close = (
+                await queries.count_positions_pending(conn) if show_queue else (0, 0)
+            )
             summary = " | ".join(errors)
             if positions_only:
                 await _alert(
-                    f"{summary}\nНе записано в торговый журнал: "
-                    f"открытий={to_open}, закрытий={to_close}. "
-                    f"Повтор на следующем запуске.",
+                    alert_text(summary, positions_only=True, show_queue=show_queue,
+                               to_open=to_open, to_close=to_close),
                     log,
                 )
                 return 1
             left_sheets = await queries.count_unexported(conn, "sheets")
             left_notion = await queries.count_unexported(conn, "notion")
             await _alert(
-                f"{summary}\nНе выгружено: Sheets={left_sheets}, "
-                f"Notion={left_notion}, торговый журнал: открытий={to_open}, "
-                f"закрытий={to_close}. Повтор на следующем запуске.",
+                alert_text(summary, positions_only=False, show_queue=show_queue,
+                           to_open=to_open, to_close=to_close,
+                           left_sheets=left_sheets, left_notion=left_notion),
                 log,
             )
             return 1

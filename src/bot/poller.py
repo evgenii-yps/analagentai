@@ -232,7 +232,7 @@ class BotPoller:
         now = datetime.now(UTC)
 
         if cmd in ("start", "help"):
-            return handlers.render_help()
+            return handlers.render_help(bool(settings.VIRTUAL_OUTPUT_ENABLED))
         if cmd == "status":
             return await self._cmd_status(now, chat_id)
         if cmd == "last":
@@ -246,6 +246,10 @@ class BotPoller:
         if cmd == "summary":
             return await self._cmd_summary(now)
         if cmd == "positions":
+            # Команда остаётся известной, но при VIRTUAL_OUTPUT_ENABLED=false отвечает
+            # одной строкой и в базу за позициями не ходит (§2.2).
+            if not settings.VIRTUAL_OUTPUT_ENABLED:
+                return handlers.render_hidden_positions()
             return await self._cmd_positions(now)
         if cmd == "demo":
             return await self._cmd_demo(now)
@@ -398,6 +402,16 @@ class BotPoller:
         per_token = await self.queries.freshness_by_instrument(
             None if user.instruments is None else list(user.instruments)
         )
+        # VIRTUAL_OUTPUT_ENABLED=false (этап 9.5, часть 3, §2.3): раздела «Сделки
+        # (виртуальные)» нет, вместо него — «Демо-счёт» (только при DEMO_ENABLED=true).
+        if not settings.VIRTUAL_OUTPUT_ENABLED:
+            demo = None
+            if settings.DEMO_ENABLED:
+                try:
+                    demo = await self.queries.demo_overview(days=7)
+                except Exception as exc:  # noqa: BLE001 — демо не важнее ответа
+                    self._log.warning("bot_demo_state_failed=1", error=str(exc))
+            return handlers.render_status(hb_rows, facts, now, per_token, None, demo)
         pause_sec = float(settings.POSITION_TOKEN_PAUSE_MIN) * 60.0
         try:
             positions = await self.queries.positions_state(

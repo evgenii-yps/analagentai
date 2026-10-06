@@ -281,6 +281,28 @@ async def _send(text: str, now: datetime | None = None) -> None:
         await rate_limit.record_sent(_TRADE_SENT_KEY, now)
 
 
+async def _discard_held_trade_messages() -> int:
+    """Отбрасывает придержанные сообщения о сделках без отправки; пишет число в журнал.
+
+    Возвращает, сколько сообщений отброшено. Ошибка Redis не роняет итерацию.
+    """
+    try:
+        redis = get_redis()
+        held = await redis.lrange(_TRADE_HELD_KEY, 0, -1)
+        if not held:
+            return 0
+        await redis.delete(_TRADE_HELD_KEY)
+    except Exception as exc:  # noqa: BLE001 — чистка не важнее позиции
+        _log.warning("notify_trade_rollup_discard_failed=1", error=str(exc))
+        return 0
+    _log.info(
+        "notify_trade_rollup_discarded=1", count=len(held),
+        reason="POSITION_NOTIFY_ENABLED=false — придержанные сообщения о сделках "
+               "не отправляются",
+    )
+    return len(held)
+
+
 async def _flush_trade_rollup(now: datetime) -> None:
     """Шлёт почасовую сводку придержанных сообщений (§6.3 ТЗ 9.3).
 
@@ -293,6 +315,14 @@ async def _flush_trade_rollup(now: datetime) -> None:
     окно потолка уведомлений: обнуление в начале часа даёт две сводки за две
     минуты на границе.
     """
+    # ПРИ ВЫКЛЮЧЕННЫХ СООБЩЕНИЯХ О СДЕЛКАХ СВОДКА НЕ УХОДИТ, А ПРИДЕРЖАННОЕ
+    # ОТБРАСЫВАЕТСЯ (этап 9.5, часть 3, §2.5). Остаток списка в Redis (TTL сутки) от
+    # времени, когда сообщения ещё были включены, иначе ушёл бы одной сводкой уже
+    # после выключения — человек увидел бы виртуальные сделки, которые просил не
+    # показывать. Правило не зависит от VIRTUAL_OUTPUT_ENABLED и от потолка.
+    if not settings.POSITION_NOTIFY_ENABLED:
+        await _discard_held_trade_messages()
+        return
     if int(settings.NOTIFY_TRADES_MAX_PER_HOUR) <= 0:
         return
     try:

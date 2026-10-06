@@ -24,6 +24,7 @@
 
 from __future__ import annotations
 
+import secrets
 from datetime import datetime
 
 import structlog
@@ -59,7 +60,12 @@ async def record_sent(key: str, now: datetime) -> None:
     """Отмечает факт отправки в скользящем окне часа."""
     try:
         redis = get_redis()
-        await redis.zadd(key, {now.isoformat(): now.timestamp()})
+        # УНИКАЛЬНЫЙ ЧЛЕН НА КАЖДОЕ СООБЩЕНИЕ. Членом множества было одно время, и два
+        # сообщения с одной и той же меткой (пачка исполнений за одну итерацию)
+        # схлопывались в одно: потолок недосчитывал. Суффикс делает член уникальным;
+        # вес остаётся временем, и окно чистится по нему как прежде.
+        member = f"{now.isoformat()}#{secrets.token_hex(4)}"
+        await redis.zadd(key, {member: now.timestamp()})
         await redis.expire(key, _KEY_TTL_SEC)
     except Exception as exc:  # noqa: BLE001 — счётчик не важнее сообщения
         _log.warning("notify_rate_write_failed=1", key=key, error=str(exc))

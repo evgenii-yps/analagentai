@@ -182,8 +182,25 @@ def parse_stats_period(args: list[str], default: str = "7d") -> str:
 # Рендеры ответов (чистые: данные → HTML-текст).
 # --------------------------------------------------------------------------- #
 
-def render_help() -> str:
-    """/start и /help: краткое описание и список команд человеческим языком."""
+# Ответ на /positions при VIRTUAL_OUTPUT_ENABLED=false (этап 9.5, часть 3, §2.2).
+HIDDEN_POSITIONS_TEXT = "Виртуальные сделки скрыты. Демо-счёт — /demo"
+
+
+def render_hidden_positions() -> str:
+    """/positions при выключенном выводе виртуальных сделок: одна строка, без данных."""
+    return HIDDEN_POSITIONS_TEXT
+
+
+def render_help(virtual_output: bool = True) -> str:
+    """/start и /help: краткое описание и список команд человеческим языком.
+
+    ``virtual_output=False`` (``VIRTUAL_OUTPUT_ENABLED=false``) убирает из списка команду
+    ``/positions``: виртуальные сделки человеку не показываются.
+    """
+    positions_line = (
+        "/positions — виртуальные позиции: открытые и итог за 7 дней\n"
+        if virtual_output else ""
+    )
     return (
         "🤖 <b>Agent Trade — бот наблюдения</b>\n"
         "Система анализирует рынок BTC тремя агентами и раз в минуту формирует "
@@ -198,7 +215,7 @@ def render_help() -> str:
         "/agents — что три агента думают прямо сейчас\n"
         "/stats [24h|7d|30d|all] — как система отрабатывает (по умолчанию 7d)\n"
         "/summary — суточная сводка по запросу\n"
-        "/positions — виртуальные позиции: открытые и итог за 7 дней\n"
+        + positions_line +
         "/demo — демо-счёт OKX: баланс, открытые демо-сделки и итог за 7 дней\n"
         "/help — эта справка"
     )
@@ -215,6 +232,7 @@ def render_status(
     now: datetime,
     per_token: list[tuple[str, datetime | None]] | None = None,
     positions: dict[str, Any] | None = None,
+    demo: dict[str, Any] | None = None,
 ) -> str:
     """/status: свежесть heartbeat-ключей, свежесть данных, счётчики сигналов.
 
@@ -298,6 +316,23 @@ def render_status(
                     for symbol, left_sec in pauses
                 )
                 lines.append(f"Пауза по токенам ({pause_min} мин): {listed}")
+
+    # РАЗДЕЛ «ДЕМО-СЧЁТ» (этап 9.5, часть 3, §2.3): на месте раздела «Сделки
+    # (виртуальные)» при VIRTUAL_OUTPUT_ENABLED=false. Передаётся только в этом режиме
+    # и только при DEMO_ENABLED=true; иначе раздела нет вовсе.
+    if demo is not None:
+        state = demo["state"]
+        diff_pct = (
+            (state.equity - state.start_capital) / state.start_capital * 100
+            if state.start_capital > 0 else None
+        )
+        lines.append("")
+        lines.append("<b>Демо-счёт:</b>")
+        lines.append(f"Баланс итого: ${float(state.equity):,.2f}")
+        lines.append(f"Открытых сделок: {int(state.open_count)}")
+        lines.append(
+            "С начала: " + (f"{float(diff_pct):+.2f}%" if diff_pct is not None else "—")
+        )
 
     lines.append("")
     if problems:
