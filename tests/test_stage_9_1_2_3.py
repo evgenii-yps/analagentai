@@ -354,7 +354,9 @@ def test_the_receiver_version_requirement_matches_the_receiver() -> None:
         r"RECEIVER_VERSION = '([^']+)'", receiver
     )
     assert declared is not None, "приёмник не объявляет версию вовсе"
-    assert export_main._TRADES_RECEIVER_VERSION == declared.group(1)
+    # Этап 9.5.2: приёмник объявляет 9.5.2 (надмножество 9.2) — она обязана входить в
+    # принимаемые журналом версии, иначе обновление приёмника остановило бы журнал.
+    assert declared.group(1) in export_main._TRADES_COMPATIBLE_VERSIONS
 
 
 # =============================================================================

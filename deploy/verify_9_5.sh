@@ -105,7 +105,7 @@ echo "  ⓘ DEMO_ENABLED в .env: $(env_val DEMO_ENABLED)"
 # действует умолчание кода (true: виртуальные сделки видны).
 virtual_output="$(env_val VIRTUAL_OUTPUT_ENABLED)"
 echo "  ⓘ VIRTUAL_OUTPUT_ENABLED в .env: ${virtual_output:-не задан (по умолчанию true)}"
-echo "  ⓘ POSITION_NOTIFY_ENABLED: $(env_val POSITION_NOTIFY_ENABLED); SHEETS_TRADES_ENABLED: $(env_val SHEETS_TRADES_ENABLED); DEMO_SHEETS_ENABLED: $(env_val DEMO_SHEETS_ENABLED)"
+echo "  ⓘ POSITION_NOTIFY_ENABLED: $(env_val POSITION_NOTIFY_ENABLED); SHEETS_TRADES_ENABLED: $(env_val SHEETS_TRADES_ENABLED); DEMO_SHEETS_ENABLED: $(env_val DEMO_SHEETS_ENABLED); DEMO_OWNER_SHEET_ENABLED: $(env_val DEMO_OWNER_SHEET_ENABLED)"
 
 # --- 5. Границы по коду: запись только в demo_orders, demo_state, demo_balance_daily ---
 echo "5. Запись сервиса в чужие таблицы (по коду src/demo и src/demo_main.py)"
@@ -113,7 +113,7 @@ if [ ! -d "${APP_DIR}/src/demo" ]; then
   skip "каталога src/demo нет"
 else
   targets="$(grep -rhoiE 'INSERT[[:space:]]+INTO[[:space:]]+[a-z_.]+|UPDATE[[:space:]]+[a-z_.]+[[:space:]]+SET|DELETE[[:space:]]+FROM[[:space:]]+[a-z_.]+' \
-      "${APP_DIR}/src/demo" "${APP_DIR}/src/demo_main.py" "${APP_DIR}/src/export/demo_sheets.py" 2>/dev/null \
+      "${APP_DIR}/src/demo" "${APP_DIR}/src/demo_main.py" "${APP_DIR}/src/export/demo_sheets.py" "${APP_DIR}/src/export/demo_owner_sheet.py" 2>/dev/null \
     | sed -E 's/^(insert[[:space:]]+into|update|delete[[:space:]]+from)[[:space:]]+//I; s/[[:space:]]+set$//I; s/^public\.//' \
     | tr 'A-Z' 'a-z' | sort -u || true)"
   foreign="$(printf '%s\n' "${targets}" | grep -vxE 'demo_orders|demo_state|demo_balance_daily|' || true)"
@@ -174,6 +174,29 @@ if [ -z "${snaps}" ]; then
 else
   echo "  ⓘ снимков: ${snaps}; последний за: ${last:-нет}; поздних (late): $(psql_q "SELECT count(*) FROM demo_balance_daily WHERE late;")"
   if [ "${dups}" = "0" ]; then ok "по одному снимку на сутки"; else bad "есть сутки с несколькими снимками"; fi
+fi
+
+# --- 10. Лист владельца «торговля демо апи окх» (этап 9.5.2) ----------------------
+echo "10. Запись в лист владельца (DEMO_OWNER_SHEET_ENABLED)"
+owner_enabled="$(env_val DEMO_OWNER_SHEET_ENABLED)"
+owner_last="$(docker compose exec -T redis redis-cli GET export:demo_owner_sheet:last_ok 2>/dev/null | tr -d '\r' || true)"
+echo "  ⓘ DEMO_OWNER_SHEET_ENABLED: ${owner_enabled:-не задан (по умолчанию false)}; последний успешный прогон (UTC): ${owner_last:-нет отметки}"
+if [ "${owner_enabled}" != "true" ]; then
+  echo "  ⓘ запись в лист выключена — пункт не проверяется"
+elif [ -z "${owner_last}" ]; then
+  bad "запись включена, но успешного прогона ещё не было (смотрите export.log: demo_owner_sheet_done=1 и алерты)"
+else
+  owner_epoch="$(date -u -d "${owner_last}" +%s 2>/dev/null || true)"
+  if [ -z "${owner_epoch}" ]; then
+    bad "отметка нечитаема: ${owner_last}"
+  else
+    owner_age=$(( $(date -u +%s) - owner_epoch ))
+    # cron --positions-only идёт каждые 15 минут: три пропуска подряд — уже сбой
+    if [ "${owner_age}" -le 2700 ]; then ok "последний успешный прогон ${owner_age} с назад (порог 2700 с = три прогона cron)"
+    else bad "последний успешный прогон ${owner_age} с назад: записи нет дольше трёх циклов cron"; fi
+  fi
+  owner_line="$(tail -n 4000 "${APP_DIR}/logs/export.log" 2>/dev/null | grep 'demo_owner_sheet_done=1' | tail -1 || true)"
+  [ -n "${owner_line}" ] && echo "  ⓘ последняя строка журнала: ${owner_line}"
 fi
 
 echo

@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import html
+import time
 from datetime import UTC, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -49,7 +50,8 @@ import structlog
 
 from src.core.config import mask_secret, settings
 from src.core.logging import setup_logging
-from src.export import demo_sheets, notion, queries, sheets
+from src.core.redis_client import get_redis
+from src.export import demo_owner_sheet, demo_sheets, notion, queries, sheets
 from src.export.transform import (
     CORRELATION_HEADER,
     INDEPENDENT_DISCLAIMER,
@@ -118,7 +120,17 @@ _SHEET_TRADES = "торговля тест апи окх чтение"
 # версии 6 они живут 24–48 часов регулярно, и столбец врал бы на большинстве
 # строк, оставаясь правдоподобным. Отказ выгрузки до обновления приёмника
 # заметен сразу; вранью в столбце времени заметности не хватает.
+#
+# ЭТАП 9.5.2 ПОДНЯЛ ВЕРСИЮ ПРИЁМНИКА ДО 9.5.2 (режим cells_values), НЕ ТРОГАЯ РЕЖИМЫ
+# ЖУРНАЛА: 9.5.2 — надмножество 9.2, table_append и table_update в нём побуквенно те же.
+# Поэтому журнал принимает ОБЕ версии: требовать для него «ровно 9.2» значило бы
+# остановить выгрузку в действующий лист в тот самый момент, когда владелец
+# обновил приёмник ради другого листа. Сравнение по-прежнему точное — членством в
+# кортеже, а не «не меньше».
 _TRADES_RECEIVER_VERSION = "9.2"
+# Версия, с которой приёмник умеет cells_values (Этап 9.5.2).
+_OWNER_RECEIVER_VERSION = "9.5.2"
+_TRADES_COMPATIBLE_VERSIONS = (_TRADES_RECEIVER_VERSION, _OWNER_RECEIVER_VERSION)
 
 
 class ExportError(Exception):
@@ -418,7 +430,7 @@ async def _export_trades(
     # приёмник создаёт лист, если его нет, и подсовывать ему выдуманное имя
     # значило бы завести в книге владельца пустой лишний лист.
     probe = await sheets.post_rows(url, secret, _SHEET_TRADES, "version", [])
-    if not probe.ok or probe.receiver_version != _TRADES_RECEIVER_VERSION:
+    if not probe.ok or probe.receiver_version not in _TRADES_COMPATIBLE_VERSIONS:
         got = probe.receiver_version or (
             "нет ответа" if not probe.ok else "поле version не возвращено"
         )
@@ -629,6 +641,163 @@ async def _export_demo_sheets(
     return len(trades) - 2, len(balance) - 3
 
 
+# --------------------------------------------------------------------------
+# Лист владельца «торговля демо апи окх» (Этап 9.5.2)
+# --------------------------------------------------------------------------
+
+# Redis: отметка последнего успешного прогона (читает deploy/verify_9_5.sh) и ключи
+# антидребезга алертов. Redis здесь — не «база» из §1 ТЗ: в таблицы системы запись не идёт.
+OWNER_SHEET_LAST_OK_KEY = "export:demo_owner_sheet:last_ok"
+OWNER_SHEET_ALERT_PREFIX = "export:demo_owner_sheet:alert:"
+_OWNER_ALERT_TTL_SEC = 3600            # приёмник не той версии, отказ записи — не чаще раза в час
+_OWNER_ROWS_ALERT_TTL_SEC = 24 * 3600  # строки кончаются — не чаще раза в сутки
+_OWNER_ROWS_WARN_MARGIN = 15           # заранее: позиций > LAST_ROW − 15 (§3.8)
+
+
+async def _owner_alert(
+    reason: str, text: str, ttl: int, log: structlog.types.WrappedLogger
+) -> None:
+    """Алерт про лист владельца с антидребезгом: одна причина — не чаще раза в ``ttl`` секунд.
+
+    Ключ Redis ставится атомарно (``SET NX EX``). Недоступный Redis алерт не глушит: лучше
+    лишнее сообщение, чем молчание. Общий алерт выгрузки здесь НЕ используется: он уходит
+    каждые 15 минут (cron), а причина — вроде необновлённого приёмника — сутками одна и та же.
+    """
+    allowed = True
+    try:
+        allowed = bool(
+            await get_redis().set(f"{OWNER_SHEET_ALERT_PREFIX}{reason}", "1", nx=True, ex=ttl)
+        )
+    except Exception as exc:  # noqa: BLE001 — антидребезг не важнее самого алерта
+        log.warning("Лист владельца демо: Redis недоступен для антидребезга", error=str(exc))
+    if allowed:
+        await _alert(text, log)
+
+
+async def _export_demo_owner_sheet(
+    conn: asyncpg.Connection,
+    log: structlog.types.WrappedLogger,
+) -> bool:
+    """Пишет демо-сделки в лист владельца (режим cells_values). ``True`` — записано.
+
+    ЦЕЛЬ НЕЗАВИСИМА: ничего не бросает наружу. Любой отказ — в журнал и в алерт с
+    антидребезгом, остальные выгрузки идут дальше. Выключено (``DEMO_OWNER_SHEET_ENABLED``) —
+    ни запроса к базе, ни обращения к сети.
+
+    ПОРЯДОК: строки строятся из базы (чтение) → вопрос о версии приёмника → запись. Версия
+    не 9.5.2 — не записывается НИЧЕГО: старый приёмник режима cells_values не знает и
+    обработал бы запрос общим путём, то есть создал бы лишний лист и записал в него.
+    """
+    if not settings.DEMO_OWNER_SHEET_ENABLED:
+        log.info("Лист владельца демо: выключен (DEMO_OWNER_SHEET_ENABLED=false)")
+        return False
+    started = time.monotonic()
+    try:
+        if not settings.SHEETS_WEBAPP_URL or not settings.SHEETS_SHARED_SECRET:
+            raise ExportError("не заданы SHEETS_WEBAPP_URL / SHEETS_SHARED_SECRET")
+        last_row = int(settings.DEMO_OWNER_SHEET_LAST_ROW)
+        if last_row < demo_owner_sheet.FIRST_ROW:
+            raise ExportError(
+                f"DEMO_OWNER_SHEET_LAST_ROW={last_row}: данные начинаются со строки "
+                f"{demo_owner_sheet.FIRST_ROW}"
+            )
+        try:
+            payload = await demo_owner_sheet.build_owner_rows(
+                conn, datetime.now(UTC), settings.NOTIFY_TIMEZONE, last_row=last_row
+            )
+        except demo_owner_sheet.OwnerSheetNotReady as exc:
+            log.info("Лист владельца демо: учёт ещё не стартовал — пропуск", reason=str(exc))
+            return False
+        except asyncpg.UndefinedTableError as exc:
+            raise ExportError(
+                f"нет таблиц демо-исполнения ({exc}); примените миграцию 030"
+            ) from exc
+
+        await _warn_owner_rows(payload, log)
+
+        url, secret = settings.SHEETS_WEBAPP_URL, settings.SHEETS_SHARED_SECRET
+        # Имя листа в вопросе о версии — ЖУРНАЛ (он точно существует): приёмник до 9.1.2
+        # создал бы лист с любым несуществующим именем, а точное имя листа владельца
+        # (с пробелом в конце) клиенту неизвестно.
+        probe = await sheets.post_rows(url, secret, _SHEET_TRADES, "version", [])
+        if not probe.ok or probe.receiver_version != _OWNER_RECEIVER_VERSION:
+            got = probe.receiver_version or (
+                "нет ответа" if not probe.ok else "поле version не возвращено"
+            )
+            log.error(
+                "Лист владельца демо: приёмник не той версии — не записано НИЧЕГО",
+                receiver_version=got, required=_OWNER_RECEIVER_VERSION,
+            )
+            await _owner_alert(
+                "receiver_version",
+                f"приёмник Google не обновлён до {_OWNER_RECEIVER_VERSION} (сейчас: {got}): "
+                "лист «" + settings.DEMO_OWNER_SHEET.strip() + "» не заполняется",
+                _OWNER_ALERT_TTL_SEC, log,
+            )
+            return False
+
+        writes, clears = demo_owner_sheet.to_requests(payload)
+        result = await sheets.write_cells_values(
+            url, secret, settings.DEMO_OWNER_SHEET, writes, clears
+        )
+        if not result.ok:
+            log.error("Лист владельца демо: запись не удалась", error=result.error,
+                      code=result.error_code, range=result.error_range)
+            await _owner_alert(
+                f"write:{result.error_code or 'network'}",
+                f"лист «{settings.DEMO_OWNER_SHEET.strip()}» не записан: {result.error}",
+                _OWNER_ALERT_TTL_SEC, log,
+            )
+            return False
+    except ExportError as exc:
+        log.error("Лист владельца демо: ошибка", error=str(exc))
+        await _owner_alert("export_error", f"лист владельца демо: {exc}",
+                           _OWNER_ALERT_TTL_SEC, log)
+        return False
+    except Exception as exc:  # noqa: BLE001 — цель независима: остальные выгрузки идут дальше
+        log.error("Лист владельца демо: непредвиденная ошибка", error=str(exc))
+        await _owner_alert("unexpected", f"лист владельца демо: непредвиденная ошибка: {exc}",
+                           _OWNER_ALERT_TTL_SEC, log)
+        return False
+
+    log.info(
+        "demo_owner_sheet_done=1",
+        rows=len(payload.blocks["T"]), written=result.written, cleared=result.cleared,
+        version=result.receiver_version or probe.receiver_version,
+        seconds=round(time.monotonic() - started, 2),
+    )
+    try:
+        await get_redis().set(OWNER_SHEET_LAST_OK_KEY, datetime.now(UTC).isoformat())
+    except Exception as exc:  # noqa: BLE001 — отметка для verify не важнее записи
+        log.warning("Лист владельца демо: отметка прогона не записана", error=str(exc))
+    return True
+
+
+async def _warn_owner_rows(
+    payload: demo_owner_sheet.OwnerSheetPayload, log: structlog.types.WrappedLogger
+) -> None:
+    """Предупреждение «кончаются строки с формулами» (§3.8): раз в сутки, и заранее."""
+    capacity = payload.last_row - (payload.first_row - 1)
+    if payload.dropped > 0:
+        text = (
+            "в листе кончаются строки с формулами, протяните формулы ниже: позиций "
+            f"{payload.total_positions}, строк с формулами {capacity} (до строки "
+            f"{payload.last_row}); {payload.dropped} последних в лист не записаны"
+        )
+        reason = "rows_overflow"
+    elif payload.total_positions > payload.last_row - _OWNER_ROWS_WARN_MARGIN:
+        text = (
+            "в листе кончаются строки с формулами, протяните формулы ниже: позиций "
+            f"{payload.total_positions} из {capacity} (до строки {payload.last_row})"
+        )
+        reason = "rows_soon"
+    else:
+        return
+    log.warning("Лист владельца демо: строки с формулами кончаются",
+                positions=payload.total_positions, capacity=capacity, dropped=payload.dropped)
+    await _owner_alert(reason, text, _OWNER_ROWS_ALERT_TTL_SEC, log)
+
+
 async def _export_notion(
     conn: asyncpg.Connection,
     log: structlog.types.WrappedLogger,
@@ -762,6 +931,11 @@ async def _run(positions_only: bool = False) -> int:
             except ExportError as exc:
                 errors.append(str(exc))
                 log.error("Ошибка выгрузки демо-листов", error=str(exc))
+
+        # ЛИСТ ВЛАДЕЛЬЦА «торговля демо апи окх» (этап 9.5.2): тоже в обоих режимах, и тоже
+        # независимая цель. Свои отказы разбирает сама (журнал + алерт с антидребезгом),
+        # поэтому в ``errors`` ничего не добавляет: общий алерт шёл бы каждые 15 минут.
+        await _export_demo_owner_sheet(conn, log)
 
         if not positions_only:
             try:
