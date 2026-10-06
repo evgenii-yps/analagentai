@@ -84,7 +84,7 @@ def create_demo_exchange(
         "userAgent": EXCHANGE_USER_AGENT,
         "headers": exchange_headers(),
         "hostname": host,
-        "options": {"defaultType": "spot"},
+        "options": {"defaultType": "spot", "fetchMarkets": {"types": ["spot"]}},
     }
     ca_file = os.environ.get("SSL_CERT_FILE")
     if ca_file:

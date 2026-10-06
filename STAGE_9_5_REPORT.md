@@ -456,3 +456,40 @@ docker compose up -d --force-recreate positions notify bot
   подставленным `_psql` (docker на хосте недоступен).
 - Раздел «Демо-счёт» в отчёте здоровья проверен на соответствие `ledger` формулами на одной базе, но не на
   живых данных сервера.
+
+# 13. Этап 9.5.1 — демо-клиент грузит только спот-рынки
+
+**9.5.1**
+
+## 13.1 Причина
+
+ccxt 4.4.100 в `load_markets()` по умолчанию грузит рынки всех типов
+(`options.fetchMarkets.types = ['spot','future','swap','option']`). На демо-рынке OKX (замер на сервере
+06.10.2026, живой демо-ключ, `www.okx.com`) среди FUTURES есть запись с пустым `instId`
+(spot 570 / битых 0; future 127 / 1; swap 192 / 0; option 1462 / 0). Пустой id попадает в `markets_by_id`, и
+`set_markets()` падает в `keysort`: `TypeError: '<' not supported between 'NoneType' and 'str'`. Любой приватный
+вызов, который сначала грузит рынки (`fetch_balance` и др.), падал; предпроверка показывала «www.okx.com: TypeError».
+Ключ при этом рабочий: сырой `private_get_account_balance` отвечал `code 0`.
+
+## 13.2 Правка
+
+`src/demo/exchange.py`, `create_demo_exchange()`: в `config["options"]` добавлено
+`"fetchMarkets": {"types": ["spot"]}` рядом с `"defaultType": "spot"`. Больше ничего в логике не менялось.
+Коллектор (`src/core/exchange.py`, настоящий рынок) не тронут. На сервере с этой опцией `load_markets` проходил
+(569 рынков, BTC/USDT есть), `fetch_balance` работал.
+
+## 13.3 Тесты (`tests/test_demo_exchange.py`)
+
+1. `test_demo_client_loads_only_spot_markets_option` — `options['fetchMarkets'] == {'types': ['spot']}`.
+2. `test_demo_load_markets_survives_empty_instid_and_asks_spot_only` — заглушка HTTP отдаёт для FUTURES запись с
+   `instId ''`; `load_markets()` проходит, а перехваченные URL содержат только `instType=SPOT`
+   (FUTURES/SWAP/OPTION не запрашиваются).
+3. Мутация: строка убрана — тесты 1 и 2 падают (воспроизводится исходный `TypeError` из `keysort`); строка
+   возвращена. Дополнительно `test_without_the_option_the_empty_instid_breaks_load_markets` фиксирует, что без
+   опции заглушка действительно ломает ccxt (тест 2 проверяет не пустоту).
+
+Не проверено: живой запрос к бирже из этой среды не делался — только заглушка HTTP.
+
+## 13.4 PR
+
+PR_NUMBER_PLACEHOLDER
