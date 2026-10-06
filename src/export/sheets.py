@@ -66,6 +66,14 @@ class SheetsResult:
     # МНОГО, и добавить к ним ещё одну значит усугубить: разбирать лист всё
     # равно придётся руками, но разбирать станет на строку больше.
     ambiguous: list[dict[str, Any]] = field(default_factory=list)
+    # --- Этап 9.5.2, режим cells_values ---
+    # Сколько ячеек записано и очищено (из ответа приёмника).
+    written: int = 0
+    cleared: int = 0
+    # Машинный код отказа приёмника (``sheet_not_found``, ``sheet_ambiguous``,
+    # ``formula_in_target``) и диапазон, на котором он сработал, если приёмник его назвал.
+    error_code: str | None = None
+    error_range: str | None = None
 
 
 def normalize_batch(
@@ -273,4 +281,78 @@ async def post_rows(
         last_error = f"ok=false: {body.get('error', 'без описания')}"
         _log.warning("Sheets: ответ ok=false", attempt=attempt + 1, error=last_error)
 
+    return SheetsResult(ok=False, error=last_error)
+
+
+async def write_cells_values(
+    url: str,
+    secret: str,
+    sheet: str,
+    writes: list[dict[str, Any]],
+    clears: list[dict[str, Any]] | None = None,
+) -> SheetsResult:
+    """Режим ``cells_values`` (Этап 9.5.2): значения в ЯЧЕЙКИ чужого листа, ничего больше.
+
+    ``writes`` — ``[{"range": "A6:D40", "values": [[...], ...]}, ...]`` (``setValues``);
+    ``clears`` — ``[{"range": "A41:D1000"}, ...]`` (``clearContent``: значения уходят,
+    оформление и формулы остаются). Лист ищется приёмником по имени без краевых пробелов и
+    НЕ создаётся никогда; формула в любом из диапазонов — отказ без единой записи.
+
+    Исключений не бросает. Сетевые ошибки и неуспешные HTTP-коды повторяются (5/15/45 с,
+    как в :func:`post_rows`), а вот ``ok=false`` приёмника — НЕТ: «лист не найден» и
+    «формула в диапазоне» от повтора не пройдут, а запись идемпотентна и следующий прогон
+    cron всё равно придёт.
+
+    Версию приёмника этот вызов не проверяет — её обязан спросить вызывающий ДО первой
+    записи (``post_rows(..., "version", [])``): старый приёмник режима не знает и записал бы
+    запрос общим путём, то есть не туда.
+    """
+    payload: dict[str, Any] = {
+        "secret": secret,
+        "sheet": sheet,
+        "mode": "cells_values",
+        "writes": writes,
+        "clears": clears or [],
+    }
+    last_error = "неизвестная ошибка"
+    for attempt, delay in enumerate((0.0, *_RETRY_DELAYS)):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            async with httpx.AsyncClient(
+                timeout=_TIMEOUT, verify=_verify(), follow_redirects=True
+            ) as client:
+                response = await client.post(url, json=payload)
+        except Exception as exc:  # noqa: BLE001 — сеть не должна ронять скрипт
+            last_error = f"сетевая ошибка: {exc}"
+            _log.warning("Sheets: попытка не удалась", attempt=attempt + 1, error=last_error)
+            continue
+        if response.status_code != 200:
+            last_error = f"HTTP {response.status_code}"
+            _log.warning("Sheets: неуспешный код", attempt=attempt + 1, status=response.status_code)
+            continue
+        try:
+            body = response.json()
+        except Exception as exc:  # noqa: BLE001
+            last_error = f"нераспознанный ответ: {exc}"
+            _log.warning("Sheets: ответ не JSON", attempt=attempt + 1)
+            continue
+        version = body.get("version")
+        if body.get("ok") is True:
+            return SheetsResult(
+                ok=True,
+                receiver_version=None if version is None else str(version),
+                written=int(body.get("written", 0)),
+                cleared=int(body.get("cleared", 0)),
+            )
+        code = body.get("error")
+        rng = body.get("range")
+        detail = f"ok=false: {code or 'без описания'}" + (f" ({rng})" if rng else "")
+        _log.warning("Sheets: ответ ok=false", sheet=sheet, mode="cells_values", error=detail)
+        return SheetsResult(
+            ok=False, error=detail,
+            receiver_version=None if version is None else str(version),
+            error_code=None if code is None else str(code),
+            error_range=None if rng is None else str(rng),
+        )
     return SheetsResult(ok=False, error=last_error)

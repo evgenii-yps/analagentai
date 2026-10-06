@@ -877,8 +877,10 @@ def test_the_receiver_declares_the_new_version_everywhere_it_is_named() -> None:
     """
     receiver = (_ROOT / "deploy" / "apps_script.gs").read_text(encoding="utf-8")
     client = (_ROOT / "src" / "export_main.py").read_text(encoding="utf-8")
-    assert "const RECEIVER_VERSION = '9.2';" in receiver
+    assert "const RECEIVER_VERSION = '9.5.2';" in receiver
     assert '_TRADES_RECEIVER_VERSION = "9.2"' in client
+    # Этап 9.5.2: приёмник 9.5.2 — надмножество 9.2; журнал принимает обе версии.
+    assert "_TRADES_COMPATIBLE_VERSIONS = (" in client
     # Инструкция обновления называет ту же версию — по ней владелец проверяет,
     # что переразвернул скрипт.
-    assert "receiver_version=9.2" in receiver
+    assert "receiver_version=9.5.2" in receiver

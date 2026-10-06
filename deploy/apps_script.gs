@@ -14,7 +14,7 @@
  *      трогать не нужно.
  *
  * ПРОВЕРКА ПОСЛЕ ОБНОВЛЕНИЯ: в журнале выгрузки обязана появиться строка с
- * receiver_version=9.2. Старая версия ответит на table_append ошибкой — и
+ * receiver_version=9.5.2. Старая версия ответит на table_append ошибкой — и
  * это правильно: видимый отказ лучше тихой записи не туда.
  *
  * Защита — секрет ниже (проверяется на каждом запросе). URL и секрет не публиковать.
@@ -85,13 +85,35 @@
  * строки выше. Если протянуть неоткуда — формулы не выдумываются: ответ
  * остаётся ok:true, но несёт warning. Сочинённая формула — это чужая модель
  * денег, написанная за владельца.
+ *
+ * ЭТАП 9.5.2. Добавлен режим cells_values — запись ЗНАЧЕНИЙ в перечисленные
+ * ячейки чужого листа («торговля демо апи окх»), где формулы и оформление
+ * принадлежат владельцу. Запрос:
+ *
+ *   {mode:"cells_values", sheet:"<имя>",
+ *    writes:[{range:"A6:D40", values:[[..],..]}, ..],
+ *    clears:[{range:"A41:D1000"}, ..]}
+ *
+ *   1. Лист ищется по имени БЕЗ пробелов по краям (trim с обеих сторон,
+ *      сравнение точное после trim) — у листа владельца пробел в конце имени.
+ *      Ноль совпадений — sheet_not_found, больше одного — sheet_ambiguous.
+ *      Лист НЕ создаётся никогда.
+ *   2. ДО ЛЮБОЙ ЗАПИСИ все диапазоны (writes и clears) проверяются: форма
+ *      адреса, размер значений, выход за пределы листа, значения-«формулы» и
+ *      getFormulas(). Хоть одна формула в целевом диапазоне — formula_in_target,
+ *      и НЕ ЗАПИСАНО НИЧЕГО.
+ *   3. writes — setValues, clears — clearContent (НЕ clear и НЕ clearFormat:
+ *      оформление, проверки данных, условное форматирование не трогаются).
+ *   4. Ответ {ok:true, written:<ячеек>, cleared:<ячеек>}.
+ *
+ * Остальные режимы не менялись ни строкой. Версия 9.5.2 — надмножество 9.2.
  */
 
 const SECRET = 'ВСТАВЬ_СЮДА_СЕКРЕТ';
 
 // Версия приёмника. Возвращается в ответе и попадает в журнал выгрузки —
 // по ней видно, что развёрнутая версия действительно обновилась.
-const RECEIVER_VERSION = '9.2';
+const RECEIVER_VERSION = '9.5.2';
 
 // Сколько строк листа просматривать в поисках строки итогов и свободного места
 // (Этап 9.1.2). Торговый журнал на тысячу сделок не рассчитан по другим
@@ -116,6 +138,10 @@ function doPost(e) {
     if (body.mode === 'version') {
       return json({ ok: true, version: RECEIVER_VERSION });
     }
+
+    // ЗАПИСЬ ЗНАЧЕНИЙ В ЯЧЕЙКИ ЧУЖОГО ЛИСТА (Этап 9.5.2) — тоже до общего пути:
+    // общий путь ЛИСТ СОЗДАЁТ, а этот не создаёт никогда.
+    if (body.mode === 'cells_values') return cellsValues(body);
 
     // РЕЖИМЫ ТОРГОВОГО ЖУРНАЛА ОБРАБАТЫВАЮТСЯ ДО ОБЩЕГО ПУТИ. Они пишут в
     // ЧУЖОЙ живой лист и потому ведут себя осторожнее: лист не создают,
@@ -645,4 +671,127 @@ function fixElapsedFormats(sheet, startRow, count, fromColumn, noteColumn) {
     }
   }
   return fixed;
+}
+
+// ===========================================================================
+// ЭТАП 9.5.2. cells_values: значения в ячейки листа владельца
+// ===========================================================================
+
+// Адрес диапазона: «A3» или «A6:D40». Ничего другого: ни целых столбцов, ни ссылок
+// на другой лист («Лист2!A1»), ни именованных диапазонов — запись разрешена ровно
+// туда, куда её адресовал клиент, и ни клеткой дальше.
+const CELLS_RANGE_RE = /^[A-Z]{1,3}[1-9][0-9]*(:[A-Z]{1,3}[1-9][0-9]*)?$/;
+
+/**
+ * Лист по имени БЕЗ краевых пробелов: ``{sheet}`` либо ``{error}``.
+ *
+ * Пробел в конце имени листа владельца («торговля демо апи окх ») — штатный случай,
+ * а не опечатка, поэтому сравнивается trim(имя листа) с trim(запрошенного),
+ * строго. Совпадений должно быть РОВНО одно: два листа с одинаковым trim-именем —
+ * отказ (sheet_ambiguous), потому что выбрать «первый» значило бы писать наугад.
+ * Лист НЕ создаётся: опечатка в имени обязана выглядеть как отказ, а не как
+ * пустой одноимённый лист, в котором «всё работает».
+ */
+function findSheetByTrimmedName(ss, requested) {
+  var wanted = String(requested === null || requested === undefined ? '' : requested).trim();
+  var found = [];
+  if (wanted.length > 0) {
+    var all = ss.getSheets();
+    for (var i = 0; i < all.length; i += 1) {
+      if (String(all[i].getName()).trim() === wanted) found.push(all[i]);
+    }
+  }
+  if (found.length === 0) return { error: 'sheet_not_found' };
+  if (found.length > 1) return { error: 'sheet_ambiguous' };
+  return { sheet: found[0] };
+}
+
+/**
+ * Проверка ОДНОГО диапазона до любой записи. Возвращает код отказа либо ''.
+ *
+ * ``isWrite`` — для writes (дополнительно проверяются размер и содержимое значений),
+ * для clears — только адрес, границы листа и формулы.
+ */
+function checkCellsRange(sheet, item, isWrite) {
+  var a1 = item && item.range;
+  if (typeof a1 !== 'string' || !CELLS_RANGE_RE.test(a1)) return 'bad_range';
+  var range = sheet.getRange(a1);
+  if (range.getLastRow() > sheet.getMaxRows()
+      || range.getLastColumn() > sheet.getMaxColumns()) {
+    return 'range_out_of_sheet';
+  }
+  if (isWrite) {
+    var values = item.values;
+    if (!Array.isArray(values) || values.length !== range.getNumRows()) {
+      return 'values_shape';
+    }
+    for (var r = 0; r < values.length; r += 1) {
+      if (!Array.isArray(values[r]) || values[r].length !== range.getNumColumns()) {
+        return 'values_shape';
+      }
+      for (var c = 0; c < values[r].length; c += 1) {
+        var cell = values[r][c];
+        // Строка, начинающаяся с «=», превратилась бы в ФОРМУЛУ чужого листа.
+        if (typeof cell === 'string' && cell.charAt(0) === '=') return 'formula_in_values';
+      }
+    }
+  }
+  var formulas = range.getFormulas();
+  for (var i = 0; i < formulas.length; i += 1) {
+    for (var j = 0; j < formulas[i].length; j += 1) {
+      if (String(formulas[i][j] === null ? '' : formulas[i][j]).length > 0) {
+        return 'formula_in_target';
+      }
+    }
+  }
+  return '';
+}
+
+function cellsValues(body) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const lookup = findSheetByTrimmedName(ss, body.sheet);
+  if (lookup.error) {
+    return json({ ok: false, error: lookup.error, version: RECEIVER_VERSION });
+  }
+  const sheet = lookup.sheet;
+  const writes = body.writes || [];
+  const clears = body.clears || [];
+  if (!Array.isArray(writes) || !Array.isArray(clears)) {
+    return json({ ok: false, error: 'bad_request', version: RECEIVER_VERSION });
+  }
+
+  // ПРОВЕРКА ВСЕХ ДИАПАЗОНОВ — ДО ПЕРВОЙ ЗАПИСИ (§2 ТЗ 9.5.2). Отказ по любому из
+  // них оставляет лист нетронутым целиком: наполовину записанный лист владельца
+  // выглядел бы правдоподобно и считался бы неверно.
+  for (var w = 0; w < writes.length; w += 1) {
+    var badWrite = checkCellsRange(sheet, writes[w], true);
+    if (badWrite) {
+      return json({ ok: false, error: badWrite, range: writes[w] && writes[w].range,
+                    version: RECEIVER_VERSION });
+    }
+  }
+  for (var k = 0; k < clears.length; k += 1) {
+    var badClear = checkCellsRange(sheet, clears[k], false);
+    if (badClear) {
+      return json({ ok: false, error: badClear, range: clears[k] && clears[k].range,
+                    version: RECEIVER_VERSION });
+    }
+  }
+
+  var written = 0;
+  var cleared = 0;
+  for (var i = 0; i < writes.length; i += 1) {
+    var target = sheet.getRange(writes[i].range);
+    target.setValues(writes[i].values.map(function (row) {
+      return row.map(function (cell) { return cell === null ? '' : cell; });
+    }));
+    written += target.getNumRows() * target.getNumColumns();
+  }
+  for (var n = 0; n < clears.length; n += 1) {
+    var area = sheet.getRange(clears[n].range);
+    // clearContent, а НЕ clear: значения уходят, оформление и проверки остаются.
+    area.clearContent();
+    cleared += area.getNumRows() * area.getNumColumns();
+  }
+  return json({ ok: true, written: written, cleared: cleared, version: RECEIVER_VERSION });
 }

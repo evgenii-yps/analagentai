@@ -41,6 +41,12 @@ function makeSheet(name) {
     // а именно на нём владелец и поймал ошибку.
     numberFormats: new Map(),
     maxColumns: 26,          // столько колонок у нового листа Google Таблицы
+    maxRows: 1000,           // столько строк у листа владельца (Этап 9.5.2)
+    // ПРОВЕРКИ ДАННЫХ живут отдельно от значений, как в Google (Этап 9.5.2): запись
+    // из скрипта их не применяет и не снимает. Ключ — «строка:столбец», значение —
+    // список допустимых текстов. Двойник хранит их, чтобы стенд мог убедиться, что
+    // приёмник после записи и очистки не тронул ни одной.
+    validations: new Map(),
     frozen: 0,
     clear() {
       this.grid = []; this.formulas.clear(); this.numberFormats.clear();
@@ -56,6 +62,8 @@ function makeSheet(name) {
       return width;
     },
     getMaxColumns() { return this.maxColumns; },
+    getMaxRows() { return this.maxRows; },
+    getName() { return this.name; },
     insertColumnsAfter(after, howMany) { this.maxColumns += howMany; },
     setFrozenRows(n) { this.frozen = n; },
     key(row, col) { return `${row}:${col}`; },
@@ -107,6 +115,7 @@ function makeSheet(name) {
         }
       }
       this.numberFormats = movedFormats;
+      this.maxRows += howMany;
     },
     appendRow(values) {
       if (values.length > this.maxColumns) this.maxColumns = values.length;
@@ -114,11 +123,41 @@ function makeSheet(name) {
     },
     getRange(row, col, numRows, numCols) {
       const self = this;
+      // A1-нотация (Этап 9.5.2): «A3» или «A6:D40». Столбцы AA.. не нужны ни одному
+      // сценарию, но разбор честный — по буквам, а не по первой.
+      if (typeof row === 'string') {
+        const m = /^([A-Z]+)(\d+)(?::([A-Z]+)(\d+))?$/.exec(row);
+        if (!m) throw new Error(`Der Bereich wurde nicht gefunden: ${row}`);
+        const letters = (t) => [...t].reduce((n, ch) => n * 26 + ch.charCodeAt(0) - 64, 0);
+        const c1 = letters(m[1]); const r1 = Number(m[2]);
+        const c2 = m[3] ? letters(m[3]) : c1; const r2 = m[4] ? Number(m[4]) : r1;
+        return self.getRange(r1, c1, r2 - r1 + 1, c2 - c1 + 1);
+      }
       if (col + numCols - 1 > self.maxColumns) {
         throw new Error('Those columns are out of bounds.');
       }
       return {
         box: { row, col, numRows, numCols },
+        getNumRows() { return numRows; },
+        getNumColumns() { return numCols; },
+        getLastRow() { return row + numRows - 1; },
+        getLastColumn() { return col + numCols - 1; },
+        // clearContent снимает ЗНАЧЕНИЯ и формулы, но не формат и не проверки данных.
+        clearContent() {
+          for (let r = 0; r < numRows; r += 1) {
+            for (let c = 0; c < numCols; c += 1) {
+              if (self.grid[row + r - 1] && self.grid[row + r - 1][col + c - 1] !== undefined) {
+                self.grid[row + r - 1][col + c - 1] = '';
+              }
+              self.formulas.delete(self.key(row + r, col + c));
+            }
+          }
+        },
+        // Любой другой способ очистки двойник не поддерживает: приёмник 9.5.2 обязан
+        // звать именно clearContent, и вызов clear/clearFormat тут — провал сценария.
+        clear() { throw new Error('приёмник вызвал clear() вместо clearContent()'); },
+        clearFormat() { throw new Error('приёмник вызвал clearFormat()'); },
+        setDataValidation() { throw new Error('приёмник тронул проверку данных'); },
         getValue() { return self.getCell(row, col); },
         setValue(value) { self.setCell(row, col, value); },
         getNumberFormat() { return self.getFormatAt(row, col); },
@@ -220,6 +259,7 @@ function makeContext() {
   const spreadsheet = {
     getSheetByName: (n) => sheets.get(n) || null,
     insertSheet: (n) => { const s = makeSheet(n); sheets.set(n, s); return s; },
+    getSheets: () => [...sheets.values()],
   };
   const sandbox = {
     sheets,
@@ -941,6 +981,251 @@ check('9.2 §6.1: дозапись закрытия чинит формат УЖ
          `формат строки закрытия ${sheet.getFormatAt(3, 12)}, ожидался [h]:mm:ss`);
 });
 
+
+// ===========================================================================
+// ЭТАП 9.5.2. cells_values: запись значений в ячейки листа владельца
+// ===========================================================================
+
+// Имя листа владельца — С ПРОБЕЛОМ В КОНЦЕ, как в боевой книге.
+const OWNER_NAME = 'торговля демо апи окх ';
+const OWNER_ASKED = 'торговля демо апи окх';
+// Колонки с формулами владельца: E, L, N, O, P, Q, R, S, U, V.
+const OWNER_FORMULA_COLS = [5, 12, 14, 15, 16, 17, 18, 19, 21, 22];
+
+/** Двойник листа владельца: шапка (строки 1–5), формулы до строки 1000, форматы, проверка D. */
+function makeOwnerSheet(ctx, name = OWNER_NAME) {
+  const sheet = ctx.SpreadsheetApp.getActiveSpreadsheet().insertSheet(name);
+  sheet.maxColumns = 26;
+  sheet.setCell(1, 1, 'ДЕМО-счёт OKX');
+  sheet.setCell(2, 1, 'стартовый капитал');
+  sheet.setCell(4, 1, 'дата'); sheet.setCell(4, 14, 'прибыль $');
+  for (let r = 6; r <= 1000; r += 1) {
+    for (const c of OWNER_FORMULA_COLS) sheet.setFormulaAt(r, c, `=K${r}-G${r}`);
+    sheet.setFormatAt(r, 1, 'dd.MM.yyyy');
+    sheet.setFormatAt(r, 2, '[h]:mm:ss');
+    sheet.setFormatAt(r, 7, '0.00');
+    sheet.validations.set(`${r}:4`, ['покупать', 'пропущено']);
+  }
+  sheet.setFormatAt(3, 1, '#,##0.00');
+  return sheet;
+}
+
+const ownerBlocks = (n, from = 6) => ({
+  writes: [
+    { range: 'A3', values: [[1000]] },
+    { range: `A${from}:D${from + n - 1}`,
+      values: Array.from({ length: n }, (_, i) => [46300 + i, 0.5, 'BTC', 'покупать']) },
+    { range: `F${from}:K${from + n - 1}`,
+      values: Array.from({ length: n }, () => [60000, 2, '', '', '', '']) },
+    { range: `M${from}:M${from + n - 1}`, values: Array.from({ length: n }, () => [0.001]) },
+    { range: `T${from}:T${from + n - 1}`,
+      values: Array.from({ length: n }, (_, i) => [`[поз. ${i + 1}] заметка`]) },
+  ],
+  clears: [
+    { range: `A${from + n}:D1000` }, { range: `F${from + n}:K1000` },
+    { range: `M${from + n}:M1000` }, { range: `T${from + n}:T1000` },
+  ],
+});
+
+const postCells = (ctx, body) => post(ctx, {
+  secret: ctx.SECRET, sheet: OWNER_ASKED, mode: 'cells_values', ...body,
+});
+
+const snapshot = (sheet) => JSON.stringify([
+  sheet.grid, [...sheet.formulas], [...sheet.numberFormats], [...sheet.validations],
+]);
+
+console.log('\nЭтап 9.5.2: режим cells_values');
+
+check('9.5.2: версия приёмника — 9.5.2', () => {
+  const ctx = makeContext();
+  const res = post(ctx, { secret: ctx.SECRET, sheet: OWNER_ASKED, mode: 'version' });
+  assert(res.ok === true && res.version === '9.5.2', `version=${res.version}`);
+});
+
+check('9.5.2: лист с пробелом в конце имени находится по имени без пробела', () => {
+  const ctx = makeContext();
+  const sheet = makeOwnerSheet(ctx);
+  const res = postCells(ctx, ownerBlocks(2));
+  assert(res.ok === true, `ok=false: ${res.error}`);
+  assert(sheet.getCell(3, 1) === 1000, 'A3 не записана');
+  assert(sheet.getCell(6, 3) === 'BTC' && sheet.getCell(7, 3) === 'BTC', 'токены не записаны');
+  // Пробелы с ОБЕИХ сторон запрошенного имени тоже не мешают.
+  const res2 = post(ctx, {
+    secret: ctx.SECRET, sheet: '  торговля демо апи окх  ', mode: 'cells_values',
+    writes: [{ range: 'A3', values: [[1234]] }], clears: [],
+  });
+  assert(res2.ok === true && sheet.getCell(3, 1) === 1234, 'trim с обеих сторон не работает');
+});
+
+check('9.5.2: ответ — written и cleared считают ячейки', () => {
+  const ctx = makeContext();
+  makeOwnerSheet(ctx);
+  const res = postCells(ctx, ownerBlocks(2));
+  // A3 (1) + A:D 2×4 + F:K 2×6 + M 2 + T 2 = 25
+  assert(res.written === 25, `written=${res.written}, ожидалось 25`);
+  // Очистка со строки 8 по 1000: 993 строки × (4 + 6 + 1 + 1) колонок
+  assert(res.cleared === 993 * 12, `cleared=${res.cleared}, ожидалось ${993 * 12}`);
+});
+
+check('9.5.2: лист не найден — sheet_not_found, лист НЕ создан, ничего не записано', () => {
+  const ctx = makeContext();
+  const other = ctx.SpreadsheetApp.getActiveSpreadsheet().insertSheet('другой лист');
+  const before = snapshot(other);
+  const count = ctx.sheets.size;
+  const res = postCells(ctx, ownerBlocks(1));
+  assert(res.ok === false && res.error === 'sheet_not_found', `ответ ${JSON.stringify(res)}`);
+  assert(ctx.sheets.size === count, 'лист был создан');
+  assert(snapshot(other) === before, 'чужой лист изменён');
+});
+
+check('9.5.2: два листа с одинаковым trim-именем — sheet_ambiguous, ничего не записано', () => {
+  const ctx = makeContext();
+  const first = makeOwnerSheet(ctx, 'торговля демо апи окх');
+  const second = makeOwnerSheet(ctx, ' торговля демо апи окх ');
+  const before = snapshot(first) + snapshot(second);
+  const res = postCells(ctx, ownerBlocks(1));
+  assert(res.ok === false && res.error === 'sheet_ambiguous', `ответ ${JSON.stringify(res)}`);
+  assert(snapshot(first) + snapshot(second) === before, 'какой-то из листов изменён');
+});
+
+check('9.5.2: формулы, форматы и проверка данных владельца на месте после записи и очистки', () => {
+  const ctx = makeContext();
+  const sheet = makeOwnerSheet(ctx);
+  // Хвост от прежнего прогона: строки 8–10 заполнены, должны очиститься.
+  for (let r = 8; r <= 10; r += 1) {
+    sheet.setCell(r, 1, 46300); sheet.setCell(r, 3, 'ETH'); sheet.setCell(r, 20, 'старая');
+  }
+  const formulasBefore = JSON.stringify([...sheet.formulas]);
+  const formatsBefore = JSON.stringify([...sheet.numberFormats]);
+  const validationsBefore = JSON.stringify([...sheet.validations]);
+  const res = postCells(ctx, ownerBlocks(2));
+  assert(res.ok === true, `ok=false: ${res.error}`);
+  assert(JSON.stringify([...sheet.formulas]) === formulasBefore, 'формулы владельца изменены');
+  assert(JSON.stringify([...sheet.numberFormats]) === formatsBefore,
+         'форматы изменены: очистка сняла оформление');
+  assert(JSON.stringify([...sheet.validations]) === validationsBefore,
+         'проверка данных изменена');
+  for (let r = 8; r <= 10; r += 1) {
+    assert(sheet.getCell(r, 1) === '' && sheet.getCell(r, 3) === '' && sheet.getCell(r, 20) === '',
+           `строка ${r} не очищена`);
+  }
+  // Колонки-формулы не записаны: ни одного значения в E, L, N–S, U, V.
+  for (const c of OWNER_FORMULA_COLS) {
+    for (let r = 6; r <= 12; r += 1) {
+      assert(sheet.getCell(r, c) === '', `в колонку ${c} строки ${r} что-то записано`);
+    }
+  }
+  // Строки 1, 2, 4 шапки не тронуты.
+  assert(sheet.getCell(1, 1) === 'ДЕМО-счёт OKX' && sheet.getCell(2, 1) === 'стартовый капитал'
+         && sheet.getCell(4, 1) === 'дата', 'шапка листа изменена');
+});
+
+check('9.5.2: «ошибка» и «потеряна» записываются в колонку D с проверкой данных «покупать, пропущено»', () => {
+  // ГРАНИЦА ЭТОГО СЦЕНАРИЯ. Двойник повторяет документированное поведение Google:
+  // setValues из скрипта проверку данных НЕ применяет (она работает на ввод руками),
+  // и приёмник нигде не зовёт API проверки данных (setDataValidation в двойнике
+  // бросает ошибку). Поведение самого Google на живой книге подтверждает только
+  // первая запись на сервере — это пункт инструкции владельцу.
+  const ctx = makeContext();
+  const sheet = makeOwnerSheet(ctx);
+  const res = postCells(ctx, {
+    writes: [{ range: 'D6:D8', values: [['ошибка'], ['потеряна'], ['пропущено']] }],
+    clears: [],
+  });
+  assert(res.ok === true, `ok=false: ${res.error}`);
+  assert(sheet.getCell(6, 4) === 'ошибка' && sheet.getCell(7, 4) === 'потеряна', 'D не записана');
+  assert(sheet.validations.get('6:4').join() === 'покупать,пропущено', 'проверка данных тронута');
+});
+
+check('9.5.2: формула в целевом диапазоне — formula_in_target и НИ ОДНОЙ записанной ячейки', () => {
+  const ctx = makeContext();
+  const sheet = makeOwnerSheet(ctx);
+  // Формула попадает в ТРЕТИЙ по счёту диапазон (M): записи A3, A:D, F:K, M — всё до неё
+  // уже могло бы быть записано, а приёмник обязан отказать, не тронув ничего.
+  sheet.setFormulaAt(7, 13, '=K7-G7');
+  const before = snapshot(sheet);
+  const res = postCells(ctx, ownerBlocks(3));
+  assert(res.ok === false && res.error === 'formula_in_target', `ответ ${JSON.stringify(res)}`);
+  assert(res.range === 'M6:M8', `range=${res.range}`);
+  assert(snapshot(sheet) === before, 'часть ячеек записана несмотря на отказ');
+});
+
+check('9.5.2: формула в диапазоне ОЧИСТКИ — тоже отказ без единой записи', () => {
+  const ctx = makeContext();
+  const sheet = makeOwnerSheet(ctx);
+  sheet.setFormulaAt(500, 20, '=A500');            // T500 — внутри clears T8:T1000
+  const before = snapshot(sheet);
+  const res = postCells(ctx, ownerBlocks(2));
+  assert(res.ok === false && res.error === 'formula_in_target', `ответ ${JSON.stringify(res)}`);
+  assert(snapshot(sheet) === before, 'часть ячеек записана несмотря на отказ');
+});
+
+check('9.5.2: чужой адрес, неверный размер, «=…» в значении, выход за лист — отказ без записи', () => {
+  const cases = [
+    ['bad_range', { writes: [{ range: 'Лист2!A1', values: [[1]] }] }],
+    ['bad_range', { writes: [{ range: 'A:A', values: [[1]] }] }],
+    ['bad_range', { clears: [{ range: 'A6:D' }] }],
+    ['values_shape', { writes: [{ range: 'A6:D7', values: [[1, 2, 3, 4]] }] }],
+    ['values_shape', { writes: [{ range: 'A6:D6', values: [[1, 2, 3]] }] }],
+    ['formula_in_values', { writes: [{ range: 'T6', values: [['=IMPORTXML("x")']] }] }],
+    ['range_out_of_sheet', { clears: [{ range: 'A6:D1001' }] }],
+  ];
+  for (const [code, extra] of cases) {
+    const ctx = makeContext();
+    const sheet = makeOwnerSheet(ctx);
+    const before = snapshot(sheet);
+    const res = postCells(ctx, { writes: [{ range: 'A3', values: [[1]] }], ...extra });
+    assert(res.ok === false && res.error === code,
+           `ожидался ${code}, ответ ${JSON.stringify(res)}`);
+    assert(snapshot(sheet) === before, `${code}: лист изменён`);
+  }
+});
+
+check('9.5.2: повторный запрос с теми же данными ничего не меняет (идемпотентность)', () => {
+  const ctx = makeContext();
+  const sheet = makeOwnerSheet(ctx);
+  postCells(ctx, ownerBlocks(3));
+  const first = snapshot(sheet);
+  const res = postCells(ctx, ownerBlocks(3));
+  assert(res.ok === true, `ok=false: ${res.error}`);
+  assert(snapshot(sheet) === first, 'второй прогон изменил лист');
+});
+
+check('9.5.2: строк стало меньше — хвост очищается, строки выше остаются', () => {
+  const ctx = makeContext();
+  const sheet = makeOwnerSheet(ctx);
+  postCells(ctx, ownerBlocks(10));
+  assert(sheet.getCell(15, 3) === 'BTC', 'исходное состояние: 10 строк не записаны');
+  const res = postCells(ctx, ownerBlocks(8));
+  assert(res.ok === true, `ok=false: ${res.error}`);
+  for (const r of [14, 15]) {
+    assert(sheet.getCell(r, 1) === '' && sheet.getCell(r, 3) === '' && sheet.getCell(r, 20) === ''
+           && sheet.getCell(r, 7) === '' && sheet.getCell(r, 13) === '', `строка ${r} не очищена`);
+    assert(sheet.getFormulaAt(r, 14) !== '', `формула N${r} стёрта`);
+    assert(sheet.getFormatAt(r, 1) === 'dd.MM.yyyy', `формат A${r} снят`);
+  }
+  assert(sheet.getCell(13, 3) === 'BTC', 'строка 13 затёрта');
+});
+
+check('9.5.2: чужой секрет отвергается и в новом режиме', () => {
+  const ctx = makeContext();
+  const sheet = makeOwnerSheet(ctx);
+  const before = snapshot(sheet);
+  const res = post(ctx, { secret: 'неверный', sheet: OWNER_ASKED, mode: 'cells_values',
+                          writes: [{ range: 'A3', values: [[1]] }], clears: [] });
+  assert(res.ok === false && res.error === 'forbidden', `ответ ${JSON.stringify(res)}`);
+  assert(snapshot(sheet) === before, 'лист изменён при чужом секрете');
+});
+
+check('9.5.2: общий путь по-прежнему создаёт лист, а cells_values — нет', () => {
+  const ctx = makeContext();
+  post(ctx, { secret: ctx.SECRET, sheet: 'Новый', mode: 'replace', rows: [['a']] });
+  assert(ctx.sheets.has('Новый'), 'режим replace перестал создавать лист');
+  const res = post(ctx, { secret: ctx.SECRET, sheet: 'Новый2', mode: 'cells_values',
+                          writes: [{ range: 'A1', values: [['x']] }], clears: [] });
+  assert(res.ok === false && !ctx.sheets.has('Новый2'), 'cells_values создал лист');
+});
 
 console.log(failed === 0 ? '\nВсе сценарии стенда прошли'
 

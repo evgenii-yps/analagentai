@@ -30,6 +30,7 @@ from typing import Any
 
 import pytest
 
+from src import export_main
 from src.core.config import settings
 from src.export import queries, sheets
 from src.export.transform import (
@@ -726,12 +727,16 @@ def test_the_required_version_lives_in_one_place_and_is_compared_exactly(
     """
     source = (_ROOT / "src" / "export_main.py").read_text(encoding="utf-8")
     assert '_TRADES_RECEIVER_VERSION = "9.2"' in source
-    assert "probe.receiver_version != _TRADES_RECEIVER_VERSION" in source
+    # Этап 9.5.2: приёмник поднят до 9.5.2 (надмножество 9.2), и журнал принимает обе версии
+    # — членством в кортеже, то есть по-прежнему точным сравнением, а не «не меньше».
+    assert "probe.receiver_version not in _TRADES_COMPATIBLE_VERSIONS" in source
     # Версия НЕ зашита второй раз строкой рядом с запросом.
     assert source.count('"9.2"') == 1, "версия зашита больше чем в одном месте"
-    # И она совпадает с той, что объявлена в приёмнике.
+    # И объявленная приёмником версия входит в принимаемые клиентом.
     receiver = (_ROOT / "deploy" / "apps_script.gs").read_text(encoding="utf-8")
-    assert "const RECEIVER_VERSION = '9.2';" in receiver
+    assert "const RECEIVER_VERSION = '9.5.2';" in receiver
+    assert export_main._OWNER_RECEIVER_VERSION == "9.5.2"
+    assert "9.5.2" in export_main._TRADES_COMPATIBLE_VERSIONS
 
 
 def test_the_version_probe_carries_nothing_and_names_the_real_sheet() -> None:
@@ -894,7 +899,7 @@ def test_the_receiver_declares_the_new_version_and_both_table_modes() -> None:
     записи не туда.
     """
     receiver = (_ROOT / "deploy" / "apps_script.gs").read_text(encoding="utf-8")
-    assert "const RECEIVER_VERSION = '9.2';" in receiver
+    assert "const RECEIVER_VERSION = '9.5.2';" in receiver
     assert "function tableAppend(" in receiver
     assert "function tableUpdate(" in receiver
     # Строка ищется СВЕРХУ и не ниже итогов, а не добавляется в конец листа.
