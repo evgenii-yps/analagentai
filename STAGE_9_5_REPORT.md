@@ -492,4 +492,4 @@ ccxt 4.4.100 в `load_markets()` по умолчанию грузит рынки
 
 ## 13.4 PR
 
-PR_NUMBER_PLACEHOLDER
+[PR #15](https://github.com/evgenii-yps/analagentai/pull/15)
