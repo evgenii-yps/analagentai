@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import re
+import textwrap
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -165,8 +166,10 @@ def test_the_sheets_and_the_bot_only_read_the_demo_tables() -> None:
             # единственная запись ledger — снимок суток
             assert targets == {"demo_balance_daily"}
     queries = (ROOT / "src" / "bot" / "queries.py").read_text(encoding="utf-8")
-    block = queries[queries.index("async def demo_overview"):queries.index(
-        "async def positions_capital")]
+    # Этап 9.7: блок демо-запросов бота — от demo_state до positions_capital (несколько
+    # методов), поэтому он берётся с начала строки и выравнивается.
+    block = textwrap.dedent(queries[queries.index("    async def demo_state"):queries.index(
+        "    async def positions_capital")])
     assert sql_write_targets(block) == set()
 
 

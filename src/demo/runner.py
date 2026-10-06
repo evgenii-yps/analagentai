@@ -88,6 +88,8 @@ class DemoConfig:
     notify_enabled: bool = True
     trades_max_per_hour: int = 0
     timezone: str = "Europe/Moscow"
+    # Чат получателя: по нему читаются тихие часы (``user_settings``). Пусто — со звуком.
+    chat_id: str = ""
 
     @classmethod
     def from_settings(cls, cfg: Any) -> DemoConfig:
@@ -101,6 +103,7 @@ class DemoConfig:
             notify_enabled=bool(cfg.DEMO_NOTIFY_ENABLED),
             trades_max_per_hour=int(cfg.NOTIFY_TRADES_MAX_PER_HOUR),
             timezone=str(cfg.NOTIFY_TIMEZONE),
+            chat_id=str(cfg.TELEGRAM_CHAT_ID or ""),
         )
 
 
@@ -122,7 +125,9 @@ class Context:
     config: DemoConfig
     symbols: list[str]
     secrets: tuple[str, ...] = ()
-    notify: Callable[[str], Awaitable[bool]] | None = None
+    # Отправка в Telegram: ``send_message``-совместимая (текст + необязательные
+    # ``reply_markup`` и ``disable_notification``). Истинный результат — отправлено.
+    notify: Callable[..., Awaitable[Any]] | None = None
     now: Callable[[], datetime] = _utcnow
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
     mirror_since: datetime | None = None
@@ -133,6 +138,8 @@ class Context:
     halted: str | None = None
     # Свободный USDT, прочитанный на этой итерации (None — ещё не читали).
     usdt_free: Decimal | None = None
+    # Кэш тихих часов получателя: (момент чтения, настройки). Живёт 60 с.
+    quiet_cache: tuple[float, Any] | None = None
 
     @property
     def tz(self) -> ZoneInfo:

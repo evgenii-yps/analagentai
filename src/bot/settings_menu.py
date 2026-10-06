@@ -14,8 +14,12 @@ Telegram и без базы, — а это тот самый код, ошибк�
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
+from src.bot import nav
+from src.core import fmt
 from src.core.user_settings import UserSettings
 
 # Значения, предлагаемые кнопками (§1 ТЗ 8.3).
@@ -35,35 +39,101 @@ def _selected(settings: UserSettings, instrument_id: int) -> bool:
     return settings.instruments is None or instrument_id in settings.instruments
 
 
-def quiet_text(settings: UserSettings) -> str:
-    """Человеческая подпись состояния тишины."""
+UTC_ZONE = ZoneInfo("UTC")
+
+
+# ЧАСЫ ТИШИНЫ: ХРАНЕНИЕ В UTC, ПОКАЗ И ВЫБОР — ПО ЧАСОВОМУ ПОЯСУ УВЕДОМЛЕНИЙ (Д8).
+# В ``user_settings`` часы лежат в UTC и включительно с обеих сторон (``quiet_to = 4`` —
+# тихо до 04:59): так их читает ``src.notify.agent`` и служба demo, и этот формат не
+# меняется. Человек живёт по МСК, поэтому перевод туда и обратно делается здесь, по
+# смещению пояса на момент ``now``. Пояса с нецелым смещением округляются до часа.
+
+def _offset_hours(tz: ZoneInfo, now: datetime | None) -> int:
+    moment = (now or datetime.now(UTC)).astimezone(tz)
+    offset = moment.utcoffset()
+    return round(offset.total_seconds() / 3600) if offset is not None else 0
+
+
+def local_to_utc_hour(hour: int, tz: ZoneInfo, now: datetime | None = None) -> int:
+    """Час по местному времени → час UTC."""
+    return (int(hour) - _offset_hours(tz, now)) % 24
+
+
+def utc_to_local_hour(hour: int, tz: ZoneInfo, now: datetime | None = None) -> int:
+    """Час UTC → час по местному времени."""
+    return (int(hour) + _offset_hours(tz, now)) % 24
+
+
+def quiet_bounds(
+    settings: UserSettings, tz: ZoneInfo = UTC_ZONE, now: datetime | None = None
+) -> tuple[int, int] | None:
+    """Окно тишины по местному времени: ``(с_часа, до_часа)``; правая граница — не включена.
+
+    Хранится «до HH:59 включительно», а показывается «до (HH+1):00»: ``quiet_to = 4`` (UTC)
+    в Москве — «до 08:00».
+    """
     if settings.quiet_from is None or settings.quiet_to is None:
-        return "выключена"
-    return f"с {settings.quiet_from:02d}:00 до {settings.quiet_to:02d}:59 UTC"
+        return None
+    start = utc_to_local_hour(settings.quiet_from, tz, now)
+    end = (utc_to_local_hour(settings.quiet_to, tz, now) + 1) % 24
+    return start, end
 
 
-def menu_text(settings: UserSettings, instruments: list[tuple[int, str]]) -> str:
-    """Заголовок меню: что настроено сейчас.
+def quiet_text(
+    settings: UserSettings, tz: ZoneInfo = UTC_ZONE, now: datetime | None = None
+) -> str:
+    """Человеческая подпись состояния тишины: «с 23:00 до 08:00 МСК» или «выключены»."""
+    bounds = quiet_bounds(settings, tz, now)
+    if bounds is None:
+        return "выключены"
+    return f"с {bounds[0]:02d}:00 до {bounds[1]:02d}:00 {fmt.tz_label(tz)}"
 
-    Меню показывает ТЕКУЩЕЕ состояние (§1 ТЗ): человек должен видеть, что
-    действует, не вспоминая, что он нажимал в прошлый раз.
+
+def menu_text(
+    settings: UserSettings,
+    instruments: list[tuple[int, str]],
+    tz: ZoneInfo = UTC_ZONE,
+    signals_enabled: bool = True,
+    now: datetime | None = None,
+) -> str:
+    """Текст экрана настроек: что настроено сейчас и на что это влияет (Д7).
+
+    Меню показывает ТЕКУЩЕЕ состояние (§1 ТЗ 8.3): человек должен видеть, что
+    действует, не вспоминая, что он нажимал в прошлый раз. Монеты, горизонт и порог
+    управляют только разделами «Сигналы» и «Качество сигналов» (и сигнальными
+    уведомлениями, когда они включены) — тихие часы касаются сообщений о сделках.
     """
     chosen = [
         _token(symbol) for instrument_id, symbol in instruments
         if _selected(settings, instrument_id)
     ]
-    return "\n".join([
-        "<b>Настройки уведомлений</b>",
+    bounds = quiet_bounds(settings, tz, now)
+    quiet = (
+        "выключены" if bounds is None
+        else f"{bounds[0]:02d}:00–{bounds[1]:02d}:00 {fmt.tz_label(tz)}"
+    )
+    lines = [
+        "⚙️ <b>Настройки</b>",
         "",
-        f"Токены: {', '.join(chosen) if chosen else 'ни одного'}",
-        f"Горизонт: {settings.horizon_h} ч",
-        f"Порог силы: {settings.min_score:.2f}",
-        f"Тишина: {quiet_text(settings)}",
-    ])
+        f"🔕 <b>Тихие часы:</b> {quiet}",
+        "   В эти часы сообщения о сделках приходят без звука.",
+        "   Тревоги о сбоях — всегда со звуком.",
+        "",
+        "📡 <b>Для разделов «Сигналы» и «Качество сигналов»:</b>",
+        f"   Монеты: {', '.join(chosen) if chosen else 'ни одной'}",
+        f"   Горизонт: {settings.horizon_h} ч",
+        f"   Порог силы: {fmt.num(settings.min_score)}",
+    ]
+    if not signals_enabled:
+        lines.append("ℹ️ Уведомления о сигналах сейчас выключены.")
+    return "\n".join(lines)
 
 
 def menu_keyboard(
-    settings: UserSettings, instruments: list[tuple[int, str]]
+    settings: UserSettings,
+    instruments: list[tuple[int, str]],
+    tz: ZoneInfo = UTC_ZONE,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     """Клавиатура меню: выбранное отмечено галочкой."""
     token_rows: list[list[dict[str, str]]] = []
@@ -91,21 +161,27 @@ def menu_keyboard(
         {
             "text": (
                 f"{MARK_ON if abs(settings.min_score - t) < 1e-9 else ''}"
-                f"{t:.2f}".strip()
+                f"{fmt.num(t)}".strip()
             ),
             "callback_data": f"thr:{t:.2f}",
         }
         for t in THRESHOLDS
     ]
-    quiet_row = [{"text": f"Тишина: {quiet_text(settings)}", "callback_data": "quiet"}]
+    quiet_row = [
+        {"text": f"Тишина: {quiet_text(settings, tz, now)}", "callback_data": "quiet"}
+    ]
     if settings.quiet_from is not None:
         quiet_row.append({"text": "Выключить", "callback_data": "qoff"})
 
-    return {"inline_keyboard": [*token_rows, horizon_row, threshold_row, quiet_row]}
+    return {
+        "inline_keyboard": [
+            *token_rows, horizon_row, threshold_row, quiet_row, [nav.home_button()],
+        ]
+    }
 
 
 def hours_keyboard(prefix: str, title_action: str) -> dict[str, Any]:
-    """Клавиатура выбора часа UTC (00–23) для тишины."""
+    """Клавиатура выбора часа (00–23, по часовому поясу уведомлений) для тишины."""
     rows: list[list[dict[str, str]]] = []
     row: list[dict[str, str]] = []
     for hour in range(24):
@@ -117,6 +193,14 @@ def hours_keyboard(prefix: str, title_action: str) -> dict[str, Any]:
         rows.append(row)
     rows.append([{"text": "← Назад", "callback_data": "menu"}])
     return {"inline_keyboard": rows}
+
+
+def hour_label(value: str) -> str:
+    """``"23"`` → ``"23:00"`` (для подсказки при выборе часа тишины)."""
+    try:
+        return f"{int(value):02d}:00"
+    except ValueError:
+        return value
 
 
 def parse_callback(data: str) -> tuple[str, str] | None:
@@ -135,6 +219,8 @@ def apply_callback(
     action: str,
     value: str,
     instruments: list[tuple[int, str]],
+    tz: ZoneInfo = UTC_ZONE,
+    now: datetime | None = None,
 ) -> tuple[UserSettings, str]:
     """Применяет нажатие. Возвращает новые настройки и КОРОТКОЕ подтверждение.
 
@@ -185,7 +271,7 @@ def apply_callback(
             return settings, "Не понял порог."
         if not any(abs(threshold - t) < 1e-9 for t in THRESHOLDS):
             return settings, "Такого порога нет."
-        return _replace(settings, min_score=threshold), f"Порог силы: {threshold:.2f}"
+        return _replace(settings, min_score=threshold), f"Порог силы: {fmt.num(threshold)}"
 
     if action == "qoff":
         return (
@@ -201,9 +287,17 @@ def apply_callback(
             return settings, "Не понял часы тишины."
         if not (0 <= start <= 23 and 0 <= end <= 23):
             return settings, "Часы задаются от 00 до 23."
+        if start == end:
+            # Граница конца — первый час, когда звук возвращается. Совпадение с началом
+            # означало бы «тихо все сутки», а выключение звука навсегда — не тишина.
+            return settings, "Начало и конец совпадают — выберите другой час конца."
+        # Выбор — по местному времени, хранение — в UTC и включительно: последний тихий
+        # час — тот, что стоит перед границей конца.
+        stored_from = local_to_utc_hour(start, tz, now)
+        stored_to = local_to_utc_hour((end - 1) % 24, tz, now)
         return (
-            _replace(settings, quiet_from=start, quiet_to=end),
-            f"Тишина: с {start:02d}:00 до {end:02d}:59 UTC",
+            _replace(settings, quiet_from=stored_from, quiet_to=stored_to),
+            f"Тишина: с {start:02d}:00 до {end:02d}:00 {fmt.tz_label(tz)}",
         )
 
     return settings, ""

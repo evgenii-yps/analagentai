@@ -4,10 +4,11 @@ Redis), обращений к реальным БД/сети нет.
 """
 
 from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 
-from src.bot import handlers
+from src.bot import handlers, screens
 from src.bot.poller import check_rate_limit, is_allowed
 from src.notify.agent import compute_agreement
 
@@ -162,8 +163,10 @@ def test_agreement_empty_is_none() -> None:
 # --------------------------------------------------------------------------- #
 
 def test_help_contains_mandatory_phrase() -> None:
-    text = handlers.render_help()
-    assert "Система не торгует сама. Все решения принимаете вы" in text
+    # Этап 9.7 (Д3): справка живёт в screens.help_screen; прежняя фраза «Система не торгует
+    # сама. Все решения принимаете вы» была неправдой — сделки идут на демо-счёте.
+    text, _ = screens.help_screen(flags=screens.Flags(demo_enabled=True), coins=["BTC"])
+    assert "Реальными деньгами система не торгует" in text
 
 
 def test_status_all_fresh() -> None:
@@ -243,15 +246,19 @@ def test_signal_card_not_found() -> None:
 
 
 def test_agents_stale_marked() -> None:
+    # Этап 9.7 (Д6): экран агентов — по каждой монете; устаревший вывод и отсутствие
+    # вывода показываются значком 💤, а не словами.
     old = _NOW - timedelta(seconds=1000)
-    rows = {
-        "market": {"agent": "market", "signal": "bullish", "confidence": 0.7, "ts": _NOW},
-        "liquidity": {"agent": "liquidity", "signal": "neutral", "confidence": 0.1, "ts": old},
-        "futures": None,
-    }
-    text = handlers.render_agents(rows, freshness_sec=300, now=_NOW)
-    assert "устарел, в решении не участвует" in text
-    assert "Работают 3 агента из 5. News и OnChain пока не реализованы." in text
+    by_token = {"BTC": {
+        "market": {"signal": "bullish", "confidence": 0.7, "ts": _NOW},
+        "liquidity": {"signal": "neutral", "confidence": 0.1, "ts": old},
+    }}
+    text, _ = screens.agents_screen(
+        tokens=["BTC"], by_token=by_token, decisions={}, freshness_sec=300,
+        flags=screens.Flags(), now=_NOW, tz=ZoneInfo("Europe/Moscow"),
+    )
+    assert "<b>BTC</b> 🟢 0,70 · 💤 · 💤" in text
+    assert "Работают 3 агента из 5" in text
 
 
 # /stats переписан §4 ТЗ 8.3: попадания за 7 и 30 дней по ВЫБРАННОМУ горизонту,
@@ -286,7 +293,7 @@ def test_stats_puts_the_count_next_to_every_percent() -> None:
     """§4 ТЗ: процент без знаменателя одинаково читается при 3 и при 300."""
     blocks = [("за 7 дней", _stats_block(80, sr_buy=0.62, n_buy=84), _stats_block(90))]
     text = handlers.render_stats(blocks, horizon_h=4, now=_NOW)
-    assert "buy 62% из 84" in text
+    assert "покупать 62% из 84" in text
 
 
 def test_stats_small_sample_warning() -> None:

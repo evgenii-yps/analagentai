@@ -439,10 +439,11 @@ def test_menu_shows_current_state() -> None:
     instruments = [(1, "BTC/USDT"), (3, "ETH/USDT"), (5, "SOL/USDT")]
     settings = _settings(instruments=(1, 5), horizon_h=12, min_score=0.80)
     text = menu_text(settings, instruments)
-    assert "BTC, SOL" in text
+    # Этап 9.7 (§4.7): экран настроек говорит, на что влияют монеты, горизонт и порог.
+    assert "Монеты: BTC, SOL" in text
     assert "Горизонт: 12 ч" in text
-    assert "Порог силы: 0.80" in text
-    assert "Тишина: выключена" in text
+    assert "Порог силы: 0,80" in text
+    assert "Тихие часы:</b> выключены" in text
 
     keyboard = menu_keyboard(settings, instruments)
     buttons = [b for row in keyboard["inline_keyboard"] for b in row]
@@ -472,7 +473,7 @@ def test_menu_confirmation_is_short_and_specific() -> None:
     _, note = apply_callback(settings, "hor", "12", instruments)
     assert note == "Горизонт: 12 ч"
     _, note = apply_callback(settings, "thr", "0.90", instruments)
-    assert note == "Порог силы: 0.90"
+    assert note == "Порог силы: 0,90"
     _, note = apply_callback(settings, "tok", "3", instruments)
     assert note == "ETH выключен"
 
@@ -482,10 +483,12 @@ def test_menu_quiet_hours_round_trip() -> None:
 
     instruments = [(1, "BTC/USDT")]
     settings = _settings()
-    updated, note = apply_callback(settings, "qt", "22:6", instruments)
+    # Этап 9.7 (Д8): выбор — по местному времени, граница конца — час, когда звук возвращается;
+    # в UTC хранится последний тихий час включительно (при поясе UTC: «до 07:00» → 6).
+    updated, note = apply_callback(settings, "qt", "22:7", instruments)
     assert updated.quiet_from == 22 and updated.quiet_to == 6
-    assert "22:00" in note and "06:59" in note
-    assert quiet_text(updated) == "с 22:00 до 06:59 UTC"
+    assert "22:00" in note and "07:00" in note
+    assert quiet_text(updated) == "с 22:00 до 07:00 UTC"
 
     off, note = apply_callback(updated, "qoff", "", instruments)
     assert off.quiet_from is None and off.quiet_to is None

@@ -27,8 +27,10 @@ from zoneinfo import ZoneInfo
 
 import structlog
 
+from src.core import fmt
+from src.core.user_settings import UserSettings, is_quiet_hour
 from src.demo import ledger, rules
-from src.positions.messages import exit_ru, hhmm
+from src.positions.messages import exit_ru
 
 if TYPE_CHECKING:
     from src.demo.runner import Context
@@ -44,47 +46,33 @@ _WINDOW_SEC = 3600
 
 
 # --------------------------------------------------------------------------
-# Форматирование
+# Форматирование (единый русский формат — ``src.core.fmt``)
 # --------------------------------------------------------------------------
+
+# Кнопка под каждым сообщением о сделке. Её нажатие обрабатывает бот (``src.bot.nav``,
+# адрес ``v1:accn``): экран счёта приходит НОВЫМ сообщением, а сообщение о сделке —
+# запись — не редактируется.
+ACCOUNT_CALLBACK = "v1:accn"
+ACCOUNT_BUTTON: dict[str, Any] = {
+    "inline_keyboard": [[{"text": "💰 Счёт", "callback_data": ACCOUNT_CALLBACK}]]
+}
+
+# Причины пропуска покупки человеческим языком. Неизвестная причина печатается как есть:
+# новая причина в сообщении лучше молчания.
+DEMO_SKIP_RU: dict[str, str] = {
+    rules.SKIP_NO_CAPITAL: "не хватило денег",
+    rules.SKIP_NO_BALANCE: "мало USDT на демо-счёте",
+    rules.SKIP_STALE: "опоздание",
+    rules.SKIP_NOT_BUY: "не покупка",
+    rules.SKIP_BEFORE_START: "до запуска демо",
+    rules.SKIP_DUST: "слишком маленькая сумма",
+    "no_market": "нет рынка на бирже",
+    "closed_before_buy": "сделка закрылась до покупки",
+}
 
 
 def _esc(value: Any) -> str:
     return html.escape(str(value))
-
-
-def tz_label(tz: ZoneInfo) -> str:
-    """Подпись пояса: ``МСК`` для Москвы, иначе сокращение пояса."""
-    return "МСК" if tz.key == "Europe/Moscow" else (datetime.now(tz).strftime("%Z") or tz.key)
-
-
-def local_time(ts: datetime, tz: ZoneInfo) -> str:
-    """``дд.мм ЧЧ:ММ МСК`` — время по часовому поясу уведомлений."""
-    return ts.astimezone(tz).strftime("%d.%m %H:%M") + " " + tz_label(tz)
-
-
-def price_str(value: Decimal | float) -> str:
-    """Цена с разделителем тысяч; знаков больше у копеечных монет (как в ``positions``)."""
-    number = float(value)
-    digits = 2 if abs(number) >= 100 else (4 if abs(number) >= 1 else 6)
-    return f"{number:,.{digits}f}".replace(",", " ")
-
-
-def qty_str(value: Decimal) -> str:
-    """Количество монеты без хвоста нулей: ``0.00003332``."""
-    text = f"{Decimal(str(value)):.8f}".rstrip("0").rstrip(".")
-    return text or "0"
-
-
-def usd(value: Decimal | float, places: int = 2, sign: bool = False) -> str:
-    number = float(value)
-    return f"{number:+,.{places}f}".replace(",", " ") if sign else \
-        f"{number:,.{places}f}".replace(",", " ")
-
-
-def pct(value: Decimal | float | None, places: int = 2, sign: bool = True) -> str:
-    if value is None:
-        return "—"
-    return f"{float(value):+.{places}f}%" if sign else f"{float(value):.{places}f}%"
 
 
 def token_of(symbol: str) -> str:
@@ -101,29 +89,35 @@ def opened_text(
     slippage_pct: Decimal | None, cost_usd: Decimal, qty: Decimal, fee_usd: Decimal | None,
     probability: float | None, target_price: Decimal, target_pct: Decimal,
     deadline_at: datetime, cash: Decimal | None, equity: Decimal | None, tz: ZoneInfo,
+    calibrated_probability: float | None = None,
 ) -> str:
-    """«КУПЛЕНО на демо-счёте»: исполнение, сумма, комиссия, сигнал, цель, срок, баланс."""
+    """«Куплено»: цена, сумма, комиссия, цель и срок, согласие агентов, баланс.
+
+    ``probability`` — ИНДЕКС СОГЛАСИЯ агентов (с этапа 7.3 это не вероятность), и подпись
+    говорит именно так. Вероятность успеха по истории — отдельной строкой и только если
+    она посчитана (``signals.calibrated_probability`` не пусто).
+    """
     token = token_of(symbol)
-    signal = "—" if signal_price is None else f"${price_str(signal_price)}"
-    prob = "—" if probability is None else f"{float(probability):.2f}"
-    fee = "—" if fee_usd is None else f"${usd(fee_usd, 4)}"
+    lines = [
+        f"🛒 <b>Куплено · {_esc(token)}</b> #{int(position_id)} <i>(демо)</i>",
+        f"Цена {fmt.price(avg_price)} · сигнал {fmt.price(signal_price)} · "
+        f"проскальзывание {fmt.pct(slippage_pct)}",
+        f"Сумма {fmt.money(cost_usd)} · {fmt.qty(qty)} {_esc(token)} · "
+        f"комиссия {fmt.money(fee_usd, 4)}",
+        f"🎯 Цель {fmt.price(target_price)} ({fmt.pct(target_pct)}) · "
+        f"⏳ до {fmt.local_dt(deadline_at, tz)}",
+        f"Согласие агентов {fmt.share(probability)}",
+    ]
+    if calibrated_probability is not None:
+        lines.append(f"Вероятность успеха по истории {fmt.share(calibrated_probability)}")
     if cash is None or equity is None:
-        balance = "Баланс после сделки: нет данных"
+        lines.append("💰 Баланс: нет данных")
     else:
-        balance = (
-            f"Баланс: свободно ${usd(cash)} · в рынке ${usd(equity - cash)} · "
-            f"итого ${usd(equity)}"
+        lines.append(
+            f"💰 Баланс {fmt.money(equity)} · свободно {fmt.money(cash)} · "
+            f"в рынке {fmt.money(equity - cash)}"
         )
-    return (
-        f"🟢 <b>КУПЛЕНО на демо-счёте</b> · {_esc(token)} (#{int(position_id)})\n"
-        f"Исполнено по ${price_str(avg_price)} · цена сигнала {signal} · "
-        f"проскальзывание {pct(slippage_pct)}\n"
-        f"Сумма ${usd(cost_usd)} · {qty_str(qty)} {_esc(token)} · комиссия {fee}\n"
-        f"Вероятность сигнала {prob}\n"
-        f"Цель ${price_str(target_price)} ({pct(target_pct)} от входа) · "
-        f"срок до {local_time(deadline_at, tz)}\n"
-        f"{balance}"
-    )
+    return "\n".join(lines)
 
 
 def closed_text(
@@ -132,23 +126,26 @@ def closed_text(
     profit_pct: Decimal | None, fees_usd: Decimal, equity: Decimal | None,
     start_capital: Decimal,
 ) -> str:
-    """«ПРОДАНО»: причина, цены, время в сделке, прибыль, комиссии пары, баланс и итог."""
+    """«Продано»: значок и слово — по результату (прибыль больше нуля — ✅ «в плюс»,
+    ноль и меньше — ❌ «в минус»), причина, цены, время в сделке, результат, баланс."""
     token = token_of(symbol)
+    won = profit_usd > 0
+    head = "✅ <b>Продано в плюс" if won else "❌ <b>Продано в минус"
     if equity is None:
-        balance = "Баланс итого: нет данных"
+        balance = "💰 Баланс: нет данных"
     else:
         diff, diff_pct = ledger.change(equity, start_capital)
         balance = (
-            f"Баланс итого ${usd(equity)} · с начала {usd(diff, 2, sign=True)} $ "
-            f"({pct(diff_pct)})"
+            f"💰 Баланс {fmt.money(equity)} · с начала {fmt.sign_emoji(diff)} "
+            f"{fmt.money_signed(diff)} ({fmt.pct(diff_pct)})"
         )
     return (
-        f"🔴 <b>ПРОДАНО на демо-счёте</b> · {_esc(token)} (#{int(position_id)})\n"
+        f"{head} · {_esc(token)}</b> #{int(position_id)} <i>(демо)</i>\n"
         f"Причина: {_esc(exit_ru(exit_reason, hold_hours))}\n"
-        f"Вход ${price_str(entry_price)} → выход ${price_str(exit_price)} · "
-        f"в сделке {hhmm(held_sec)}\n"
-        f"Прибыль {usd(profit_usd, 4, sign=True)} $ ({pct(profit_pct)}) · "
-        f"комиссии за пару ${usd(fees_usd, 4)}\n"
+        f"{fmt.price(entry_price)} → {fmt.price(exit_price)} · "
+        f"в сделке {fmt.duration(held_sec)}\n"
+        f"Результат {fmt.sign_emoji(profit_usd)} {fmt.money_signed(profit_usd, 4)} "
+        f"({fmt.pct(profit_pct)}) · комиссии {fmt.money(fees_usd, 4)}\n"
         f"{balance}"
     )
 
@@ -161,7 +158,8 @@ _FILL_SQL = (
     "SELECT d.id, d.position_id, d.leg, d.symbol, d.avg_price, d.filled_qty, d.cost_usd, "
     "d.fee_usd, d.fee_ccy, d.slippage_pct, d.filled_at, d.cash_after_usd, "
     "d.equity_after_usd, i.base, p.entry_price, p.signal_price, p.target_price, "
-    "p.target_pct, p.deadline_at, p.opened_at, p.exit_reason, sg.probability "
+    "p.target_pct, p.deadline_at, p.opened_at, p.exit_reason, sg.probability, "
+    "sg.calibrated_probability "
     "FROM demo_orders d JOIN instruments i ON i.id = d.instrument_id "
     "JOIN positions p ON p.id = d.position_id "
     "LEFT JOIN signals sg ON sg.id = p.signal_id WHERE d.id = $1;"
@@ -187,6 +185,7 @@ async def build_fill_text(ctx: Context, order_id: int) -> str | None:
             probability=row["probability"], target_price=_dec(row["target_price"]),
             target_pct=_dec(row["target_pct"]), deadline_at=row["deadline_at"],
             cash=_dec(row["cash_after_usd"]), equity=equity, tz=ctx.tz,
+            calibrated_probability=row["calibrated_probability"],
         )
     buy = await ctx.pool.fetchrow(
         "SELECT avg_price, cost_usd, fee_usd, fee_ccy, filled_at FROM demo_orders "
@@ -251,6 +250,62 @@ async def _record_sent(ctx: Context, now: datetime) -> None:
         _log.warning("demo_notify_rate_write_failed=1", error=str(exc))
 
 
+# --------------------------------------------------------------------------
+# Тихие часы
+# --------------------------------------------------------------------------
+
+_QUIET_CACHE_SEC = 60
+
+
+async def is_quiet_now(ctx: Context) -> bool:
+    """Сейчас тихие часы получателя? Настройки читаются из ``user_settings`` (кэш 60 с).
+
+    Хранятся они в UTC и включительно; окно через полночь (23–07) разбирает единая
+    :func:`src.core.user_settings.is_quiet_hour`. Нет чата, нет записи или тишина
+    выключена — ``False``. ОШИБКА ЧТЕНИЯ — тоже ``False`` (сообщение пойдёт со звуком) и
+    предупреждение в журнал: лишний звук лучше пропущенной сделки.
+    """
+    chat = ctx.config.chat_id
+    if not chat:
+        return False
+    now = ctx.now()
+    cached = ctx.quiet_cache
+    if cached is not None and now.timestamp() - cached[0] < _QUIET_CACHE_SEC:
+        return is_quiet_hour(cached[1], now)
+    try:
+        row = await ctx.pool.fetchrow(
+            "SELECT quiet_from, quiet_to FROM user_settings WHERE chat_id = $1;", int(chat)
+        )
+        user = UserSettings(
+            chat_id=int(chat),
+            quiet_from=None if row is None or row["quiet_from"] is None
+            else int(row["quiet_from"]),
+            quiet_to=None if row is None or row["quiet_to"] is None else int(row["quiet_to"]),
+        )
+    except Exception as exc:  # noqa: BLE001 — настройки не важнее сообщения о сделке
+        _log.warning("demo_quiet_hours_read_failed=1", error=str(exc))
+        return False
+    ctx.quiet_cache = (now.timestamp(), user)
+    return is_quiet_hour(user, now)
+
+
+async def deliver(
+    ctx: Context, text: str, *, reply_markup: dict[str, Any] | None = None,
+    quiet_aware: bool = True,
+) -> Any:
+    """Одна отправка через ``ctx.notify``. Сообщения о сделках и сводка — ``quiet_aware``:
+    в тихие часы они приходят без звука, но приходят. Алерты (``quiet_aware=False``) — всегда
+    со звуком.
+    """
+    assert ctx.notify is not None
+    kwargs: dict[str, Any] = {}
+    if reply_markup is not None:
+        kwargs["reply_markup"] = reply_markup
+    if quiet_aware and await is_quiet_now(ctx):
+        kwargs["disable_notification"] = True
+    return await ctx.notify(text, **kwargs)
+
+
 async def send_trade_message(ctx: Context, text: str) -> None:
     """Отправляет сообщение о сделке или придерживает его сверх потолка в час."""
     if not ctx.config.notify_enabled or ctx.notify is None:
@@ -266,7 +321,7 @@ async def send_trade_message(ctx: Context, text: str) -> None:
             _log.warning("demo_notify_failed=1", stage="hold", error=str(exc))
         return
     try:
-        ok = await ctx.notify(text)
+        ok = await deliver(ctx, text, reply_markup=ACCOUNT_BUTTON)
     except Exception as exc:  # noqa: BLE001
         _log.warning("demo_notify_failed=1", error=str(exc))
         return
@@ -303,7 +358,7 @@ async def flush_rollup(ctx: Context) -> bool:
         "своим чередом — придержаны только сообщения о них.\n\n" + body
     )
     try:
-        ok = bool(await ctx.notify(text))
+        ok = bool(await deliver(ctx, text, reply_markup=ACCOUNT_BUTTON))
     except Exception as exc:  # noqa: BLE001
         ok = False
         _log.warning("demo_notify_failed=1", stage="rollup", error=str(exc))
