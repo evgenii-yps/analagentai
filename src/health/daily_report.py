@@ -59,14 +59,18 @@ HEARTBEATS: list[tuple[str, str, int]] = [
     # простоя цель и предел не будут замечены никогда, потому что бары уйдут за
     # отметку last_checked_ts только вместе с их разбором.
     ("positions:heartbeat", "POSITION_INTERVAL", 60),
+    # Этап 9.5: демо-исполнение. Сервис пишет heartbeat и при DEMO_ENABLED=false.
+    ("demo:heartbeat", "DEMO_INTERVAL", 15),
 ]
 
 # Этап 9.1.1 §4: контейнер positions добавлен вместе со своим heartbeat.
 # Перечень контейнеров и перечень heartbeat-ключей обязаны описывать ОДИН И ТОТ
 # ЖЕ стек: сервис, чей heartbeat в отчёте есть, а контейнер не назван, читается
 # как «ключ протух сам по себе».
+# Этап 9.5: контейнер demo добавлен вместе со своим heartbeat (решение архитектора) —
+# перечни контейнеров и heartbeat-ключей описывают один и тот же стек.
 CONTAINERS = ["postgres", "redis", "collector", "agents", "decision", "notify", "evaluator",
-              "bot", "positions"]
+              "bot", "positions", "demo"]
 
 # Потоки данных для проверки «тихой» поломки: (подпись, таблица).
 DATA_STREAMS = [
@@ -125,6 +129,23 @@ def _logic_version() -> int:
 
 
 LOGIC_VERSION = _logic_version()
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Булева настройка из окружения или ``.env`` (хвостовой комментарий отбрасывается)."""
+    raw = os.environ.get(name, ENV.get(name))
+    if raw is None:
+        return default
+    head = raw.split("#", 1)[0].strip().lower()
+    if not head:
+        return default
+    return head in ("1", "true", "yes", "on")
+
+
+# Этап 9.5, часть 3 (§2.1): при VIRTUAL_OUTPUT_ENABLED=false раздел «Сделки за 24 часа»
+# не выводится, а при DEMO_ENABLED=true на его месте — короткий раздел «Демо-счёт».
+VIRTUAL_OUTPUT_ENABLED = _env_bool("VIRTUAL_OUTPUT_ENABLED", True)
+DEMO_ENABLED = _env_bool("DEMO_ENABLED", False)
 
 
 def _run(cmd: list[str], timeout: int = 60) -> str:
@@ -708,6 +729,70 @@ def section_positions_24h() -> list[str]:
     return lines
 
 
+# РАЗДЕЛ «ДЕМО-СЧЁТ» — ОДИН SQL-ЗАПРОС ПО ТЕМ ЖЕ ФОРМУЛАМ, ЧТО У src/demo/ledger.py.
+# Хост-скрипт обходится стандартной библиотекой (asyncpg и structlog на хосте нет, правило
+# D-3), поэтому ledger импортировать нельзя; соответствие формул проверяет тест на одной и
+# той же базе (tests/test_virtual_output.py). Цена открытой ноги — последняя закрытая
+# минутная свеча, иначе цена покупки (у хост-скрипта нет клиента биржи).
+DEMO_SECTION_SQL = (
+    "WITH st AS (SELECT start_capital AS v FROM demo_state WHERE id = 1), "
+    "cash AS (SELECT "
+    "COALESCE(sum(cost_usd) FILTER (WHERE leg = 'buy'), 0) AS bc, "
+    "COALESCE(sum(fee_usd) FILTER (WHERE leg = 'buy' AND upper(fee_ccy) = 'USDT'), 0) AS bf, "
+    "COALESCE(sum(cost_usd) FILTER (WHERE leg = 'sell'), 0) AS sc, "
+    "COALESCE(sum(fee_usd) FILTER (WHERE leg = 'sell' AND upper(fee_ccy) = 'USDT'), 0) AS sf "
+    "FROM demo_orders WHERE status = 'filled'), "
+    "held AS (SELECT GREATEST(b.filled_qty - CASE WHEN b.fee_ccy IS NOT NULL "
+    "AND upper(b.fee_ccy) = upper(i.base) THEN abs(COALESCE(b.fee, 0)) ELSE 0 END, 0) "
+    "* COALESCE((SELECT o.close FROM ohlcv o WHERE o.instrument_id = b.instrument_id "
+    "AND o.timeframe = '1m' AND o.ts <= now() - interval '1 minute' "
+    "ORDER BY o.ts DESC LIMIT 1), b.avg_price) AS v "
+    "FROM demo_orders b JOIN instruments i ON i.id = b.instrument_id "
+    "WHERE b.leg = 'buy' AND b.status = 'filled' AND NOT EXISTS (SELECT 1 FROM demo_orders s "
+    "WHERE s.position_id = b.position_id AND s.leg = 'sell' AND s.status = 'filled')), "
+    "day AS (SELECT "
+    "count(*) FILTER (WHERE leg = 'buy' AND status = 'filled' "
+    "AND filled_at > now() - interval '24 hours') AS opened, "
+    "count(*) FILTER (WHERE leg = 'sell' AND status = 'filled' "
+    "AND filled_at > now() - interval '24 hours') AS closed, "
+    "count(*) FILTER (WHERE status = 'lost' AND created_at > now() - interval '24 hours') AS lost, "
+    "count(*) FILTER (WHERE status = 'rejected' "
+    "AND created_at > now() - interval '24 hours') AS rejected FROM demo_orders) "
+    "SELECT st.v - cash.bc - cash.bf + cash.sc - cash.sf, "
+    "(SELECT COALESCE(sum(v), 0) FROM held), st.v, day.opened, day.closed, day.lost, "
+    "day.rejected FROM st, cash, day;"
+)
+
+
+def format_demo_section(raw: str) -> list[str]:
+    """Строки раздела «Демо-счёт» по ответу ``DEMO_SECTION_SQL`` (``''`` — данных нет)."""
+    lines = ["<b>🧪 Демо-счёт</b>"]
+    parts = [p.strip() for p in raw.split("|")] if raw else []
+    try:
+        cash, in_market, start = (float(p) for p in parts[:3])
+        opened, closed, lost, rejected = (int(p) for p in parts[3:7])
+        if len(parts) < 7:
+            raise ValueError
+    except (ValueError, TypeError):
+        lines.append("Данных пока нет (демо-исполнение не запускалось или нет таблиц)")
+        return lines
+    equity = cash + in_market
+    diff = equity - start
+    pct = f"{diff / start * 100:+.2f}%" if start > 0 else "—"
+    lines.append(
+        f"Баланс итого: ${equity:,.2f} · свободно ${cash:,.2f} · в рынке ${in_market:,.2f}"
+    )
+    lines.append(f"С начала: {diff:+,.2f} $ ({pct})")
+    lines.append(f"Сделок за 24 часа: открыто {opened}, закрыто {closed}")
+    lines.append(f"lost: {lost} · rejected: {rejected} (за 24 часа)")
+    return lines
+
+
+def section_demo_24h() -> list[str]:
+    """Раздел «Демо-счёт» суточного отчёта (этап 9.5, часть 3, §2.1)."""
+    return format_demo_section(_psql(DEMO_SECTION_SQL))
+
+
 def section_db_and_errors() -> list[str]:
     lines = ["<b>🗄 БД и ошибки</b>"]
     size = _psql("SELECT pg_size_pretty(pg_database_size(current_database()));")
@@ -725,6 +810,16 @@ def section_db_and_errors() -> list[str]:
 
 def build_message() -> str:
     now = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
+    # БЛОК О СДЕЛКАХ (этап 9.5, часть 3, §2.1): виртуальные — или демо-счёт — или ничего.
+    #   VIRTUAL_OUTPUT_ENABLED=true             — «Сделки за 24 часа», как до этапа;
+    #   false и DEMO_ENABLED=true               — на его месте раздел «Демо-счёт»;
+    #   false и DEMO_ENABLED=false              — раздела нет вовсе (и пустой строки тоже).
+    if VIRTUAL_OUTPUT_ENABLED:
+        trades_blocks = ["\n".join(section_positions_24h())]
+    elif DEMO_ENABLED:
+        trades_blocks = ["\n".join(section_demo_24h())]
+    else:
+        trades_blocks = []
     blocks = [
         f"<b>📊 Agent Trade — суточная сводка</b>\n<i>{now}</i>",
         "\n".join(section_server()),
@@ -735,7 +830,7 @@ def build_message() -> str:
         "\n".join(section_agent_failures()),
         "\n".join(section_agent_silence()),
         "\n".join(section_funding_reserve()),
-        "\n".join(section_positions_24h()),
+        *trades_blocks,
         "\n".join(section_db_and_errors()),
     ]
     return "\n\n".join(blocks)

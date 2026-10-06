@@ -8,6 +8,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from src.core.instruments import SymbolPair, parse_horizon_hours, parse_symbol_pairs
 
+# Хосты OKX, на которых может работать демо-режим (Этап 9.5, §4.1 ТЗ).
+DEMO_ALLOWED_HOSTS: tuple[str, ...] = ("www.okx.com", "eea.okx.com")
+
 
 class Settings(BaseSettings):
     """Настройки приложения, считываемые из окружения / ``.env``."""
@@ -555,6 +558,50 @@ class Settings(BaseSettings):
     # Версия 0 («неизвестна») не попадает в выборку ни при каком значении (§9.5).
     EXPORT_LOGIC_VERSION: str = "current"
 
+    # --- Демо-исполнение зеркалом (Этап 9.5) ---
+    # Каждая виртуальная сделка дублируется рыночным ордером на ДЕМО-счёте OKX
+    # (спот, покупка и последующая продажа). Деньги не настоящие; цель — измерить
+    # проскальзывание, задержку и комиссию реального исполнения. Анализ остаётся
+    # на настоящем рынке: коллекторы, агенты, decision и positions этими
+    # параметрами не управляются, демо-ключи читает ТОЛЬКО сервис demo.
+    #
+    # Имена ключей НАМЕРЕННО отличаются от OKX_API_KEY — чтобы не перепутать
+    # боевой ключ с демо. Выключен по умолчанию.
+    DEMO_ENABLED: bool = False
+    OKX_DEMO_API_KEY: str = ""
+    OKX_DEMO_SECRET_KEY: str = ""
+    OKX_DEMO_PASSPHRASE: str = ""
+    # Только www.okx.com | eea.okx.com: счета с my.okx.com (EEA) работают через
+    # eea.okx.com, остальные — через www.okx.com. Какой хост у ключа — выясняет
+    # предпроверка (python -m src.demo.preflight).
+    OKX_DEMO_HOST: str = "www.okx.com"
+    DEMO_INTERVAL: int = 15                # секунд между итерациями
+    DEMO_MAX_ENTRY_DELAY_SEC: int = 180    # позже — покупка не делается (stale)
+    DEMO_FILL_WAIT_SEC: int = 10           # ожидание исполнения рыночного ордера
+    DEMO_MIN_USDT_BALANCE: float = 20.0    # ниже — покупки не делаются (no_balance)
+    # Редакция 2: демо-счёт — основной контур с собственным учётом капитала.
+    # Демо-счёт OKX выдаётся с большим набором чужих виртуальных монет, поэтому
+    # баланс системы считается НЕ по счёту, а от стартового капитала по строкам
+    # demo_orders (src/demo/ledger.py). Значение записывается в demo_state при
+    # ПЕРВОМ запуске; правка позже учёт не меняет (при расхождении — предупреждение
+    # в журнал). При DEMO_ENABLED=true обязано быть > 0.
+    DEMO_START_CAPITAL_USD: float = 0.0
+    # Сообщения об открытии и закрытии демо-сделок в Telegram. Поток режет тот же
+    # предохранитель, что и у positions: NOTIFY_TRADES_MAX_PER_HOUR (0 = без потолка).
+    DEMO_NOTIFY_ENABLED: bool = True
+    # Выгрузка двух демо-листов в Google Таблицу (пишет служба export, режим replace).
+    DEMO_SHEETS_ENABLED: bool = False
+    # ВЫВОД ВИРТУАЛЬНЫХ СДЕЛОК ЧЕЛОВЕКУ (этап 9.5, часть 3). Один выключатель для всех
+    # путей, которые НЕ гасятся POSITION_NOTIFY_ENABLED и SHEETS_TRADES_ENABLED: раздел
+    # «Сделки за 24 часа» в суточном отчёте здоровья, команда /positions и раздел
+    # «Сделки (виртуальные)» в /status, счётчики виртуальной очереди в алертах выгрузки.
+    # true (по умолчанию) — поведение прежнее. false — эти пути скрыты или заменены
+    # данными демо-счёта. Служба positions работает как раньше: решения, таблица
+    # positions и журналы не меняются — меняется только то, что видит человек.
+    VIRTUAL_OUTPUT_ENABLED: bool = True
+    # Суточная сводка идёт сразу после снимка конца суток по NOTIFY_TIMEZONE
+    # (00:00); отдельного часа для неё нет (DEMO_REPORT_HOUR_UTC удалён).
+
     # --- Телеграм-бот только на чтение (Этап 6.7) ---
     BOT_ENABLED: bool = True          # выключатель сервиса бота
     BOT_POLL_TIMEOUT: int = 30        # сек, таймаут long polling getUpdates
@@ -770,6 +817,54 @@ class Settings(BaseSettings):
                 "«версия логики неизвестна» и настоящей версией быть не может"
             )
         return value
+
+    def demo_config_errors(self) -> list[str]:
+        """Что неверно в настройках демо-исполнения (Этап 9.5, §4.1 ТЗ).
+
+        ПРОВЕРКА ВЫНЕСЕНА В МЕТОД, а не в ``model_validator``, и это намеренно.
+        ``.env`` у всех сервисов один: ``model_validator`` с ``DEMO_ENABLED=true``
+        и пустым ключом уронил бы при старте не только ``demo``, но и collector,
+        agents, decision, positions — из-за опечатки в настройках, которые им не
+        нужны. Метод зовёт только ``src/demo_main.py``: он и падает при старте с
+        понятным текстом. Хост проверяется ВСЕГДА (опечатка в нём — ошибка и при
+        выключенном сервисе), ключи — только при ``DEMO_ENABLED=true``.
+
+        Возвращает список сообщений; пустой список — настройки верны. Значения
+        ключей в сообщения НЕ попадают: называются только имена.
+        """
+        errors: list[str] = []
+        if self.OKX_DEMO_HOST not in DEMO_ALLOWED_HOSTS:
+            errors.append(
+                f"OKX_DEMO_HOST={self.OKX_DEMO_HOST!r} недопустим: разрешены "
+                + " и ".join(DEMO_ALLOWED_HOSTS)
+            )
+        if self.DEMO_ENABLED:
+            for name in ("OKX_DEMO_API_KEY", "OKX_DEMO_SECRET_KEY", "OKX_DEMO_PASSPHRASE"):
+                if not str(getattr(self, name)).strip():
+                    errors.append(
+                        f"DEMO_ENABLED=true, но {name} пуст: все три демо-ключа "
+                        "(OKX_DEMO_API_KEY, OKX_DEMO_SECRET_KEY, OKX_DEMO_PASSPHRASE) "
+                        "обязательны и вносятся только в .env на сервере"
+                    )
+        if self.DEMO_INTERVAL < 1:
+            errors.append(f"DEMO_INTERVAL={self.DEMO_INTERVAL} должен быть >= 1 секунды")
+        if self.DEMO_MAX_ENTRY_DELAY_SEC < 1:
+            errors.append(
+                f"DEMO_MAX_ENTRY_DELAY_SEC={self.DEMO_MAX_ENTRY_DELAY_SEC} "
+                "должен быть >= 1 секунды"
+            )
+        if self.DEMO_FILL_WAIT_SEC < 0:
+            errors.append(f"DEMO_FILL_WAIT_SEC={self.DEMO_FILL_WAIT_SEC} не может быть < 0")
+        if self.DEMO_MIN_USDT_BALANCE < 0:
+            errors.append(
+                f"DEMO_MIN_USDT_BALANCE={self.DEMO_MIN_USDT_BALANCE} не может быть < 0"
+            )
+        if self.DEMO_ENABLED and not self.DEMO_START_CAPITAL_USD > 0:
+            errors.append(
+                f"DEMO_ENABLED=true, но DEMO_START_CAPITAL_USD={self.DEMO_START_CAPITAL_USD}: "
+                "стартовый капитал учёта обязан быть > 0"
+            )
+        return errors
 
     @property
     def bot_allowed_chat_ids(self) -> set[str]:

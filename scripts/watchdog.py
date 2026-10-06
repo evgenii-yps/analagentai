@@ -41,8 +41,11 @@ sys.path.insert(0, os.path.join(APP_DIR, "src", "health"))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "health"))
 import disk_forecast  # noqa: E402
 
+# Этап 9.5: контейнер demo в списке (решение архитектора). Он работает и при
+# DEMO_ENABLED=false (простаивает и пишет heartbeat), поэтому «не running» — всегда сбой:
+# упавший контейнер должен замечаться и по состоянию, а не только по heartbeat.
 CONTAINERS = ["postgres", "redis", "collector", "agents", "decision", "notify", "evaluator",
-              "bot", "positions"]
+              "bot", "positions", "demo"]
 
 # heartbeat-ключ -> (env интервала, дефолт, имя контейнера-владельца).
 HEARTBEATS: list[tuple[str, str, int, str]] = [
@@ -63,6 +66,12 @@ HEARTBEATS: list[tuple[str, str, int, str]] = [
     # UPDATE ... WHERE status = 'open', и отставшая итерация получает ноль
     # изменённых строк вместо второго закрытия.
     ("positions:heartbeat", "POSITION_INTERVAL", 60, "positions"),
+    # Этап 9.5. Перезапуск контейнера demo БЕЗОПАСЕН: ордер сначала записывается
+    # строкой в demo_orders и лишь потом уходит на биржу, а сервис при старте
+    # разбирает строки pending/sent запросом по clOrdId, не отправляя ордер
+    # повторно. В выключенном режиме (DEMO_ENABLED=false) сервис тоже обновляет
+    # heartbeat — тревоги по выключенному сервису не будет.
+    ("demo:heartbeat", "DEMO_INTERVAL", 15, "demo"),
 ]
 
 

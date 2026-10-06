@@ -232,7 +232,7 @@ class BotPoller:
         now = datetime.now(UTC)
 
         if cmd in ("start", "help"):
-            return handlers.render_help()
+            return handlers.render_help(bool(settings.VIRTUAL_OUTPUT_ENABLED))
         if cmd == "status":
             return await self._cmd_status(now, chat_id)
         if cmd == "last":
@@ -246,7 +246,13 @@ class BotPoller:
         if cmd == "summary":
             return await self._cmd_summary(now)
         if cmd == "positions":
+            # Команда остаётся известной, но при VIRTUAL_OUTPUT_ENABLED=false отвечает
+            # одной строкой и в базу за позициями не ходит (§2.2).
+            if not settings.VIRTUAL_OUTPUT_ENABLED:
+                return handlers.render_hidden_positions()
             return await self._cmd_positions(now)
+        if cmd == "demo":
+            return await self._cmd_demo(now)
         return handlers.render_unknown()
 
     async def _handle_callback(
@@ -396,6 +402,16 @@ class BotPoller:
         per_token = await self.queries.freshness_by_instrument(
             None if user.instruments is None else list(user.instruments)
         )
+        # VIRTUAL_OUTPUT_ENABLED=false (этап 9.5, часть 3, §2.3): раздела «Сделки
+        # (виртуальные)» нет, вместо него — «Демо-счёт» (только при DEMO_ENABLED=true).
+        if not settings.VIRTUAL_OUTPUT_ENABLED:
+            demo = None
+            if settings.DEMO_ENABLED:
+                try:
+                    demo = await self.queries.demo_overview(days=7)
+                except Exception as exc:  # noqa: BLE001 — демо не важнее ответа
+                    self._log.warning("bot_demo_state_failed=1", error=str(exc))
+            return handlers.render_status(hb_rows, facts, now, per_token, None, demo)
         pause_sec = float(settings.POSITION_TOKEN_PAUSE_MIN) * 60.0
         try:
             positions = await self.queries.positions_state(
@@ -471,6 +487,10 @@ class BotPoller:
         )
         db_size = await self.queries.db_size()
         return handlers.render_summary(hb_rows, data_counts, signal_counts, db_size, now)
+
+    async def _cmd_demo(self, now: datetime) -> str:
+        """/demo: демо-счёт OKX (Этап 9.5, редакция 2). Только чтение, как и весь бот."""
+        return handlers.render_demo(await self.queries.demo_overview(days=7), now)
 
     async def _cmd_positions(self, now: datetime) -> str:
         """/positions: виртуальные позиции (Этап 9.1 §10).
