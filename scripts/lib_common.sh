@@ -29,15 +29,34 @@ env_get() {
 # «хранить 0 копий» удалило бы и только что созданную.
 is_pos_int() { [[ "${1:-}" =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 )); }
 
-# telegram_alert TEXT — сообщение напрямую через curl, без контейнеров.
-# Отсутствие токена/чата не считается ошибкой: скрипт всё равно пишет в журнал.
+# telegram_recipients — получатели сообщений по одному в строке: TELEGRAM_CHAT_ID, затем
+# BOT_ALLOWED_CHAT_IDS (через запятую) в порядке записи; пробелы срезаются, пустые и
+# повторы выбрасываются. То же правило, что Settings.telegram_recipients (Этап 9.7.1).
+telegram_recipients() {
+    local -a parts
+    local part chat seen=","
+    IFS=',' read -ra parts <<< "$(env_get TELEGRAM_CHAT_ID ""),$(env_get BOT_ALLOWED_CHAT_IDS "")"
+    for part in "${parts[@]}"; do
+        chat="$(printf '%s' "$part" | tr -d '[:space:]')"
+        [[ -z "$chat" || "$seen" == *",${chat},"* ]] && continue
+        seen+="${chat},"
+        printf '%s\n' "$chat"
+    done
+}
+
+# telegram_alert TEXT — сообщение каждому получателю напрямую через curl, без контейнеров.
+# Сбой одного получателя не мешает остальным. Отсутствие токена/получателей не считается
+# ошибкой: скрипт всё равно пишет в журнал.
 telegram_alert() {
     local token chat text="$1"
+    local -a chats
     token="$(env_get TELEGRAM_BOT_TOKEN "")"
-    chat="$(env_get TELEGRAM_CHAT_ID "")"
-    [[ -z "$token" || -z "$chat" ]] && return 0
-    curl -fsS -m 15 "https://api.telegram.org/bot${token}/sendMessage" \
-        --data-urlencode "chat_id=${chat}" \
-        --data-urlencode "text=${text}" \
-        --data-urlencode "parse_mode=HTML" >/dev/null 2>&1 || true
+    mapfile -t chats < <(telegram_recipients)
+    [[ -z "$token" || ${#chats[@]} -eq 0 ]] && return 0
+    for chat in "${chats[@]}"; do
+        curl -fsS -m 15 "https://api.telegram.org/bot${token}/sendMessage" \
+            --data-urlencode "chat_id=${chat}" \
+            --data-urlencode "text=${text}" \
+            --data-urlencode "parse_mode=HTML" >/dev/null 2>&1 || true
+    done
 }

@@ -29,14 +29,13 @@ import json
 import os
 import re
 import subprocess
-import urllib.parse
-import urllib.request
 from datetime import UTC, datetime
 
 try:  # импорт пакетом (тесты, ``python -m``)
-    from src.health import disk_forecast
+    from src.health import disk_forecast, tg_recipients
 except ImportError:  # запуск файлом из cron: каталог скрипта уже в sys.path
     import disk_forecast  # type: ignore[no-redef]
+    import tg_recipients  # type: ignore[no-redef]
 
 APP_DIR = os.environ.get("APP_DIR", "/opt/agent-trade")
 
@@ -836,32 +835,23 @@ def build_message() -> str:
     return "\n\n".join(blocks)
 
 
+def _recipients(env: dict[str, str]) -> list[str]:
+    """Получатели сводки: TELEGRAM_CHAT_ID, затем BOT_ALLOWED_CHAT_IDS, без повторов."""
+    return tg_recipients.recipients(env)
+
+
 def send_telegram(text: str) -> bool:
+    """Шлёт сводку каждому получателю. Успех — если дошло хотя бы одному."""
     token = os.environ.get("TELEGRAM_BOT_TOKEN", ENV.get("TELEGRAM_BOT_TOKEN", ""))
-    chat = os.environ.get("TELEGRAM_CHAT_ID", ENV.get("TELEGRAM_CHAT_ID", ""))
-    if not token or not chat:
+    chats = _recipients({**ENV, **os.environ})
+    if not token or not chats:
         print("daily_report: Telegram не настроен — сводка не отправлена.", flush=True)
         return False
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    data = urllib.parse.urlencode({
-        "chat_id": chat,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": "true",
-    }).encode("utf-8")
-    ca_file = os.environ.get("SSL_CERT_FILE")
-    try:
-        req = urllib.request.Request(url, data=data)
-        if ca_file:
-            import ssl
-            ctx = ssl.create_default_context(cafile=ca_file)
-            urllib.request.urlopen(req, timeout=15, context=ctx).read()
-        else:
-            urllib.request.urlopen(req, timeout=15).read()
-        return True
-    except Exception as exc:  # noqa: BLE001
-        print(f"daily_report: не удалось отправить сводку: {exc}", flush=True)
-        return False
+    delivered, failed = tg_recipients.send_all(token, chats, text, timeout=15)
+    for chat, reason in failed.items():
+        print(f"daily_report: не удалось отправить сводку (chat_id={chat}): {reason}",
+              flush=True)
+    return bool(delivered)
 
 
 def main() -> None:

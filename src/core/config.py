@@ -150,7 +150,9 @@ class Settings(BaseSettings):
 
     # --- Уведомления (Этап 5) ---
     TELEGRAM_BOT_TOKEN: str = ""      # токен Telegram-бота (пусто → сервис простаивает)
-    TELEGRAM_CHAT_ID: str = ""        # ID чата получателя
+    # ID чата владельца. Входит в список получателей ВСЕГДА (см. telegram_recipients):
+    # кто в списке — видит экраны бота и получает все сообщения системы.
+    TELEGRAM_CHAT_ID: str = ""
     NOTIFY_INTERVAL: int = 30         # сек между проверками новых сигналов
     NOTIFY_MIN_PROBABILITY: float = 0.7  # минимальная вероятность для отправки
     # Минимум агентов со свежим содержательным выводом для ОТПРАВКИ уведомления
@@ -614,7 +616,8 @@ class Settings(BaseSettings):
     # --- Телеграм-бот только на чтение (Этап 6.7) ---
     BOT_ENABLED: bool = True          # выключатель сервиса бота
     BOT_POLL_TIMEOUT: int = 30        # сек, таймаут long polling getUpdates
-    # Белый список chat_id через запятую. Пусто → берётся TELEGRAM_CHAT_ID.
+    # Дополнительные получатели (chat_id через запятую) к TELEGRAM_CHAT_ID. Кто в списке —
+    # видит экраны бота и получает все сообщения системы. Пусто → только TELEGRAM_CHAT_ID.
     BOT_ALLOWED_CHAT_IDS: str = ""
     BOT_MAX_ROWS: int = 20            # потолок строк в /last
     BOT_RATE_LIMIT_SEC: int = 3       # мин. пауза между командами одного чата
@@ -876,14 +879,24 @@ class Settings(BaseSettings):
         return errors
 
     @property
-    def bot_allowed_chat_ids(self) -> set[str]:
-        """Белый список chat_id (строки). По умолчанию — единственный чат владельца.
+    def telegram_recipients(self) -> list[str]:
+        """Список получателей: TELEGRAM_CHAT_ID, затем BOT_ALLOWED_CHAT_IDS в порядке записи.
 
-        Значения хранятся строками: chat_id из Telegram приходит числом, но
-        сравнение ведём по строковому представлению, чтобы не зависеть от типа.
+        Владелец входит всегда, даже если его забыли вписать во второй список. Пробелы
+        срезаются, пустые значения и повторы выбрасываются. Значения — строки: chat_id
+        из Telegram приходит числом, сравнение ведётся по строковому представлению.
         """
-        raw = self.BOT_ALLOWED_CHAT_IDS.strip() or self.TELEGRAM_CHAT_ID
-        return {part.strip() for part in raw.split(",") if part.strip()}
+        out: list[str] = []
+        for raw in (self.TELEGRAM_CHAT_ID, *self.BOT_ALLOWED_CHAT_IDS.split(",")):
+            chat = raw.strip()
+            if chat and chat not in out:
+                out.append(chat)
+        return out
+
+    @property
+    def bot_allowed_chat_ids(self) -> set[str]:
+        """Белый список бота — тот же набор, что список рассылки (``telegram_recipients``)."""
+        return set(self.telegram_recipients)
 
     @property
     def pg_dsn_ro(self) -> str:
@@ -945,8 +958,8 @@ class Settings(BaseSettings):
 
     @property
     def telegram_configured(self) -> bool:
-        """Заданы ли токен и chat_id для отправки в Telegram."""
-        return bool(self.TELEGRAM_BOT_TOKEN and self.TELEGRAM_CHAT_ID)
+        """Заданы ли токен и хотя бы один получатель для отправки в Telegram."""
+        return bool(self.TELEGRAM_BOT_TOKEN and self.telegram_recipients)
 
     @property
     def timeframes_list(self) -> list[str]:
