@@ -14,6 +14,7 @@ from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from src.core import fmt
 from src.notify.agent import (
     AGENT_ORDER,
     AGENT_RU,
@@ -36,8 +37,8 @@ DECISION_EMOJI = {"buy": "🟢", "sell": "🔴", "wait": "⚪"}
 
 # Известные команды (для маршрутизации и подсказки в /help).
 KNOWN_COMMANDS = (
-    "start", "help", "status", "last", "signal", "agents", "stats", "summary",
-    "settings", "positions", "demo",
+    "start", "menu", "help", "status", "last", "signals", "signal", "agents", "stats",
+    "summary", "settings", "positions", "demo", "account", "trades", "results",
 )
 
 
@@ -69,10 +70,8 @@ def age_seconds(now: datetime, ts: datetime | None) -> int | None:
 
 
 def _pct(value: Any) -> str:
-    """Число процентов с двумя знаками либо прочерк для None."""
-    if value is None:
-        return "—"
-    return f"{float(value):+.2f}%"
+    """Проценты со знаком, русский формат (обёртка над :func:`fmt.pct`)."""
+    return fmt.pct(value)
 
 
 def _hit(success: Any) -> str:
@@ -191,36 +190,6 @@ def render_hidden_positions() -> str:
     return HIDDEN_POSITIONS_TEXT
 
 
-def render_help(virtual_output: bool = True) -> str:
-    """/start и /help: краткое описание и список команд человеческим языком.
-
-    ``virtual_output=False`` (``VIRTUAL_OUTPUT_ENABLED=false``) убирает из списка команду
-    ``/positions``: виртуальные сделки человеку не показываются.
-    """
-    positions_line = (
-        "/positions — виртуальные позиции: открытые и итог за 7 дней\n"
-        if virtual_output else ""
-    )
-    return (
-        "🤖 <b>Agent Trade — бот наблюдения</b>\n"
-        "Система анализирует рынок BTC тремя агентами и раз в минуту формирует "
-        "решение; сильные сигналы приходят вам в Telegram.\n"
-        "<b>Система не торгует сама. Все решения принимаете вы.</b>\n\n"
-        "<b>Команды (только чтение):</b>\n"
-        "/settings — какие токены, горизонт, порог силы и часы тишины\n"
-        "/status — жива ли система прямо сейчас\n"
-        "/last [N] — последние отправленные сигналы (N по умолчанию 5)\n"
-        "/last all [N] — последние сигналы, включая неотправленные\n"
-        "/signal &lt;id&gt; — подробный разбор одного сигнала\n"
-        "/agents — что три агента думают прямо сейчас\n"
-        "/stats [24h|7d|30d|all] — как система отрабатывает (по умолчанию 7d)\n"
-        "/summary — суточная сводка по запросу\n"
-        + positions_line +
-        "/demo — демо-счёт OKX: баланс, открытые демо-сделки и итог за 7 дней\n"
-        "/help — эта справка"
-    )
-
-
 def render_unknown() -> str:
     """Ответ на неизвестную команду или произвольный текст."""
     return "Не понимаю команду. Наберите /help — покажу список того, что умею."
@@ -328,11 +297,9 @@ def render_status(
         )
         lines.append("")
         lines.append("<b>Демо-счёт:</b>")
-        lines.append(f"Баланс итого: ${float(state.equity):,.2f}")
+        lines.append(f"Баланс итого: {fmt.money(state.equity)}")
         lines.append(f"Открытых сделок: {int(state.open_count)}")
-        lines.append(
-            "С начала: " + (f"{float(diff_pct):+.2f}%" if diff_pct is not None else "—")
-        )
+        lines.append("С начала: " + fmt.pct(diff_pct))
 
     lines.append("")
     if problems:
@@ -353,20 +320,16 @@ def render_last(signals: list[dict[str, Any]], notified_only: bool, now: datetim
         emoji = DECISION_EMOJI.get(s["decision"], "⚪")
         decision = DECISION_RU.get(s["decision"], s["decision"])
         # Этап 7.3: величина Decision Agent — ИНДЕКС СОГЛАСИЯ, а не вероятность.
-        conviction = (
-            round(float(s["probability"]) * 100)
-            if s.get("probability") is not None
-            else "—"
-        )
+        conviction = fmt.share(s.get("probability"))
         status = "закрыт" if s.get("status") == "closed" else "открыт"
         repeat_mark = " · повтор входов" if s.get("is_repeat") else ""
         head = (
             f"\n{emoji} <b>#{s['id']}</b> · {fmt_msk(s['ts'])}{repeat_mark}\n"
-            f"   {decision}, индекс согласия {conviction}%, {status}"
+            f"   {decision}, индекс согласия {conviction}, {status}"
         )
         calibrated = s.get("calibrated_probability")
         if calibrated is not None:
-            head += f"\n   вероятность успеха (по истории) {round(float(calibrated) * 100)}%"
+            head += f"\n   вероятность успеха (по истории) {fmt.share(calibrated)}"
         lines.append(head)
         if s.get("status") == "closed":
             lines.append(
@@ -392,11 +355,7 @@ def render_signal_card(
 
     emoji = DECISION_EMOJI.get(card["decision"], "⚪")
     decision = DECISION_RU.get(card["decision"], card["decision"])
-    conviction = (
-        round(float(card["probability"]) * 100)
-        if card.get("probability") is not None
-        else "—"
-    )
+    conviction = fmt.share(card.get("probability"))
 
     # Этап 8.1: инструмент называется в заголовке — токенов пять, и без имени
     # карточка не отличает сигнал по XRP от сигнала по BTC.
@@ -407,7 +366,7 @@ def render_signal_card(
     lines = [
         header,
         f"Время: {fmt_msk(card['ts'])}",
-        f"Решение: {decision}, индекс согласия {conviction}%",
+        f"Решение: {decision}, индекс согласия {conviction}",
     ]
     # Слово «вероятность» — только когда число выведено из фактических исходов.
     calibrated = card.get("calibrated_probability")
@@ -423,13 +382,13 @@ def render_signal_card(
         if marks:
             mark = f"  [{', '.join(marks)}]"
         lines.append(
-            f"Вероятность успеха (по истории): {round(float(calibrated) * 100)}%{mark}"
+            f"Вероятность успеха (по истории): {fmt.share(calibrated)}{mark}"
         )
     if card.get("is_repeat"):
         lines.append("Повтор: решение принято на том же наборе мнений, что и предыдущее")
     price = card.get("price_at_signal")
     if price is not None:
-        lines.append(f"Цена на момент сигнала: {round(float(price)):,}".replace(",", " "))
+        lines.append(f"Цена на момент сигнала: {fmt.price(price)}")
 
     # Цель и доля её достижения — ВСЕГДА вместе, одним блоком (§8, §12 ТЗ 8.2).
     # Решение 'wait' целей не имеет: цель — это ход в сторону сделки, а сделки нет.
@@ -449,14 +408,16 @@ def render_signal_card(
         if entry is not None:
             opinion = OPINION_RU.get(entry.get("signal"), entry.get("signal", "?"))
             conf = float(entry.get("confidence", 0.0))
-            lines.append(f"• {AGENT_RU[name]}: {opinion} (уверенность {conf:.2f})")
+            lines.append(f"• {AGENT_RU[name]}: {opinion} (уверенность {fmt.num(conf)})")
     for name in AGENT_ORDER:
         if name not in present:
             lines.append(f"• {AGENT_RU[name]}: нет данных, в решении не участвовал")
 
     agreement = compute_agreement(payload)
     if agreement is not None:
-        lines.append(f"Согласованность: {agreement:.2f} — {agreement_wording(agreement)}")
+        lines.append(
+            f"Согласованность: {fmt.num(agreement)} — {agreement_wording(agreement)}"
+        )
 
     lines.append("")
     lines.append("<b>Результаты:</b>")
@@ -476,7 +437,7 @@ def render_signal_card(
     rationale = card.get("rationale")
     if rationale:
         lines.append("")
-        lines.append(f"<b>rationale:</b> {esc(rationale)}")
+        lines.append(f"<b>Пояснение:</b> {esc(rationale)}")
     return "\n".join(lines)
 
 
@@ -484,10 +445,8 @@ def _render_horizon(ev: dict[str, Any] | None) -> str:
     """Строка результата по горизонту (цена закрытия, прибыль, просадка, угадал)."""
     if not ev:
         return "ещё не оценён"
-    price = ev.get("price_at_close")
-    price_str = f"{round(float(price)):,}".replace(",", " ") if price is not None else "—"
     return (
-        f"цена {price_str}, прибыль {_pct(ev.get('pnl_pct'))}, "
+        f"цена {fmt.price(ev.get('price_at_close'))}, прибыль {_pct(ev.get('pnl_pct'))}, "
         f"просадка {_pct(ev.get('drawdown_pct'))}, {_hit(ev.get('success'))}"
     )
 
@@ -499,32 +458,6 @@ def _notify_status(card: dict[str, Any]) -> str:
     if card.get("notified"):
         return "поглощён анти-спамом"
     return "не отправлялся"
-
-
-def render_agents(
-    agent_rows: dict[str, dict[str, Any] | None],
-    freshness_sec: int,
-    now: datetime,
-) -> str:
-    """/agents: последний вывод каждого из трёх агентов и его возраст."""
-    lines = ["<b>🧠 Что агенты думают сейчас</b>", ""]
-    for name in AGENT_ORDER:
-        row = agent_rows.get(name)
-        if row is None:
-            lines.append(f"• {AGENT_RU[name]}: выводов пока нет")
-            continue
-        opinion = OPINION_RU.get(row.get("signal"), row.get("signal", "?"))
-        conf = float(row.get("confidence", 0.0))
-        age = age_seconds(now, row.get("ts"))
-        age_str = f"{age} сек назад" if age is not None else "возраст неизвестен"
-        stale = age is not None and age > freshness_sec
-        tail = " — устарел, в решении не участвует" if stale else ""
-        lines.append(
-            f"• {AGENT_RU[name]}: {opinion} (уверенность {conf:.2f}), {age_str}{tail}"
-        )
-    lines.append("")
-    lines.append("Работают 3 агента из 5. News и OnChain пока не реализованы.")
-    return "\n".join(lines)
 
 
 # §4 ТЗ 8.3: ниже этого числа наблюдений цифра не считается надёжной и
@@ -598,10 +531,10 @@ def _stats_body(block: dict[str, Any]) -> list[str]:
     if n == 0:
         return ["· закрытых сигналов пока нет"]
     body = [
-        f"· наблюдений: {n} (buy {block.get('buy', 0)}, sell {block.get('sell', 0)}, "
-        f"wait {block.get('wait', 0)})",
-        f"· угадано: buy {_rate_with_n(block.get('sr_buy'), block.get('n_buy'))}, "
-        f"sell {_rate_with_n(block.get('sr_sell'), block.get('n_sell'))}",
+        f"· наблюдений: {n} (покупать {block.get('buy', 0)}, "
+        f"продавать {block.get('sell', 0)}, ждать {block.get('wait', 0)})",
+        f"· угадано: покупать {_rate_with_n(block.get('sr_buy'), block.get('n_buy'))}, "
+        f"продавать {_rate_with_n(block.get('sr_sell'), block.get('n_sell'))}",
         f"· средняя прибыль {_pct(block.get('avg_pnl'))}, "
         f"средняя просадка {_pct(block.get('avg_dd'))}",
     ]
@@ -618,16 +551,9 @@ def _rate_with_n(value: Any, n: Any) -> str:
     """
     if value is None:
         return "—"
-    percent = round(float(value) * 100)
+    percent = fmt.share(value)
     count = int(n) if n is not None else None
-    return f"{percent}% из {count}" if count is not None else f"{percent}%"
-
-
-def _rate(value: Any) -> str:
-    """Доля 0..1 → проценты либо прочерк (нет наблюдений данного типа)."""
-    if value is None:
-        return "—"
-    return f"{round(float(value) * 100)}%"
+    return f"{percent} из {count}" if count is not None else percent
 
 
 def render_summary(
@@ -636,8 +562,9 @@ def render_summary(
     signal_counts: dict[str, Any],
     db_size: str | None,
     now: datetime,
+    include_heartbeats: bool = True,
 ) -> str:
-    """/summary: суточная сводка по запросу.
+    """Суточная сводка по запросу (часть экрана «Подробно»).
 
     Метрики БД и Redis бот считает сам (§5). Хостовые метрики (аптайм, диск,
     память, статусы контейнеров) заменены строкой-заглушкой — из контейнера они
@@ -645,17 +572,20 @@ def render_summary(
     """
     lines = [f"<b>📊 Суточная сводка по запросу</b>\n<i>{fmt_msk(now)}</i>", ""]
 
-    lines.append("<b>💓 Heartbeat сервисов</b>")
-    for key, value, interval in hb_rows:
-        ts = _parse_iso(value)
-        age = age_seconds(now, ts)
-        if age is None:
-            lines.append(f"🔴 {esc(key)}: нет отметки")
-        else:
-            mark = "🟢" if age <= 5 * interval else "🔴"
-            lines.append(f"{mark} {esc(key)}: {age} сек назад")
+    # На экране «Подробно» этот список уже есть в состоянии системы: второй раз он не
+    # печатается, иначе экран не помещался бы в одно сообщение.
+    if include_heartbeats:
+        lines.append("<b>💓 Heartbeat сервисов</b>")
+        for key, value, interval in hb_rows:
+            ts = _parse_iso(value)
+            age = age_seconds(now, ts)
+            if age is None:
+                lines.append(f"🔴 {esc(key)}: нет отметки")
+            else:
+                mark = "🟢" if age <= 5 * interval else "🔴"
+                lines.append(f"{mark} {esc(key)}: {age} сек назад")
+        lines.append("")
 
-    lines.append("")
     lines.append("<b>📈 Приток данных за 24 часа</b>")
     for label, count in data_counts:
         mark = "🔴" if count == 0 else "🟢"
@@ -664,7 +594,9 @@ def render_summary(
     lines.append("")
     lines.append("<b>🚦 Сигналы за 24 часа</b>")
     by_decision = signal_counts.get("by_decision") or {}
-    decoded = ", ".join(f"{k}: {v}" for k, v in by_decision.items()) or "нет"
+    decoded = ", ".join(
+        f"{DECISION_RU.get(k, esc(k))}: {v}" for k, v in by_decision.items()
+    ) or "нет"
     lines.append(f"По решениям: {decoded}")
     lines.append(f"Отправлено уведомлений: {signal_counts.get('sent', 0)}")
     lines.append(f"Поглощено анти-спамом: {signal_counts.get('absorbed', 0)}")
@@ -672,8 +604,8 @@ def render_summary(
     # Этап 7.3, Блок C: сколько из решений реально несут новую информацию.
     total_24h = sum(by_decision.values())
     repeats = signal_counts.get("repeats", 0)
-    share = f" ({round(100.0 * repeats / total_24h)}%)" if total_24h else ""
-    lines.append(f"Из них повторных решений: {repeats}{share}")
+    repeat_share = f" ({fmt.share(repeats / total_24h)})" if total_24h else ""
+    lines.append(f"Из них повторных решений: {repeats}{repeat_share}")
     lines.append(f"Уникальных наборов мнений: {signal_counts.get('unique_inputs', 0)}")
     lines.append(f"Закрыто оценщиком: {signal_counts.get('closed', 0)}")
 
@@ -711,60 +643,6 @@ REFUSAL_RU: dict[str, str] = {
     "no_frozen_target": "нет замороженной цели",
     "no_free_capital": "не хватает свободных денег",
 }
-
-
-def render_demo(data: dict[str, Any] | None, now: datetime) -> str:
-    """/demo: баланс демо-счёта, открытые демо-сделки, итог за окно (§7 ТЗ 9.5, ред. 2).
-
-    Ордера идут на ДЕМО-счёт: деньги не настоящие, и в заголовке это названо. Баланс
-    считается собственным учётом от стартового капитала, а не по счёту биржи. Вывода о
-    прибыльности здесь нет — печатаются числа.
-    """
-    lines = [
-        "<b>🧪 Демо-счёт OKX</b>",
-        "<i>Ордера идут на демо-счёт, деньги не настоящие.</i>",
-    ]
-    if data is None:
-        lines.append("Демо-исполнение ещё не запускалось: стартовый капитал не записан.")
-        return "\n".join(lines)
-    state = data["state"]
-    diff = state.equity - state.start_capital
-    diff_pct = diff / state.start_capital * 100 if state.start_capital > 0 else None
-    lines.append(
-        f"Баланс итого: ${float(state.equity):,.2f} · с начала {float(diff):+,.2f} $ "
-        + (f"({float(diff_pct):+.2f}%)" if diff_pct is not None else "")
-    )
-    lines.append(
-        f"Свободно ${float(state.cash):,.2f} · в рынке ${float(state.in_market):,.2f} "
-        f"(стартовый капитал ${float(state.start_capital):,.2f})"
-    )
-    lines.append("")
-    trades = data["open_trades"]
-    lines.append(f"<b>Открытые демо-сделки: {len(trades)}</b>")
-    if not trades:
-        lines.append("Открытых демо-сделок нет.")
-    for trade in trades:
-        left = trade["deadline_at"] - now if trade["deadline_at"] else None
-        if left is None:
-            left_txt = "срок неизвестен"
-        elif left.total_seconds() <= 0:
-            left_txt = "срок истёк"
-        else:
-            left_txt = (f"до срока {int(left.total_seconds() // 3600)} ч "
-                        f"{int(left.total_seconds() % 3600 // 60)} мин")
-        pct = trade["current_pct"]
-        lines.append(
-            f"{esc(trade['token'])} (#{trade['position_id']}) · вход "
-            f"{esc(_num_str(trade['entry_price']))} · сейчас "
-            + (f"{float(pct):+.2f}%" if pct is not None else "—")
-            + f" · {left_txt}"
-        )
-    lines.append("")
-    lines.append(
-        f"<b>За {int(data['days'])} дней:</b> закрыто {data['closed']} · прибыльных "
-        f"{data['wins']} · сумма прибыли {float(data['profit_usd']):+,.4f} $"
-    )
-    return "\n".join(lines)
 
 
 def render_positions(
@@ -814,16 +692,16 @@ def render_positions(
         # ограничивают», а не «денег нет».
         if float(budget_usd) <= 0:
             lines.append(
-                f"Капитал: занято {float(capital['committed_usd']):.2f} USDT "
-                f"(слот {float(slot_usd):.2f}, бюджет не ограничен)"
+                f"Капитал: занято {fmt.num(capital['committed_usd'])} USDT "
+                f"(слот {fmt.num(slot_usd)}, бюджет не ограничен)"
             )
         else:
             lines.append(
-                f"Капитал: занято {float(capital['committed_usd']):.2f} из "
-                f"{float(budget_usd):.2f} USDT (слот {float(slot_usd):.2f})"
+                f"Капитал: занято {fmt.num(capital['committed_usd'])} из "
+                f"{fmt.num(budget_usd)} USDT (слот {fmt.num(slot_usd)})"
             )
         lines.append(
-            f"Накопленный итог: {float(capital['realized_usd']):+.6f} USDT "
+            f"Накопленный итог: {_signed_num(capital['realized_usd'], 6)} USDT "
             "(не реинвестируется)"
         )
         # РАЗБИВКА ПО ВЕРСИЯМ — И ТОЛЬКО КОГДА ВЕРСИЙ БОЛЬШЕ ОДНОЙ. При
@@ -833,7 +711,7 @@ def render_positions(
         if len(by_version) > 1:
             parts = ", ".join(
                 f"v{int(item['logic_version'])}: "
-                f"{float(item['realized_usd']):+.6f} ({int(item['closed'])})"
+                f"{_signed_num(item['realized_usd'], 6)} ({int(item['closed'])})"
                 for item in by_version
             )
             lines.append(f"По версиям правила (закрытых): {parts}")
@@ -866,14 +744,14 @@ def render_positions(
         if row.get("stop_price") is None or row.get("stop_pct") is None:
             lines.append(
                 f"цель {esc(_num_str(row['target_price']))} "
-                f"(+{float(row['target_pct']):.2f}%) · предела убытка нет"
+                f"({fmt.pct(row['target_pct'])}) · предела убытка нет"
             )
         else:
             lines.append(
                 f"цель {esc(_num_str(row['target_price']))} "
-                f"(+{float(row['target_pct']):.2f}%) · "
+                f"({fmt.pct(row['target_pct'])}) · "
                 f"предел {esc(_num_str(row['stop_price']))} "
-                f"(−{float(row['stop_pct']):.2f}%)"
+                f"({fmt.pct(-abs(float(row['stop_pct'])))})"
             )
         lines.append(left_txt)
 
@@ -888,17 +766,16 @@ def render_positions(
         total_usd = summary.get("sum_net_pnl_usd")
         lines.append(
             "Сумма итогов: "
-            + ("—" if total_usd is None else f"${float(total_usd):+.3f}")
+            + fmt.money_signed(total_usd, 3)
         )
         # ОТДЕЛЬНОЙ СТРОКОЙ и только когда их больше нуля: у этих позиций цель и
         # предел задеты в одной свече, порядок событий внутри минуты неизвестен,
         # и итог взят по пределу — пессимистично.
         uncertain = int(summary.get("uncertain") or 0)
         if uncertain:
-            share = 100.0 * uncertain / closed
             lines.append(
                 f"⚠ Из них с неопределённым порядком касаний: {uncertain} "
-                f"({share:.0f}%) — итог взят по пределу"
+                f"({fmt.share(uncertain / closed)}) — итог взят по пределу"
             )
         # ЗАКРЫТИЯ ПО ПРОБЕЛУ В ДАННЫХ — ОТДЕЛЬНОЙ СТРОКОЙ И ТОЛЬКО КОГДА ОНИ
         # ЕСТЬ. У них цена выхода не наблюдалась, а восстановлена, поэтому в
@@ -931,12 +808,16 @@ def render_positions(
 
 
 def _num_str(value: Any) -> str:
-    """Цена строкой. Знаков — по величине: у копеечных инструментов их больше."""
-    if value is None:
-        return "—"
-    value = float(value)
-    digits = 2 if abs(value) >= 100 else (4 if abs(value) >= 1 else 6)
-    return f"{value:,.{digits}f}".replace(",", " ")
+    """Цена строкой, русский формат (обёртка над :func:`fmt.price`)."""
+    return fmt.price(value)
+
+
+def _signed_num(value: Any, places: int) -> str:
+    """Число со знаком и заданным числом знаков: ``+0,012345``."""
+    number = fmt.num(value, places)
+    if number == fmt.DASH or number.startswith(fmt.MINUS):
+        return number
+    return number if float(value) == 0 else "+" + number
 
 
 def _parse_iso(value: str | None) -> datetime | None:

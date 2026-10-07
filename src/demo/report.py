@@ -26,7 +26,9 @@ from typing import Any
 
 import structlog
 
+from src.core import fmt
 from src.demo import ledger
+from src.demo.messages import DEMO_SKIP_RU, deliver
 from src.demo.runner import Context, _safe_error_text
 
 _log = structlog.get_logger().bind(component="demo")
@@ -116,16 +118,6 @@ async def collect(ctx: Context, day: date) -> dict[str, Any] | None:
     }
 
 
-def _usd(value: Decimal, places: int = 2, sign: bool = False) -> str:
-    number = float(value)
-    return f"{number:+,.{places}f}".replace(",", " ") if sign else \
-        f"{number:,.{places}f}".replace(",", " ")
-
-
-def _pct(value: Decimal | None) -> str:
-    return "—" if value is None else f"{float(value):+.2f}%"
-
-
 def format_report(data: dict[str, Any]) -> str:
     """Собирает текст сводки. Чистая функция: без базы, сети и часов."""
     snap = data["snap"]
@@ -134,31 +126,36 @@ def format_report(data: dict[str, Any]) -> str:
     all_diff, all_pct = ledger.change(close, Decimal(str(data["start_capital"])))
     skipped = data["skipped"]
     skipped_text = (
-        ", ".join(f"{html.escape(r)} {n}" for r, n in sorted(skipped.items()))
+        ", ".join(
+            f"{html.escape(DEMO_SKIP_RU.get(r, r))} {n}"
+            for r, n in sorted(skipped.items())
+        )
         if skipped else "нет"
     )
-    fmt = lambda v: "нет данных" if v is None else f"{float(v):+.4f}%"  # noqa: E731
+    slip = lambda v: "нет данных" if v is None else fmt.pct(v, 4)  # noqa: E731
     lines = [
         f"<b>Демо-счёт OKX — сводка за {data['day']:%d.%m.%Y}</b>"
         + (" (снимок дописан с опозданием)" if snap["late"] else ""),
-        f"Баланс: на начало ${_usd(open_)} → на конец ${_usd(close)} "
-        f"(свободно ${_usd(Decimal(str(snap['cash_close'])))} · "
-        f"в рынке ${_usd(Decimal(str(snap['in_market_close'])))})",
-        f"Изменение за сутки: {_usd(day_diff, 2, True)} $ ({_pct(day_pct)}) · "
-        f"с начала: {_usd(all_diff, 2, True)} $ ({_pct(all_pct)})",
+        f"Баланс: на начало {fmt.money(open_)} → на конец {fmt.money(close)} "
+        f"(свободно {fmt.money(snap['cash_close'])} · "
+        f"в рынке {fmt.money(snap['in_market_close'])})",
+        f"Изменение за сутки: {fmt.sign_emoji(day_diff)} {fmt.money_signed(day_diff)} "
+        f"({fmt.pct(day_pct)}) · с начала: {fmt.sign_emoji(all_diff)} "
+        f"{fmt.money_signed(all_diff)} ({fmt.pct(all_pct)})",
         f"Сделок: открыто {snap['opened_count']} · закрыто {snap['closed_count']} · "
         f"прибыльных {snap['wins']} · убыточных {snap['losses']}",
         f"Пропуски покупок: {skipped_text}",
-        f"Проскальзывание, медиана: вход {fmt(data['slip_in'])} · выход {fmt(data['slip_out'])}",
-        f"Комиссии за сутки: ${_usd(Decimal(str(snap['fees_usd'])), 4)}",
+        f"Проскальзывание, медиана: вход {slip(data['slip_in'])} · "
+        f"выход {slip(data['slip_out'])}",
+        f"Комиссии за сутки: {fmt.money(snap['fees_usd'], 4)}",
     ]
     totals: PairTotals = data["pairs"]
     if totals.pairs:
         diff = totals.demo_usd - totals.virtual_usd
         lines.append(
             f"Против виртуальной прибыли тех же позиций ({totals.pairs}): демо "
-            f"{_usd(totals.demo_usd, 4, True)} $ · виртуально "
-            f"{_usd(totals.virtual_usd, 4, True)} $ · разница {_usd(diff, 4, True)} $"
+            f"{fmt.money_signed(totals.demo_usd, 4)} · виртуально "
+            f"{fmt.money_signed(totals.virtual_usd, 4)} · разница {fmt.money_signed(diff, 4)}"
         )
     problems = data["problems"]
     if problems:
@@ -188,7 +185,7 @@ async def daily_report(ctx: Context) -> bool:
         return False
     ok = False
     try:
-        ok = bool(await ctx.notify(format_report(data)))
+        ok = bool(await deliver(ctx, format_report(data)))
     except Exception as exc:  # noqa: BLE001 — сводка не должна ронять цикл
         _log.warning("demo_report_failed=1", error=_safe_error_text(ctx, exc))
     if ok:

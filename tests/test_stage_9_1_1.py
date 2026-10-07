@@ -450,8 +450,8 @@ def test_the_capital_lines_stand_apart_and_are_never_summed() -> None:
         capital={"committed_usd": 4.0, "realized_usd": 0.031234},
         budget_usd=10.0, slot_usd=2.0,
     )
-    assert "Капитал: занято 4.00 из 10.00 USDT (слот 2.00)" in text
-    assert "Накопленный итог: +0.031234 USDT (не реинвестируется)" in text
+    assert "Капитал: занято 4,00 из 10,00 USDT (слот 2,00)" in text
+    assert "Накопленный итог: +0,031234 USDT (не реинвестируется)" in text
     # Слово «виртуально» из заголовка не убрано.
     assert "Виртуальные позиции" in text
     # Строки стоят ПОД ЗАГОЛОВКОМ, до списка позиций.

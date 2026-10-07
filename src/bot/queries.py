@@ -11,7 +11,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -115,15 +115,16 @@ class BotQueries:
     # --- /status ---
 
     async def spot_instruments(self) -> list[tuple[int, str]]:
-        """Спотовые инструменты для меню настроек, по возрастанию идентификатора.
+        """Активные спотовые инструменты, по возрастанию идентификатора.
 
         Именно спот: сигналы выдаются по нему (Decision Agent пишет
         ``instrument_id`` спота), и настройки человека сравниваются с ним же.
         Контракты в меню не показываются — человек выбирает ТОКЕН, а не рынок.
+        Тот же список — «монеты системы» в справке и на главном экране.
         """
         rows = await self._pool.fetch(
             "SELECT id, symbol FROM instruments "
-            " WHERE symbol NOT LIKE '%:%' ORDER BY id;"
+            " WHERE symbol NOT LIKE '%:%' AND active ORDER BY id;"
         )
         return [(int(r["id"]), str(r["symbol"])) for r in rows]
 
@@ -196,13 +197,15 @@ class BotQueries:
         """
         rows = await self._pool.fetch(
             """
-            SELECT id, ts, decision, probability, status,
-                   pnl_pct, drawdown_pct, success,
-                   calibrated_probability, is_repeat, instrument_id
-            FROM signals
-            WHERE (NOT $1 OR notified_at IS NOT NULL)
-              AND ($3::int[] IS NULL OR instrument_id = ANY($3))
-            ORDER BY ts DESC
+            SELECT s.id, s.ts, s.decision, s.probability, s.status,
+                   s.pnl_pct, s.drawdown_pct, s.success,
+                   s.calibrated_probability, s.is_repeat, s.instrument_id,
+                   i.symbol AS symbol
+            FROM signals s
+            JOIN instruments i ON i.id = s.instrument_id
+            WHERE (NOT $1 OR s.notified_at IS NOT NULL)
+              AND ($3::int[] IS NULL OR s.instrument_id = ANY($3))
+            ORDER BY s.ts DESC
             LIMIT $2;
             """,
             notified_only,
@@ -220,15 +223,21 @@ class BotQueries:
         встать по одному из них, а по остальным идти — и общий показатель
         остался бы зелёным.
         """
+        # Последняя свеча — боковым соединением по индексу (одна выборка на токен), а не
+        # ``max(ts)`` по всем свечам токена: так экран «Система» на полугодовой истории
+        # отвечает за миллисекунды, а не за полсекунды.
         rows = await self._pool.fetch(
             """
-            SELECT i.symbol AS symbol, max(o.ts) AS last_ts
+            SELECT i.symbol AS symbol, o.ts AS last_ts
               FROM instruments i
-              LEFT JOIN ohlcv o
-                     ON o.instrument_id = i.id AND o.timeframe = '1m'
+              LEFT JOIN LATERAL (
+                    SELECT ts FROM ohlcv
+                     WHERE instrument_id = i.id AND timeframe = '1m'
+                     ORDER BY ts DESC
+                     LIMIT 1
+                   ) o ON TRUE
              WHERE i.symbol NOT LIKE '%:%'
                AND ($1::int[] IS NULL OR i.id = ANY($1))
-             GROUP BY i.symbol
              ORDER BY i.symbol;
             """,
             instruments,
@@ -325,6 +334,64 @@ class BotQueries:
         )
         by_agent = {r["agent"]: dict(r) for r in rows}
         return {name: by_agent.get(name) for name in agents}
+
+    async def agents_by_token(
+        self, agents: list[str], max_age_sec: int = 3600
+    ) -> dict[str, dict[str, dict[str, Any]]]:
+        """Последний вывод каждого агента ПО КАЖДОЙ МОНЕТЕ: ``{токен: {агент: строка}}``.
+
+        Агент деривативов пишет вывод по инструменту-КОНТРАКТУ, остальные — по споту,
+        поэтому монета определяется по базовому активу символа (``BTC/USDT`` и
+        ``BTC/USDT:USDT`` — одна монета BTC), и из двух строк берётся более свежая.
+
+        Смотрятся только выводы за последние ``max_age_sec`` секунд (по умолчанию час): всё,
+        что старше порога свежести, экран всё равно показывает как «нет свежих данных».
+        Без границы по времени отбор по журналу, растущему каждую минуту, шёл бы по всей
+        таблице: замер на 2,2 млн строк — 4,6 секунды против миллисекунд.
+        """
+        rows = await self._pool.fetch(
+            """
+            SELECT DISTINCT ON (ao.instrument_id, ao.agent)
+                   split_part(i.symbol, '/', 1) AS token, ao.agent AS agent,
+                   ao.signal AS signal, ao.confidence AS confidence, ao.ts AS ts
+              FROM agent_outputs ao
+              JOIN instruments i ON i.id = ao.instrument_id
+             WHERE ao.agent = ANY($1::text[])
+               AND ao.ts > now() - make_interval(secs => $2::float8)
+             ORDER BY ao.instrument_id, ao.agent, ao.ts DESC;
+            """,
+            agents, float(max_age_sec),
+        )
+        out: dict[str, dict[str, dict[str, Any]]] = {}
+        for row in rows:
+            slot = out.setdefault(str(row["token"]), {})
+            current = slot.get(row["agent"])
+            if current is None or row["ts"] > current["ts"]:
+                slot[row["agent"]] = {
+                    "signal": row["signal"],
+                    "confidence": row["confidence"],
+                    "ts": row["ts"],
+                }
+        return out
+
+    async def latest_signal_by_token(self) -> dict[str, dict[str, Any]]:
+        """Последний сигнал (решение) по каждой монете: ``{токен: {id, decision, ...}}``."""
+        rows = await self._pool.fetch(
+            """
+            SELECT split_part(i.symbol, '/', 1) AS token,
+                   s.id, s.decision, s.probability, s.ts
+              FROM instruments i
+              JOIN LATERAL (
+                    SELECT sg.id, sg.decision, sg.probability, sg.ts
+                      FROM signals sg
+                     WHERE sg.instrument_id = i.id
+                     ORDER BY sg.ts DESC
+                     LIMIT 1
+                   ) s ON TRUE
+             WHERE i.symbol NOT LIKE '%:%' AND i.active;
+            """
+        )
+        return {str(r["token"]): dict(r) for r in rows}
 
     # --- /stats ---
 
@@ -626,14 +693,31 @@ class BotQueries:
             "pauses": [(str(r["symbol"]), float(r["left_sec"])) for r in rows],
         }
 
-    # --- /demo (Этап 9.5, редакция 2, §7 ТЗ) ---
+    # --- /demo (Этап 9.5, редакция 2, §7 ТЗ) и экраны 9.7 ---
+
+    async def demo_state(self) -> dict[str, Any] | None:
+        """Состояние учёта демо-счёта: ``{state, mirror_since}``. ТОЛЬКО ЧТЕНИЕ.
+
+        ``None`` — демо-исполнение ещё не стартовало (нет таблиц или строки ``demo_state``).
+        Баланс считается собственным учётом (``src.demo.ledger``): цены открытых ног —
+        последняя закрытая минутная свеча из ``ohlcv``, у бота нет клиента биржи.
+        """
+        try:
+            row = await self._pool.fetchrow(
+                "SELECT start_capital, mirror_since FROM demo_state WHERE id = 1;"
+            )
+        except asyncpg.UndefinedTableError:
+            return None
+        if row is None:
+            return None
+        start = Decimal(str(row["start_capital"]))
+        state = await ledger.compute_state(self._pool, start)
+        return {"state": state, "mirror_since": row["mirror_since"]}
 
     async def demo_overview(self, days: int = 7) -> dict[str, Any] | None:
         """Баланс демо-счёта, открытые демо-сделки и итог за окно. ТОЛЬКО ЧТЕНИЕ.
 
         ``None`` — демо-исполнение ещё не стартовало (нет таблиц или строки ``demo_state``).
-        Баланс считается собственным учётом (``src.demo.ledger``): цены открытых ног —
-        последняя закрытая минутная свеча из ``ohlcv``, у бота нет клиента биржи.
         """
         try:
             start = await ledger.read_start_capital(self._pool)
@@ -641,11 +725,17 @@ class BotQueries:
             return None
         if start is None:
             return None
-        state = await ledger.compute_state(self._pool, start)
+        cash = await ledger.fetch_cash(self._pool, start)
         legs = await ledger.value_legs(self._pool, await ledger.fetch_held_legs(self._pool))
-        deadlines = {
-            int(r["id"]): r["deadline_at"] for r in await self._pool.fetch(
-                "SELECT id, deadline_at FROM positions WHERE id = ANY($1::bigint[]);",
+        in_market = sum((leg["value"] for leg in legs), ledger.ZERO)
+        state = ledger.LedgerState(
+            start_capital=start, cash=cash, in_market=in_market, equity=cash + in_market,
+            open_count=len(legs),
+        )
+        targets = {
+            int(r["id"]): r for r in await self._pool.fetch(
+                "SELECT id, deadline_at, target_price, target_pct FROM positions "
+                "WHERE id = ANY($1::bigint[]);",
                 [int(leg["position_id"]) for leg in legs],
             )
         } if legs else {}
@@ -654,12 +744,23 @@ class BotQueries:
             spent = Decimal(str(leg["cost_usd"])) + ledger.usdt_fee(
                 leg.get("fee_usd"), leg["fee_ccy"]
             )
+            position = targets.get(int(leg["position_id"]))
             open_trades.append({
                 "position_id": int(leg["position_id"]),
                 "token": str(leg["symbol"]).split("/", 1)[0],
                 "entry_price": Decimal(str(leg["avg_price"])),
+                "current_price": leg["price"],
                 "current_pct": (leg["value"] / spent - 1) * 100 if spent > 0 else None,
-                "deadline_at": deadlines.get(int(leg["position_id"])),
+                "opened_at": leg["filled_at"],
+                "deadline_at": position["deadline_at"] if position else None,
+                "target_price": (
+                    Decimal(str(position["target_price"]))
+                    if position and position["target_price"] is not None else None
+                ),
+                "target_pct": (
+                    Decimal(str(position["target_pct"]))
+                    if position and position["target_pct"] is not None else None
+                ),
             })
         since = datetime.now(UTC) - timedelta(days=days)
         pairs = await ledger.fetch_pairs(self._pool, since, None)
@@ -672,6 +773,131 @@ class BotQueries:
             "wins": sum(1 for p in profits if p > 0),
             "profit_usd": sum(profits, Decimal(0)),
         }
+
+    async def demo_report(self, since: datetime | None) -> dict[str, Any]:
+        """Итоги закрытых демо-сделок с момента ``since`` (``None`` — за всё время).
+
+        Берутся пары «покупка + продажа», у которых продажа исполнена не раньше ``since``.
+        Прибыль пары — ТОЛЬКО ``ledger.pair_profit`` (то же число, что в листе владельца и в
+        сообщениях); процент — от потраченных на покупку денег (``ledger.pair_cost``).
+        ✅ — прибыль больше нуля, ❌ — ноль и меньше.
+
+        Пропуски — покупки со статусом ``skipped``/``dust`` за период, кроме
+        ``before_start`` (сделки до запуска демо не зеркалируются по определению, это не
+        пропуск). Ошибки биржи — ордера ``rejected``/``lost``.
+        """
+        try:
+            pairs = await ledger.fetch_pairs(self._pool, since, None)
+        except asyncpg.UndefinedTableError:
+            pairs = []
+        rows = []
+        for pair in pairs:
+            profit = ledger.pair_profit(pair)
+            cost = ledger.pair_cost(pair)
+            rows.append({
+                "token": str(pair["symbol"]).split("/", 1)[0],
+                "position_id": int(pair["position_id"]),
+                "profit": profit,
+                "pct": profit / cost * 100 if cost > 0 else None,
+                "fees": abs(Decimal(str(pair["buy_fee_usd"] or 0)))
+                + abs(Decimal(str(pair["sell_fee_usd"] or 0))),
+                "hold_sec": (pair["sell_at"] - pair["buy_at"]).total_seconds(),
+            })
+        with_pct = [r for r in rows if r["pct"] is not None]
+        best = max(with_pct, key=lambda r: r["pct"], default=None)
+        worst = min(with_pct, key=lambda r: r["pct"], default=None)
+
+        def pick(row: dict[str, Any] | None) -> dict[str, Any] | None:
+            if row is None:
+                return None
+            return {"pct": row["pct"], "token": row["token"],
+                    "position_id": row["position_id"]}
+
+        try:
+            skipped = await self._pool.fetch(
+                "SELECT skip_reason, count(*) AS n FROM demo_orders "
+                "WHERE leg = 'buy' AND status IN ('skipped', 'dust') "
+                "AND skip_reason IS DISTINCT FROM 'before_start' "
+                "AND ($1::timestamptz IS NULL OR created_at >= $1::timestamptz) "
+                "GROUP BY skip_reason;",
+                since,
+            )
+            errors = await self._pool.fetchval(
+                "SELECT count(*) FROM demo_orders WHERE status IN ('rejected', 'lost') "
+                "AND ($1::timestamptz IS NULL OR created_at >= $1::timestamptz);",
+                since,
+            )
+        except asyncpg.UndefinedTableError:
+            skipped, errors = [], 0
+        count = len(rows)
+        return {
+            "closed": count,
+            "wins": sum(1 for r in rows if r["profit"] > 0),
+            "losses": sum(1 for r in rows if r["profit"] <= 0),
+            "profit_usd": sum((r["profit"] for r in rows), Decimal(0)),
+            "avg_pct": (
+                sum((r["pct"] for r in with_pct), Decimal(0)) / len(with_pct)
+                if with_pct else None
+            ),
+            "best": pick(best),
+            "worst": pick(worst),
+            "fees_usd": sum((r["fees"] for r in rows), Decimal(0)),
+            "avg_hold_sec": (
+                sum(r["hold_sec"] for r in rows) / count if count else None
+            ),
+            "skipped_by_reason": {str(r["skip_reason"]): int(r["n"]) for r in skipped},
+            "errors": int(errors or 0),
+        }
+
+    async def demo_recent_closed(self, limit: int = 5) -> list[dict[str, Any]]:
+        """Последние закрытые демо-сделки (новые сверху): итог, длительность, причина."""
+        try:
+            pairs = await ledger.fetch_pairs(self._pool, None, None)
+        except asyncpg.UndefinedTableError:
+            return []
+        latest = list(reversed(pairs[-max(0, int(limit)):])) if limit > 0 else []
+        if not latest:
+            return []
+        positions = {
+            int(r["id"]): r for r in await self._pool.fetch(
+                "SELECT id, opened_at, deadline_at, exit_reason FROM positions "
+                "WHERE id = ANY($1::bigint[]);",
+                [int(p["position_id"]) for p in latest],
+            )
+        }
+        out = []
+        for pair in latest:
+            profit = ledger.pair_profit(pair)
+            cost = ledger.pair_cost(pair)
+            position = positions.get(int(pair["position_id"]))
+            hold_hours = (
+                round((position["deadline_at"] - position["opened_at"]).total_seconds() / 3600)
+                if position and position["deadline_at"] and position["opened_at"] else None
+            )
+            out.append({
+                "position_id": int(pair["position_id"]),
+                "token": str(pair["symbol"]).split("/", 1)[0],
+                "profit": profit,
+                "pct": profit / cost * 100 if cost > 0 else None,
+                "hold_sec": (pair["sell_at"] - pair["buy_at"]).total_seconds(),
+                "exit_reason": str((position or {}).get("exit_reason") or ""),
+                "hold_hours": hold_hours,
+                "sell_at": pair["sell_at"],
+            })
+        return out
+
+    async def demo_yesterday_close(self, today_local: date) -> Decimal | None:
+        """``equity_close`` строки ``demo_balance_daily`` за ВЧЕРА (дата — по часовому
+        поясу уведомлений). Нет такой строки — ``None``: «за сегодня» тогда не считается.
+        """
+        try:
+            value = await self._pool.fetchval(
+                "SELECT equity_close FROM demo_balance_daily WHERE day = $1;",
+                today_local - timedelta(days=1),
+            )
+        except asyncpg.UndefinedTableError:
+            return None
+        return Decimal(str(value)) if value is not None else None
 
     async def positions_capital(self) -> dict[str, Any]:
         """Занятый капитал и накопленный итог (Этап 9.1.1 §5.5).

@@ -42,23 +42,27 @@ def opened(**over) -> str:
 
 def test_the_opened_text_has_every_required_field() -> None:
     text = opened()
-    assert "КУПЛЕНО на демо-счёте" in text
-    assert "BTC" in text and "#41" in text
-    assert "$60 060.00" in text and "цена сигнала $60 000.00" in text      # исполнение и сигнал
-    assert "проскальзывание +0.10%" in text
-    assert "Сумма $2.00" in text and "0.00003332 BTC" in text               # сумма и количество
-    assert "комиссия $0.0018" in text
-    assert "Вероятность сигнала 0.62" in text
-    assert "Цель $60 720.00 (+1.10% от входа)" in text
-    assert "срок до 07.10 12:30 МСК" in text                       # время по NOTIFY_TIMEZONE
-    assert "свободно $998.00" in text and "в рынке $2.01" in text and "итого $1 000.01" in text
+    assert "🛒 <b>Куплено · BTC</b> #41 <i>(демо)</i>" in text
+    assert "Цена 60 060,00 · сигнал 60 000,00 · проскальзывание +0,10%" in text
+    assert "Сумма $2,00 · 0,00003332 BTC · комиссия $0,0018" in text
+    assert "🎯 Цель 60 720,00 (+1,10%) · ⏳ до 07.10 12:30 МСК" in text   # время по NOTIFY_TIMEZONE
+    assert "Согласие агентов 62%" in text                                  # Д10
+    assert "Вероятность сигнала" not in text and "по истории" not in text
+    assert "💰 Баланс $1 000,01 · свободно $998,00 · в рынке $2,01" in text
+
+
+def test_the_calibrated_probability_is_a_separate_line_only_when_known() -> None:
+    """Д10: «согласие агентов» — индекс; вероятность по истории — только если она посчитана."""
+    assert "Вероятность успеха по истории 58%" in opened(calibrated_probability=0.58)
+    assert "по истории" not in opened(calibrated_probability=None)
+    assert "Согласие агентов 62%" in opened(calibrated_probability=0.58)
 
 
 def test_the_opened_text_survives_missing_numbers() -> None:
     text = opened(signal_price=None, slippage_pct=None, fee_usd=None, probability=None,
                   cash=None, equity=None)
-    assert "цена сигнала —" in text and "Вероятность сигнала —" in text
-    assert "нет данных" in text
+    assert "сигнал —" in text and "Согласие агентов —" in text
+    assert "комиссия —" in text and "💰 Баланс: нет данных" in text
 
 
 def closed(**over) -> str:
@@ -74,14 +78,12 @@ def closed(**over) -> str:
 
 def test_the_closed_text_has_every_required_field() -> None:
     text = closed()
-    assert "ПРОДАНО" in text and "BTC" in text and "#41" in text
+    assert "✅ <b>Продано в плюс · BTC</b> #41 <i>(демо)</i>" in text
     assert "Причина: цель достигнута" in text
-    assert "Вход $60 060.00 → выход $60 800.00" in text
-    assert "в сделке 03:41" in text
-    assert "Прибыль +0.0234 $ (+1.17%)" in text
-    assert "комиссии за пару $0.0038" in text
-    assert "Баланс итого $1 010.00" in text
-    assert "с начала +10.00 $ (+1.00%)" in text                            # от стартового капитала
+    assert "60 060,00 → 60 800,00 · в сделке 3 ч 41 мин" in text
+    assert "Результат 🟢 +$0,0234 (+1,17%) · комиссии $0,0038" in text
+    # баланс и «с начала» — от стартового капитала
+    assert "💰 Баланс $1 010,00 · с начала 🟢 +$10,00 (+1,00%)" in text
 
 
 def test_the_reason_uses_the_same_translation_as_the_positions_messages() -> None:
@@ -95,13 +97,27 @@ def test_the_reason_uses_the_same_translation_as_the_positions_messages() -> Non
 
 def test_a_loss_is_shown_with_a_minus() -> None:
     text = closed(profit_usd=D("-0.05"), profit_pct=D("-2.5"), equity=D("999"))
-    assert "Прибыль -0.0500 $ (-2.50%)" in text and "с начала -1.00 $ (-0.10%)" in text
+    assert "Результат 🔴 −$0,0500 (−2,50%)" in text
+    assert "с начала 🔴 −$1,00 (−0,10%)" in text
 
 
-def test_timezone_label_and_conversion() -> None:
-    ts = datetime(2026, 10, 5, 22, 30, tzinfo=UTC)
-    assert messages.local_time(ts, MSK) == "06.10 01:30 МСК"
-    assert messages.local_time(ts, ZoneInfo("UTC")).endswith("UTC")
+def test_the_closing_mark_follows_the_result() -> None:
+    """Д9: значок и слово — по результату; ноль считается «в минус» (✅ — только прибыль > 0)."""
+    plus = closed(profit_usd=D("0.01"))
+    zero = closed(profit_usd=D("0"), profit_pct=D("0"))
+    minus = closed(profit_usd=D("-0.01"), profit_pct=D("-0.5"))
+    assert plus.startswith("✅ <b>Продано в плюс")
+    assert zero.startswith("❌ <b>Продано в минус") and "Результат ⚪" in zero
+    assert minus.startswith("❌ <b>Продано в минус")
+    assert "🔴 <b>ПРОДАНО" not in plus
+
+
+def test_the_account_button_opens_the_account_in_a_new_message() -> None:
+    from src.bot import nav
+
+    button = messages.ACCOUNT_BUTTON["inline_keyboard"][0][0]
+    assert button["text"] == "💰 Счёт" and button["callback_data"] == "v1:accn"
+    assert nav.parse_nav(button["callback_data"]).screen == nav.ACCOUNT_NEW
 
 
 # --- с базой -----------------------------------------------------------------------
@@ -140,13 +156,13 @@ async def test_a_bought_position_sends_the_opening_message_with_real_data(pool, 
 
     assert len(notes) == 1
     text = notes[0]
-    assert "КУПЛЕНО на демо-счёте" in text and f"#{pid}" in text
-    assert "$60 060.00" in text                           # цена исполнения (60000 · 1.001)
-    assert "проскальзывание +0.10%" in text
-    assert "Сумма $2.00" in text and "BTC" in text and "комиссия $" in text
-    assert "Вероятность сигнала 0.71" in text
-    assert "Цель $" in text and "от входа)" in text and "срок до " in text and "МСК" in text
-    assert "свободно $998.00" in text and "итого $" in text
+    assert "Куплено · BTC" in text and f"#{pid}" in text and "<i>(демо)</i>" in text
+    assert "Цена 60 060,00" in text                       # цена исполнения (60000 · 1.001)
+    assert "проскальзывание +0,10%" in text
+    assert "Сумма $2,00" in text and "BTC" in text and "комиссия $" in text
+    assert "Согласие агентов 71%" in text                 # Д10: индекс согласия, не вероятность
+    assert "🎯 Цель " in text and "⏳ до " in text and "МСК" in text
+    assert "свободно $998,00" in text and "💰 Баланс $" in text
 
 
 @pytest.mark.skipif(not server_up(), reason="нет PostgreSQL для проверки SQL")
@@ -164,12 +180,12 @@ async def test_a_sold_position_sends_the_closing_message(pool, clock) -> None:
 
     assert len(notes) == 1
     text = notes[0]
-    assert "ПРОДАНО на демо-счёте" in text and f"#{pid}" in text
+    # продажа на 0.1% ниже тикера 60000 → пара в минус → ❌ (Д9: значок по результату)
+    assert text.startswith("❌ <b>Продано в минус · BTC</b>") and f"#{pid}" in text
     assert "Причина: цель достигнута" in text
-    assert "Вход $60 060.00 → выход $59 940.00" in text   # продажа на 0.1% ниже тикера 60000
-    assert "в сделке 02:41" in text
-    assert "Прибыль " in text and "комиссии за пару $" in text
-    assert "Баланс итого $" in text and "с начала " in text
+    assert "60 060,00 → 59 940,00 · в сделке 2 ч 41 мин" in text
+    assert "Результат " in text and "комиссии $" in text
+    assert "💰 Баланс $" in text and "с начала " in text
 
 
 @pytest.mark.skipif(not server_up(), reason="нет PostgreSQL для проверки SQL")
@@ -232,7 +248,7 @@ async def test_messages_over_the_hourly_cap_are_held_and_rolled_up(pool, clock) 
     assert await messages.flush_rollup(ctx) is True        # час отсчитывается от последней сводки
     assert len(notes) == 3
     assert "Придержано сообщений о демо-сделках: 2" in notes[2]
-    assert notes[2].count("КУПЛЕНО") == 2
+    assert notes[2].count("Куплено") == 2
     assert messages.HELD_KEY not in ctx.redis.lists
     # сводка в счёт потолка не входит
     assert await ctx.redis.zcard(messages.SENT_KEY) == 2

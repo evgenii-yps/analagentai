@@ -50,17 +50,17 @@ def test_the_report_has_every_required_figure() -> None:
     text = report.format_report(sample())
     assert "сводка за 06.10.2026" in text
     # баланс на начало и конец суток
-    assert "на начало $1 000.00 → на конец $1 012.50" in text
-    # изменение за сутки и с начала, $ и %
-    assert "Изменение за сутки: +12.50 $ (+1.25%)" in text
-    assert "с начала: +12.50 $ (+1.25%)" in text
+    assert "на начало $1 000,00 → на конец $1 012,50" in text
+    # изменение за сутки и с начала, $ и % (единый формат — src.core.fmt)
+    assert "Изменение за сутки: 🟢 +$12,50 (+1,25%)" in text
+    assert "с начала: 🟢 +$12,50 (+1,25%)" in text
     # сделки
     assert "открыто 9 · закрыто 7 · прибыльных 5 · убыточных 2" in text
     # пропуски по причинам
-    assert "no_capital 1" in text and "stale 2" in text
+    assert "не хватило денег 1" in text and "опоздание 2" in text
     # медианы проскальзывания, комиссии
-    assert "вход +0.2000% · выход +0.0500%" in text
-    assert "Комиссии за сутки: $0.0421" in text
+    assert "вход +0,2000% · выход +0,0500%" in text
+    assert "Комиссии за сутки: $0,0421" in text
     # lost и rejected при их отсутствии не упоминаются
     assert "lost" not in text and "rejected" not in text
 
@@ -68,8 +68,8 @@ def test_the_report_has_every_required_figure() -> None:
 def test_change_since_start_uses_the_start_capital_not_the_day_open() -> None:
     text = report.format_report(sample(
         snap=snap(equity_open=D("1010"), equity_close=D("1005")), start_capital=D("1000")))
-    assert "Изменение за сутки: -5.00 $ (-0.50%)" in text
-    assert "с начала: +5.00 $ (+0.50%)" in text
+    assert "Изменение за сутки: 🔴 −$5,00 (−0,50%)" in text
+    assert "с начала: 🟢 +$5,00 (+0,50%)" in text
 
 
 def test_lost_rejected_and_dust_are_shown_only_when_present() -> None:
@@ -83,7 +83,7 @@ def test_an_empty_day_does_not_crash() -> None:
                   fees_usd=D("0"), equity_close=D("1000")),
         skipped={}, slip_in=None, slip_out=None))
     assert "Пропуски покупок: нет" in text and "нет данных" in text
-    assert "Изменение за сутки: +0.00 $ (+0.00%)" in text
+    assert "Изменение за сутки: ⚪ $0,00 (0,00%)" in text
 
 
 def test_a_late_snapshot_is_marked() -> None:
@@ -105,7 +105,7 @@ def test_the_comparison_with_the_virtual_result_is_shown_when_there_are_pairs() 
     assert totals.demo_usd == D("0.038") and totals.virtual_usd == D("0.05")
     text = report.format_report(sample(pairs=totals))
     assert "Против виртуальной прибыли тех же позиций (1)" in text
-    assert "демо +0.0380 $ · виртуально +0.0500 $ · разница -0.0120 $" in text
+    assert "демо +$0,0380 · виртуально +$0,0500 · разница −$0,0120" in text
 
 
 # --- рассылка: после снимка, один раз в сутки ----------------------------------------

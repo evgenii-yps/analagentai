@@ -12,13 +12,14 @@ import types
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 import structlog
 import structlog.testing
 
 from src import export_main
-from src.bot import handlers, poller
+from src.bot import handlers, poller, screens
 from src.core.config import Settings, settings
 from src.demo import ledger
 from src.health import daily_report as health
@@ -59,22 +60,16 @@ def test_the_switch_exists_defaults_to_true_and_is_documented() -> None:
 # §2.2: /positions и справка
 # --------------------------------------------------------------------------
 
-PREVIOUS_POSITIONS_HELP_LINE = "/positions — виртуальные позиции: открытые и итог за 7 дней\n"
+# Этап 9.7: справка переехала в screens.help_screen и команды /positions не показывает ни
+# при каком значении переключателя (она нужна только для прежних данных; в меню команд её нет).
 
 
-def test_help_is_unchanged_when_the_switch_is_on() -> None:
-    on = handlers.render_help(True)
-    assert on == handlers.render_help()                   # по умолчанию — как прежде
-    assert PREVIOUS_POSITIONS_HELP_LINE in on
-    # строка стоит на прежнем месте: между /summary и /demo
-    assert on.index("/summary") < on.index("/positions") < on.index("/demo")
-
-
-def test_help_loses_only_the_positions_line_when_the_switch_is_off() -> None:
-    on, off = handlers.render_help(True), handlers.render_help(False)
-    assert "/positions" not in off
-    assert off == on.replace(PREVIOUS_POSITIONS_HELP_LINE, "")      # ничего другого не тронуто
-    assert "/demo" in off and "/status" in off
+def test_help_never_lists_the_positions_command() -> None:
+    for demo_enabled in (True, False):
+        text, _ = screens.help_screen(
+            flags=screens.Flags(demo_enabled=demo_enabled), coins=["BTC", "ETH"])
+        assert "/positions" not in text
+        assert "/demo" in text and "/status" in text
 
 
 class StubQueries:
@@ -110,6 +105,9 @@ class StubQueries:
     async def freshness_by_instrument(self, instruments):
         return []
 
+    async def spot_instruments(self):
+        return [(1, "BTC/USDT"), (2, "ETH/USDT")]
+
 
 def make_poller(queries: StubQueries) -> poller.BotPoller:
     bot = object.__new__(poller.BotPoller)
@@ -125,6 +123,8 @@ def make_poller(queries: StubQueries) -> poller.BotPoller:
     async def read_refusals(*a, **k):
         return {}
 
+    bot.tz = ZoneInfo("Europe/Moscow")
+    bot.max_rows = 20
     bot._read_heartbeats = heartbeats
     bot._chat_settings = chat_settings
     bot._read_refusals = read_refusals
@@ -134,7 +134,7 @@ def make_poller(queries: StubQueries) -> poller.BotPoller:
 async def test_positions_command_answers_as_before_when_the_switch_is_on(monkeypatch) -> None:
     monkeypatch.setattr(settings, "VIRTUAL_OUTPUT_ENABLED", True)
     queries = StubQueries()
-    reply = await make_poller(queries)._route("/positions", 1)
+    reply = await make_poller(queries)._answer_command("/positions", 1)
     assert "Виртуальные позиции" in reply and "Открытых позиций нет." in reply
     assert "positions_open" in queries.calls
 
@@ -142,19 +142,19 @@ async def test_positions_command_answers_as_before_when_the_switch_is_on(monkeyp
 async def test_positions_command_is_one_line_when_the_switch_is_off(monkeypatch) -> None:
     monkeypatch.setattr(settings, "VIRTUAL_OUTPUT_ENABLED", False)
     queries = StubQueries()
-    reply = await make_poller(queries)._route("/positions", 1)
+    reply = await make_poller(queries)._answer_command("/positions", 1)
     assert reply == "Виртуальные сделки скрыты. Демо-счёт — /demo"
     assert queries.calls == []                         # за позициями в базу не ходили
     assert "demo" in handlers.KNOWN_COMMANDS and "positions" in handlers.KNOWN_COMMANDS
 
 
-async def test_help_command_follows_the_switch(monkeypatch) -> None:
+async def test_help_command_does_not_depend_on_the_switch(monkeypatch) -> None:
     queries = StubQueries()
-    monkeypatch.setattr(settings, "VIRTUAL_OUTPUT_ENABLED", True)
-    assert "/positions" in await make_poller(queries)._route("/help", 1)
-    monkeypatch.setattr(settings, "VIRTUAL_OUTPUT_ENABLED", False)
-    for command in ("/help", "/start"):
-        assert "/positions" not in await make_poller(queries)._route(command, 1)
+    for value in (True, False):
+        monkeypatch.setattr(settings, "VIRTUAL_OUTPUT_ENABLED", value)
+        for command in ("/help", "/start", "/menu"):
+            text, _ = await make_poller(queries)._answer_command(command, 1)
+            assert "/positions" not in text
 
 
 # --------------------------------------------------------------------------
@@ -171,7 +171,7 @@ async def test_status_keeps_the_virtual_section_when_the_switch_is_on(monkeypatc
     monkeypatch.setattr(settings, "VIRTUAL_OUTPUT_ENABLED", True)
     monkeypatch.setattr(settings, "DEMO_ENABLED", True)
     queries = StubQueries(demo_data())
-    text = await make_poller(queries)._route("/status", 1)
+    text = await make_poller(queries)._status_text(NOW, 1)
     assert "Сделки (виртуальные):" in text and "Открытых позиций: 3" in text
     assert "Демо-счёт:" not in text                    # прежний вывод, без добавок
     assert "demo_overview" not in queries.calls
@@ -181,20 +181,20 @@ async def test_status_swaps_the_section_for_the_demo_account_when_off(monkeypatc
     monkeypatch.setattr(settings, "VIRTUAL_OUTPUT_ENABLED", False)
     monkeypatch.setattr(settings, "DEMO_ENABLED", True)
     queries = StubQueries(demo_data())
-    text = await make_poller(queries)._route("/status", 1)
+    text = await make_poller(queries)._status_text(NOW, 1)
     assert "Сделки (виртуальные)" not in text and "Открытых позиций" not in text
     assert "positions_state" not in queries.calls
     assert "<b>Демо-счёт:</b>" in text
-    assert "Баланс итого: $1,002.50" in text
+    assert "Баланс итого: $1 002,50" in text
     assert "Открытых сделок: 2" in text
-    assert "С начала: +0.25%" in text
+    assert "С начала: +0,25%" in text
 
 
 async def test_status_has_no_section_when_off_and_the_demo_is_disabled(monkeypatch) -> None:
     monkeypatch.setattr(settings, "VIRTUAL_OUTPUT_ENABLED", False)
     monkeypatch.setattr(settings, "DEMO_ENABLED", False)
     queries = StubQueries(demo_data())
-    text = await make_poller(queries)._route("/status", 1)
+    text = await make_poller(queries)._status_text(NOW, 1)
     assert "Сделки (виртуальные)" not in text and "Демо-счёт" not in text
     assert queries.calls == []                         # ни виртуальные, ни демо-данные не читались
     assert "Всё работает нормально" in text            # ответ целый, ошибок нет
@@ -208,7 +208,7 @@ async def test_status_survives_a_broken_demo_query(monkeypatch) -> None:
         async def demo_overview(self, days: int = 7):
             raise RuntimeError("таблицы нет")
 
-    text = await make_poller(Broken())._route("/status", 1)
+    text = await make_poller(Broken())._status_text(NOW, 1)
     assert "Демо-счёт" not in text and "Всё работает нормально" in text
 
 

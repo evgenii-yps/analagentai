@@ -443,15 +443,18 @@ class FakeExchange:
 def build_context(
     pool: asyncpg.Pool, exchange: Any, clock: Clock, *, redis: FakeRedis | None = None,
     notified: list[str] | None = None, mirror_since: datetime | None = None,
-    symbols: list[str] | None = None, **config: Any,
+    symbols: list[str] | None = None, sent_kwargs: list[dict[str, Any]] | None = None,
+    **config: Any,
 ):
     """Контекст сервиса с заглушками: часы управляемые, сна нет, уведомления в список."""
     from src.demo import runner
 
     sink = notified if notified is not None else []
 
-    async def notify(text: str) -> bool:
+    async def notify(text: str, **kwargs: Any) -> bool:
         sink.append(text)
+        if sent_kwargs is not None:
+            sent_kwargs.append(kwargs)
         return True
 
     start_capital = Decimal(str(config.pop("start_capital", 1000)))
