@@ -257,53 +257,75 @@ async def _record_sent(ctx: Context, now: datetime) -> None:
 _QUIET_CACHE_SEC = 60
 
 
-async def is_quiet_now(ctx: Context) -> bool:
-    """Сейчас тихие часы получателя? Настройки читаются из ``user_settings`` (кэш 60 с).
+async def is_quiet_for(ctx: Context, chat_id: str) -> bool:
+    """Сейчас тихие часы этого получателя? Настройки читаются из ``user_settings`` (кэш 60 с
+    на каждого получателя).
 
     Хранятся они в UTC и включительно; окно через полночь (23–07) разбирает единая
     :func:`src.core.user_settings.is_quiet_hour`. Нет чата, нет записи или тишина
     выключена — ``False``. ОШИБКА ЧТЕНИЯ — тоже ``False`` (сообщение пойдёт со звуком) и
     предупреждение в журнал: лишний звук лучше пропущенной сделки.
     """
-    chat = ctx.config.chat_id
-    if not chat:
+    if not chat_id:
         return False
     now = ctx.now()
-    cached = ctx.quiet_cache
+    cached = ctx.quiet_cache.get(chat_id)
     if cached is not None and now.timestamp() - cached[0] < _QUIET_CACHE_SEC:
         return is_quiet_hour(cached[1], now)
     try:
         row = await ctx.pool.fetchrow(
-            "SELECT quiet_from, quiet_to FROM user_settings WHERE chat_id = $1;", int(chat)
+            "SELECT quiet_from, quiet_to FROM user_settings WHERE chat_id = $1;", int(chat_id)
         )
         user = UserSettings(
-            chat_id=int(chat),
+            chat_id=int(chat_id),
             quiet_from=None if row is None or row["quiet_from"] is None
             else int(row["quiet_from"]),
             quiet_to=None if row is None or row["quiet_to"] is None else int(row["quiet_to"]),
         )
     except Exception as exc:  # noqa: BLE001 — настройки не важнее сообщения о сделке
-        _log.warning("demo_quiet_hours_read_failed=1", error=str(exc))
+        _log.warning("demo_quiet_hours_read_failed=1", chat_id=chat_id, error=str(exc))
         return False
-    ctx.quiet_cache = (now.timestamp(), user)
+    ctx.quiet_cache[chat_id] = (now.timestamp(), user)
     return is_quiet_hour(user, now)
 
 
 async def deliver(
     ctx: Context, text: str, *, reply_markup: dict[str, Any] | None = None,
     quiet_aware: bool = True,
-) -> Any:
-    """Одна отправка через ``ctx.notify``. Сообщения о сделках и сводка — ``quiet_aware``:
-    в тихие часы они приходят без звука, но приходят. Алерты (``quiet_aware=False``) — всегда
-    со звуком.
+) -> bool:
+    """Отправка через ``ctx.notify``.
+
+    ``quiet_aware`` (сообщения о сделках и сводки): отдельная отправка КАЖДОМУ получателю,
+    у каждого свои тихие часы — в тишине сообщение приходит без звука, но приходит.
+    Алерты (``quiet_aware=False``) — одна рассылка без адреса (``send_message`` сама шлёт
+    всем получателям), всегда со звуком. Получателей в настройках нет — тоже рассылка.
+
+    Результат истинный, если дошло ХОТЯ БЫ ОДНОМУ. Сбой одного не мешает остальным;
+    исключение пробрасывается, только если не дошло никому и хоть один вызов упал.
     """
     assert ctx.notify is not None
-    kwargs: dict[str, Any] = {}
-    if reply_markup is not None:
-        kwargs["reply_markup"] = reply_markup
-    if quiet_aware and await is_quiet_now(ctx):
-        kwargs["disable_notification"] = True
-    return await ctx.notify(text, **kwargs)
+    recipients = ctx.config.recipients
+    if not quiet_aware or not recipients:
+        kwargs: dict[str, Any] = {}
+        if reply_markup is not None:
+            kwargs["reply_markup"] = reply_markup
+        return bool(await ctx.notify(text, **kwargs))
+    delivered = False
+    failure: Exception | None = None
+    for chat in recipients:
+        kwargs = {"chat_id": chat}
+        if reply_markup is not None:
+            kwargs["reply_markup"] = reply_markup
+        if await is_quiet_for(ctx, chat):
+            kwargs["disable_notification"] = True
+        try:
+            delivered = bool(await ctx.notify(text, **kwargs)) or delivered
+        except Exception as exc:  # noqa: BLE001 — сбой одного получателя не мешает остальным
+            failure = exc
+            _log.warning("demo_notify_failed=1", chat_id=chat, error=str(exc))
+    if not delivered and failure is not None:
+        raise failure
+    return delivered
 
 
 async def send_trade_message(ctx: Context, text: str) -> None:

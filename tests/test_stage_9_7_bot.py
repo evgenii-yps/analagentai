@@ -618,7 +618,7 @@ def quiet_ctx(pool: QuietPool, hour_utc: int, **config):
         sent.append((text, kwargs))
         return True
 
-    cfg = runner.DemoConfig(host="www.okx.com", chat_id="777", **config)
+    cfg = runner.DemoConfig(host="www.okx.com", recipients=("777",), **config)
     ctx = runner.Context(pool=pool, exchange=None, redis=FakeRedis(), config=cfg, symbols=[],
                          notify=notify, now=clock.now)
     return ctx, clock, sent
@@ -649,7 +649,7 @@ async def test_the_quiet_window_is_not_lost_or_delayed_just_silenced() -> None:
 async def test_alerts_are_always_loud_even_inside_the_quiet_window() -> None:
     ctx, _, sent = quiet_ctx(QuietPool(), hour_utc=23)
     await runner.alert(ctx, "no_balance", "мало USDT")
-    assert len(sent) == 1 and sent[0][1] == {}                           # без disable_notification
+    assert len(sent) == 1 and sent[0][1] == {}                           # рассылка всем, со звуком
     assert "disable_notification" not in sent[0][1]
 
 
@@ -667,7 +667,7 @@ async def test_no_settings_row_or_quiet_off_means_loud() -> None:
         await messages.send_trade_message(ctx, "сделка")
         assert "disable_notification" not in sent[0][1]
     ctx, _, sent = quiet_ctx(QuietPool(), hour_utc=23)
-    ctx.config = runner.DemoConfig(host="www.okx.com")                   # чата нет
+    ctx.config = runner.DemoConfig(host="www.okx.com")                   # получателей нет
     await messages.send_trade_message(ctx, "сделка")
     assert "disable_notification" not in sent[0][1]
 
@@ -690,10 +690,10 @@ async def test_the_rollup_and_the_daily_report_follow_the_quiet_window() -> None
     assert await messages.flush_rollup(ctx) is True
     rollup_text, rollup_kwargs = sent[-1]
     assert "Придержано сообщений" in rollup_text
-    assert rollup_kwargs["disable_notification"] is True
+    assert rollup_kwargs["disable_notification"] is True and rollup_kwargs["chat_id"] == "777"
     sent.clear()
     await messages.deliver(ctx, "суточная сводка")
-    assert sent[0][1] == {"disable_notification": True}
+    assert sent[0][1] == {"chat_id": "777", "disable_notification": True}
 
 
 def test_the_demo_uses_the_one_shared_window_function() -> None:
@@ -720,7 +720,8 @@ async def test_the_daily_report_goes_through_the_quiet_aware_sender(monkeypatch)
 
     monkeypatch.setattr(report, "collect", collect)
     assert await report.daily_report(ctx) is True
-    assert sent[0][1] == {"disable_notification": True} and "сводка за" in sent[0][0]
+    assert sent[0][1] == {"chat_id": "777", "disable_notification": True}
+    assert "сводка за" in sent[0][0]
 
 
 # --------------------------------------------------------------------------

@@ -88,8 +88,9 @@ class DemoConfig:
     notify_enabled: bool = True
     trades_max_per_hour: int = 0
     timezone: str = "Europe/Moscow"
-    # Чат получателя: по нему читаются тихие часы (``user_settings``). Пусто — со звуком.
-    chat_id: str = ""
+    # Получатели сообщений (``settings.telegram_recipients``): у КАЖДОГО свои тихие часы
+    # (``user_settings``). Пусто — рассылка без адреса и со звуком.
+    recipients: tuple[str, ...] = ()
 
     @classmethod
     def from_settings(cls, cfg: Any) -> DemoConfig:
@@ -103,7 +104,7 @@ class DemoConfig:
             notify_enabled=bool(cfg.DEMO_NOTIFY_ENABLED),
             trades_max_per_hour=int(cfg.NOTIFY_TRADES_MAX_PER_HOUR),
             timezone=str(cfg.NOTIFY_TIMEZONE),
-            chat_id=str(cfg.TELEGRAM_CHAT_ID or ""),
+            recipients=tuple(str(chat) for chat in cfg.telegram_recipients),
         )
 
 
@@ -138,8 +139,8 @@ class Context:
     halted: str | None = None
     # Свободный USDT, прочитанный на этой итерации (None — ещё не читали).
     usdt_free: Decimal | None = None
-    # Кэш тихих часов получателя: (момент чтения, настройки). Живёт 60 с.
-    quiet_cache: tuple[float, Any] | None = None
+    # Кэш тихих часов по получателям: chat_id -> (момент чтения, настройки). Живёт 60 с.
+    quiet_cache: dict[str, tuple[float, Any]] = field(default_factory=dict)
 
     @property
     def tz(self) -> ZoneInfo:

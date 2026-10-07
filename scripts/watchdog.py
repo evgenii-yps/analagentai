@@ -30,8 +30,6 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-import urllib.parse
-import urllib.request
 from datetime import UTC, datetime
 
 APP_DIR = os.environ.get("APP_DIR", "/opt/agent-trade")
@@ -40,6 +38,7 @@ APP_DIR = os.environ.get("APP_DIR", "/opt/agent-trade")
 sys.path.insert(0, os.path.join(APP_DIR, "src", "health"))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "health"))
 import disk_forecast  # noqa: E402
+import tg_recipients  # noqa: E402
 
 # Этап 9.5: контейнер demo в списке (решение архитектора). Он работает и при
 # DEMO_ENABLED=false (простаивает и пишет heartbeat), поэтому «не running» — всегда сбой:
@@ -155,29 +154,24 @@ def _alert_allowed(reason: str, redis_up: bool, ttl_sec: int = 3600) -> bool:
     return r.returncode == 0 and r.stdout.strip().upper() == "OK"
 
 
-def _telegram(text: str) -> None:
+def _recipients(env: dict[str, str]) -> list[str]:
+    """Получатели тревог: TELEGRAM_CHAT_ID, затем BOT_ALLOWED_CHAT_IDS, без повторов."""
+    return tg_recipients.recipients(env)
+
+
+def _telegram(text: str) -> bool:
+    """Шлёт тревогу каждому получателю. Успех — если дошло хотя бы одному."""
     token = os.environ.get("TELEGRAM_BOT_TOKEN", ENV.get("TELEGRAM_BOT_TOKEN", ""))
-    chat = os.environ.get("TELEGRAM_CHAT_ID", ENV.get("TELEGRAM_CHAT_ID", ""))
-    if not token or not chat:
+    chats = _recipients({**ENV, **os.environ})
+    if not token or not chats:
         _log("Telegram не настроен — алерт не отправлен.")
-        return
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    data = urllib.parse.urlencode({
-        "chat_id": chat, "text": text, "parse_mode": "HTML",
-        "disable_web_page_preview": "true",
-    }).encode("utf-8")
-    ca_file = os.environ.get("SSL_CERT_FILE")
-    try:
-        req = urllib.request.Request(url, data=data)
-        if ca_file:
-            import ssl
-            ctx = ssl.create_default_context(cafile=ca_file)
-            urllib.request.urlopen(req, timeout=10, context=ctx).read()
-        else:
-            urllib.request.urlopen(req, timeout=10).read()
+        return False
+    delivered, failed = tg_recipients.send_all(token, chats, text, timeout=10)
+    for chat, reason in failed.items():
+        _log(f"Не удалось отправить алерт в Telegram (chat_id={chat}): {reason}")
+    if delivered:
         _log("Алерт отправлен в Telegram.")
-    except Exception as exc:  # noqa: BLE001
-        _log(f"Не удалось отправить алерт в Telegram: {exc}")
+    return bool(delivered)
 
 
 def _container_states() -> dict[str, str]:
