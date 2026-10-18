@@ -3,7 +3,7 @@
 # Этап 9.9 — итог версии логики 7 (замер, только чтение)
 
 Основа: `main` = `8952bcf` (Этап 9.6). Перед началом `git fetch origin && git branch -r`: `origin/main` = `8952bcf`,
-не новее — работа ведётся от него. Рабочая ветка `claude/new-session-0kxxzs`. Коммит этапа — `__HASH__`.
+не новее — работа ведётся от него. Рабочая ветка `claude/new-session-0kxxzs`. Коммит этапа — `d236693`.
 Слияние в `main` (`--ff-only`) — после приёмки архитектором; в этой ветке оно НЕ сделано.
 
 ## 1. Что сделано
@@ -31,9 +31,9 @@
 |---|---|---|
 | 1 | Первая строка отчёта `9.9 редакция 1`; хэш и основа указаны | да (выше) |
 | 2 | Дифф `src/`, `db/migrations/`, `docker-compose.yml`, `.env.example` пуст; `LOGIC_VERSION` прежний | да, `git diff --stat 8952bcf..HEAD -- src db docker-compose.yml .env.example` пуст |
-| 3 | `pytest` без новых пропусков; `ruff` 0.8.4 — 0; `bash -n` новых `.sh` | __PYTEST__; ruff: `All checks passed!`; `bash -n` — `test_the_new_shell_scripts_pass_bash_n` |
+| 3 | `pytest` без новых пропусков; `ruff` 0.8.4 — 0; `bash -n` новых `.sh` | `1785 passed, 98 skipped` (до этапа `1736 passed, 98 skipped`: +49 новых, пропусков не больше); ruff: `All checks passed!`; `bash -n` — `test_the_new_shell_scripts_pass_bash_n` |
 | 4 | Все мутации §6 ловятся | да, §3 ниже |
-| 5 | `run_9_9.sh` на тестовой базе: 10 блоков, ≤ 300 строк, пароля нет | `test_run_9_9_runs_all_ten_blocks_in_a_read_only_report` (60 позиций, 5 монет, 8 недель — __LINES__ строк), `test_run_9_9_never_prints_the_password` |
+| 5 | `run_9_9.sh` на тестовой базе: 10 блоков, ≤ 300 строк, пароля нет | `test_run_9_9_runs_all_ten_blocks_in_a_read_only_report` (60 позиций, 5 монет, 8 недель, тест проверяет ≤ 300 строк; на трёх монетах и 20 днях — 154 строки), `test_run_9_9_never_prints_the_password` |
 | 6 | `run_7_1.sh` до/после выноса даёт тот же вывод | `test_run_7_1_gives_the_same_output_before_and_after_the_extraction` (код возврата и текст равны; убраны только даты, путь и `now()` блока 00) |
 | 7 | Этот файл: что сделано, отклонения, команда запуска | §1, §5, §6 |
 
