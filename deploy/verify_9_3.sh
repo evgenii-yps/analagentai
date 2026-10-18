@@ -58,6 +58,10 @@ BEFORE="${OUT_DIR}/snapshot_9_3_before.txt"
 # Имя названо §14.3 буквально, и записано здесь тоже буквально: путь,
 # собранный из переменных, невозможно сверить с требованием глазами.
 METRICS="${APP_DIR}/analysis_out/verify_9_3_metrics.txt"
+# Общий помощник (Этап 9.9): строка запуска читается в обоих форматах журнала — JSON и key=value.
+# Служба пишет её консольным форматом structlog, и поиск только по образцу JSON находил «ничего».
+# shellcheck source=deploy/lib_verify.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib_verify.sh"
 
 cd "${APP_DIR}" || { echo "Нет каталога ${APP_DIR}"; exit 2; }
 mkdir -p "${OUT_DIR}" 2>/dev/null || true
@@ -129,34 +133,30 @@ echo
 
 # --- 2. Строки запуска обеих служб (§8 ТЗ) ----------------------------------
 echo "2. Строки запуска служб"
-pos_line="$(docker compose logs --since 24h --no-color positions 2>/dev/null \
-            | grep -F 'cooldown_sec' | tail -1 || true)"
+pos_logs="$(docker compose logs --since 24h --no-color positions 2>/dev/null || true)"
+pos_line="$(startup_line "${pos_logs}" cooldown_sec)"
 if [ -z "${pos_line}" ]; then
   note_skip "в журнале positions за сутки нет строки запуска — перезапускалась ли служба?"
 else
   ok=1
-  for field in '"logic_version": 7' '"max_open": 0' '"slot_usd": 2' \
-               '"budget_usd": 0' '"min_probability": 0.8' \
-               '"max_hold_hours": 48' '"plus_wait_start_hours": 24' \
-               '"cooldown_sec": 3600' '"one_per_token": false'; do
-    echo "${pos_line}" | grep -qF "${field}" \
-      || { note_stop "в строке запуска positions нет ${field}"; ok=0; }
+  for pair in logic_version=7 max_open=0 slot_usd=2 budget_usd=0 min_probability=0.8 \
+              max_hold_hours=48 plus_wait_start_hours=24 cooldown_sec=3600 one_per_token=false; do
+    startup_eq "${pos_line}" "${pair%%=*}" "${pair#*=}" \
+      || { note_stop "в строке запуска positions нет ${pair%%=*}=${pair#*=}"; ok=0; }
   done
   [ "${ok}" = 1 ] && note_ok "positions называет все девять величин §8"
 fi
 
-notify_line="$(docker compose logs --since 24h --no-color notify 2>/dev/null \
-               | grep -F 'notify_daily_summary_utc' | tail -1 || true)"
+notify_logs="$(docker compose logs --since 24h --no-color notify 2>/dev/null || true)"
+notify_line="$(startup_line "${notify_logs}" notify_daily_summary_utc)"
 if [ -z "${notify_line}" ]; then
   note_skip "в журнале notify за сутки нет строки запуска — перезапускалась ли служба?"
 else
   ok=1
-  for field in '"notify_signals_enabled": false' \
-               '"notify_trades_enabled": true' \
-               '"notify_daily_summary_utc": "06:00"' \
-               '"notify_trades_max_per_hour": 0'; do
-    echo "${notify_line}" | grep -qF "${field}" \
-      || { note_stop "в строке запуска notify нет ${field}"; ok=0; }
+  for pair in notify_signals_enabled=false notify_trades_enabled=true \
+              notify_daily_summary_utc=06:00 notify_trades_max_per_hour=0; do
+    startup_eq "${notify_line}" "${pair%%=*}" "${pair#*=}" \
+      || { note_stop "в строке запуска notify нет ${pair%%=*}=${pair#*=}"; ok=0; }
   done
   [ "${ok}" = 1 ] && note_ok "notify называет все четыре величины §8"
 fi

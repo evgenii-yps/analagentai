@@ -28,6 +28,9 @@ APP_DIR="${APP_DIR:-/opt/agent-trade}"
 DB_USER="${POSTGRES_USER:-agenttrade}"
 DB_NAME="${POSTGRES_DB:-agenttrade}"
 ENV_FILE="${APP_DIR}/.env"
+# Общий помощник (Этап 9.9): строка запуска читается в обоих форматах журнала — JSON и key=value.
+# shellcheck source=deploy/lib_verify.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib_verify.sh"
 HOURS=24
 TOLERANCE="0.01"          # допуск проверки потолка, долларов (ТЗ 9.6, п. 7 критериев приёмки)
 RESERVE_TOLERANCE="0.05"  # допуск резерва: сумма покупки на бирже расходится с заявленной на центы
@@ -106,19 +109,20 @@ else
 fi
 
 # --- 3. Строка запуска: пять величин правила совпадают с .env --------------------------------
-echo "3. Строка запуска demo (JSON): пять величин правила и .env"
+echo "3. Строка запуска demo: пять величин правила и .env"
 logs="$(docker compose logs --no-color --tail 20000 demo 2>/dev/null || true)"
-startup="$(printf '%s\n' "${logs}" | grep -E '"mm_enabled"' | tail -1 || true)"
+# Служба пишет строку запуска консольным форматом (mm_enabled=True ...), а при JSON-рендерере —
+# "mm_enabled": true; lib_verify.sh находит последнюю строку и читает значения в обоих форматах.
+startup="$(startup_line "${logs}" mm_enabled)"
 started_at=""
 if [ -z "${startup}" ]; then
   skip "строки запуска с mm_enabled нет в журнале — контейнер не пересоздан после обновления кода?"
   advice "пересоздайте сервис: docker compose --profile \"*\" build --no-cache && docker compose up -d --force-recreate demo bot"
 else
-  json_str() { printf '%s' "${startup}" | grep -oE "\"$1\": ?\"[^\"]*\"" | head -1 | sed -E 's/^[^:]*: ?"//; s/"$//' || true; }
-  json_raw() { printf '%s' "${startup}" | grep -oE "\"$1\": ?[a-z]+" | head -1 | sed -E 's/^[^:]*: ?//' || true; }
-  started_at="$(json_str timestamp)"
-  l_enabled="$(json_raw mm_enabled)"; l_reserve="$(json_str mm_reserve_pct)"; l_step="$(json_str mm_step_pct)"
-  l_cap="$(json_str mm_token_cap_pct)"; l_min="$(json_str mm_min_order_usd)"
+  started_at="$(startup_ts "${startup}")"
+  l_enabled="$(startup_val "${startup}" mm_enabled)"; l_reserve="$(startup_val "${startup}" mm_reserve_pct)"
+  l_step="$(startup_val "${startup}" mm_step_pct)"; l_cap="$(startup_val "${startup}" mm_token_cap_pct)"
+  l_min="$(startup_val "${startup}" mm_min_order_usd)"
   echo "  ⓘ в журнале: mm_enabled=${l_enabled}, резерв ${l_reserve}, шаг ${l_step}, потолок ${l_cap}, минимум ${l_min} (запуск ${started_at:-?})"
   mismatch=""
   [ "${l_enabled}" = "${mm_enabled_env}" ] || mismatch+=" DEMO_MM_ENABLED"
