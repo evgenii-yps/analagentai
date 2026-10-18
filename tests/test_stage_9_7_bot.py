@@ -743,8 +743,9 @@ def test_no_new_dependencies_and_no_migrations_were_added() -> None:
     assert "httpx==0.28.1" in requirements
     migrations = sorted(p.name for p in (ROOT / "db" / "migrations").glob("*.sql")
                         if not p.name.endswith("_rollback.sql"))
-    # этап 9.7 миграций не добавлял: после 030 есть только миграция этапа 9.6
-    assert [m for m in migrations if m[:3] > "030"] == ["031_demo_sizing.sql"]
+    # этап 9.7 миграций не добавлял: после 030 есть миграция этапа 9.6 и (позже) миграция 9.10
+    assert [m for m in migrations if m[:3] > "030"] == [
+        "031_demo_sizing.sql", "032_ro_backtest_read.sql"]
 
 
 def test_the_logic_version_is_untouched() -> None:
