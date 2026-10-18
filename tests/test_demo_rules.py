@@ -165,6 +165,11 @@ def test_pair_pnl() -> None:
     assert pct == D("2.4")
     loss, loss_pct = rules.pair_pnl(D("2"), D("1.99"), D("0.002"))
     assert loss == D("-0.012") and loss_pct == D("-0.6")
+    # комиссия покупки в USDT вычитается, как в ledger.pair_profit; процент — от потраченного
+    fee_profit, fee_pct = rules.pair_pnl(D("2"), D("2.05"), D("0.002"), D("0.002"))
+    assert fee_profit == D("0.046")
+    assert fee_pct == D("0.046") / D("2.002") * 100
+    assert rules.pair_pnl(D("2"), D("2.05"), D("0.002"), D("0")) == (profit, pct)
     with pytest.raises(ValueError):
         rules.pair_pnl(D("0"), D("1"), D("0"))
 

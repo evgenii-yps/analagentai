@@ -175,6 +175,28 @@ async def fetch_reserved(db: Any) -> Decimal:
     return Decimal(str(value))
 
 
+async def fetch_token_exposure(db: Any) -> dict[int, Decimal]:
+    """Вложено в каждую монету (instrument_id → $): купленные и не проданные ноги по цене
+    покупки (``cost_usd``) плюс суммы под покупками с неизвестным исходом
+    (``requested_cost_usd`` у buy в статусах ``pending``/``sent``).
+
+    Вложенное, а не текущая стоимость: основа потолка на монету (манименеджмент, этап 9.6).
+    Условие «не продана» то же, что в ``fetch_held_legs``. Отклонённые и пропущенные
+    покупки денег не держат и не считаются.
+    """
+    rows = await db.fetch(
+        "SELECT b.instrument_id, "
+        "sum(CASE WHEN b.status = 'filled' THEN COALESCE(b.cost_usd, b.requested_cost_usd) "
+        "ELSE b.requested_cost_usd END) AS exposure "
+        "FROM demo_orders b WHERE b.leg = 'buy' AND ("
+        "(b.status = 'filled' AND NOT EXISTS (SELECT 1 FROM demo_orders s "
+        "WHERE s.position_id = b.position_id AND s.leg = 'sell' AND s.status = 'filled')) "
+        "OR b.status IN ('pending', 'sent')) "
+        "GROUP BY b.instrument_id;"
+    )
+    return {int(r["instrument_id"]): Decimal(str(r["exposure"] or 0)) for r in rows}
+
+
 async def fetch_held_legs(db: Any, asof: datetime | None = None) -> list[dict[str, Any]]:
     """Купленные и ещё не проданные ноги (покупка исполнена, продажа — нет)."""
     rows = await db.fetch(

@@ -5,7 +5,8 @@
   0. восстановление — строки ``pending``/``sent`` разбираются запросом ордера по
      ``clOrdId``; повторно такой ордер НЕ отправляется никогда;
   1. продажи — закрытые позиции, у которых есть выполненная покупка и нет продажи;
-  2. покупки — открытые позиции без строки покупки.
+  2. покупки — открытые позиции без строки покупки; размер покупки — по правилу
+     манименеджмента (этап 9.6, ``DEMO_MM_ENABLED``) или ``positions.notional_usd``.
 
 ПРОДАЖИ ИДУТ РАНЬШЕ ПОКУПОК: освободившиеся деньги и размер счёта нужны покупкам, а
 не наоборот, и продажа уже купленного не должна ждать новых покупок.
@@ -91,6 +92,12 @@ class DemoConfig:
     # Получатели сообщений (``settings.telegram_recipients``): у КАЖДОГО свои тихие часы
     # (``user_settings``). Пусто — рассылка без адреса и со звуком.
     recipients: tuple[str, ...] = ()
+    # Этап 9.6: манименеджмент. Выключен — размер покупки ``positions.notional_usd``.
+    mm_enabled: bool = False
+    mm_reserve_pct: Decimal = Decimal(25)
+    mm_step_pct: Decimal = Decimal(5)
+    mm_token_cap_pct: Decimal = Decimal(15)
+    mm_min_order_usd: Decimal = Decimal(5)
 
     @classmethod
     def from_settings(cls, cfg: Any) -> DemoConfig:
@@ -105,6 +112,11 @@ class DemoConfig:
             trades_max_per_hour=int(cfg.NOTIFY_TRADES_MAX_PER_HOUR),
             timezone=str(cfg.NOTIFY_TIMEZONE),
             recipients=tuple(str(chat) for chat in cfg.telegram_recipients),
+            mm_enabled=bool(cfg.DEMO_MM_ENABLED),
+            mm_reserve_pct=Decimal(str(cfg.DEMO_MM_RESERVE_PCT)),
+            mm_step_pct=Decimal(str(cfg.DEMO_MM_STEP_PCT)),
+            mm_token_cap_pct=Decimal(str(cfg.DEMO_MM_TOKEN_CAP_PCT)),
+            mm_min_order_usd=Decimal(str(cfg.DEMO_MM_MIN_ORDER_USD)),
         )
 
 
@@ -160,11 +172,15 @@ class IterStats:
     dust: int = 0
     rejected: int = 0
     no_capital: int = 0
+    # Этап 9.6: покупки, не сделанные правилом размера (штатная работа, не сбой).
+    token_cap: int = 0
+    reserve: int = 0
 
     def any(self) -> bool:
         return bool(
             self.recovered or self.lost or self.sells or self.buys
             or self.skipped or self.dust or self.rejected
+            or self.token_cap or self.reserve
         )
 
 
@@ -314,18 +330,26 @@ async def _insert_row(
     skip_reason: str | None = None, requested_cost: Decimal | None = None,
     requested_qty: Decimal | None = None, virtual_price: Any = None,
     virtual_ts: datetime, exit_reason: str | None = None,
+    sizing_rule: str | None = None,
+    sizing: tuple[Decimal, Decimal] | None = None,
 ) -> int | None:
-    """Вставляет строку ноги. ``None`` — строка уже есть (другая итерация успела)."""
+    """Вставляет строку ноги. ``None`` — строка уже есть (другая итерация успела).
+
+    Этап 9.6, только для покупок: ``sizing_rule`` — ``mm1``/``fixed``; ``sizing`` — пара
+    «баланс, вложено в монету до покупки», с которой правило посчитало сумму.
+    """
+    sizing_equity, sizing_exposure = sizing if sizing is not None else (None, None)
     value = await ctx.pool.fetchval(
         "INSERT INTO demo_orders (position_id, instrument_id, leg, status, "
         "skip_reason, cl_ord_id, symbol, host, requested_cost_usd, requested_qty, "
-        "virtual_price, virtual_ts, exit_reason) "
-        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) "
+        "virtual_price, virtual_ts, exit_reason, sizing_rule, sizing_equity_usd, "
+        "sizing_exposure_usd) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) "
         "ON CONFLICT DO NOTHING RETURNING id;",
         int(pos["id"]), int(pos["instrument_id"]), leg, status, skip_reason,
         rules.cl_ord_id(int(pos["id"]), leg), str(pos["symbol"]),
         ctx.config.host, requested_cost, requested_qty, virtual_price, virtual_ts,
-        exit_reason,
+        exit_reason, sizing_rule, sizing_equity, sizing_exposure,
     )
     return int(value) if value is not None else None
 
@@ -704,13 +728,18 @@ def _buy_candidates_sql() -> str:
     )
 
 
+def _sizing_rule_name(ctx: Context) -> str:
+    return rules.SIZING_MM1 if ctx.config.mm_enabled else rules.SIZING_FIXED
+
+
 async def _skip_buy(
-    ctx: Context, pos: dict[str, Any], reason: str, stats: IterStats
+    ctx: Context, pos: dict[str, Any], reason: str, stats: IterStats,
+    sizing: tuple[Decimal, Decimal] | None = None,
 ) -> None:
     row_id = await _insert_row(
         ctx, pos=pos, leg=rules.LEG_BUY, status=rules.STATUS_SKIPPED,
         skip_reason=reason, virtual_price=pos["entry_price"],
-        virtual_ts=pos["opened_at"],
+        virtual_ts=pos["opened_at"], sizing_rule=_sizing_rule_name(ctx), sizing=sizing,
     )
     if row_id is not None:
         stats.skipped[reason] = stats.skipped.get(reason, 0) + 1
@@ -723,9 +752,30 @@ async def _free_usdt(ctx: Context) -> Decimal:
     return ctx.usdt_free
 
 
+@dataclass
+class _MmState:
+    """Вход правила размера на одну итерацию покупок: баланс, свободные деньги, вложено."""
+
+    equity: Decimal
+    free_cash: Decimal
+    exposure: dict[int, Decimal]
+
+
+async def _load_mm_state(ctx: Context) -> _MmState:
+    state = await ledger.ledger_state(ctx, ctx.now())
+    return _MmState(
+        equity=state.equity,
+        free_cash=state.cash - await ledger.fetch_reserved(ctx.pool),
+        exposure=await ledger.fetch_token_exposure(ctx.pool),
+    )
+
+
 async def run_buys(ctx: Context, stats: IterStats) -> None:
     assert ctx.mirror_since is not None
     rows = await ctx.pool.fetch(_buy_candidates_sql(), ctx.mirror_since)
+    # Состояние для правила размера считается один раз за вызов и лениво: итерация без
+    # кандидатов, дошедших до правила, не делает ни одного лишнего запроса.
+    mm: _MmState | None = None
     for record in rows:
         pos = dict(record)
         if str(pos["symbol"]) not in ctx.valid_symbols:
@@ -742,7 +792,6 @@ async def run_buys(ctx: Context, stats: IterStats) -> None:
             continue
         if ctx.halted:
             return
-        cost = rules.order_cost_usd(pos)
         try:
             free = await _free_usdt(ctx)
         except Exception as exc:  # noqa: BLE001
@@ -760,6 +809,35 @@ async def run_buys(ctx: Context, stats: IterStats) -> None:
                 f"{ctx.config.min_usdt_balance}; покупки не делаются",
             )
             continue
+        # РАЗМЕР ПОКУПКИ. Манименеджмент (этап 9.6) — ПОСЛЕ no_balance, ДО no_capital.
+        # Пропуск по правилу — штатная работа, не сбой: без алерта.
+        instrument_id = int(pos["instrument_id"])
+        sizing: tuple[Decimal, Decimal] | None = None
+        if ctx.config.mm_enabled:
+            if mm is None:
+                try:
+                    mm = await _load_mm_state(ctx)
+                except Exception as exc:  # noqa: BLE001 — лучше пропустить итерацию
+                    _log.warning("demo_mm_state_failed=1", error=_safe_error_text(ctx, exc))
+                    return
+            held = mm.exposure.get(instrument_id, Decimal(0))
+            sizing = (mm.equity, held)
+            cost, why = rules.mm_order_cost(
+                mm.equity, mm.free_cash, held,
+                step_pct=ctx.config.mm_step_pct,
+                token_cap_pct=ctx.config.mm_token_cap_pct,
+                reserve_pct=ctx.config.mm_reserve_pct,
+                min_order_usd=ctx.config.mm_min_order_usd,
+            )
+            if why is not None:
+                await _skip_buy(ctx, pos, why, stats, sizing)
+                if why == rules.SKIP_TOKEN_CAP:
+                    stats.token_cap += 1
+                else:
+                    stats.reserve += 1
+                continue
+        else:
+            cost = rules.order_cost_usd(pos)
         # КАПИТАЛ УЧЁТА (редакция 2): ПОСЛЕ no_balance и ДО вставки pending. Свободные
         # деньги — cash за вычетом сумм под ордерами, исход которых ещё неизвестен.
         # Равенство проходит: cash == стоимости покупки — деньги на неё есть.
@@ -770,7 +848,7 @@ async def run_buys(ctx: Context, stats: IterStats) -> None:
             _log.warning("demo_cash_failed=1", error=_safe_error_text(ctx, exc))
             return
         if cash < cost:
-            await _skip_buy(ctx, pos, rules.SKIP_NO_CAPITAL, stats)
+            await _skip_buy(ctx, pos, rules.SKIP_NO_CAPITAL, stats, sizing)
             stats.no_capital += 1
             await alert(
                 ctx, "no_capital",
@@ -781,7 +859,7 @@ async def run_buys(ctx: Context, stats: IterStats) -> None:
         row_id = await _insert_row(
             ctx, pos=pos, leg=rules.LEG_BUY, status=rules.STATUS_PENDING,
             requested_cost=cost, virtual_price=pos["entry_price"],
-            virtual_ts=pos["opened_at"],
+            virtual_ts=pos["opened_at"], sizing_rule=_sizing_rule_name(ctx), sizing=sizing,
         )
         if row_id is None:
             continue
@@ -799,6 +877,9 @@ async def run_buys(ctx: Context, stats: IterStats) -> None:
         )
         if verdict in ("filled", "sent"):
             ctx.usdt_free = free - cost
+            if mm is not None:
+                mm.free_cash -= cost
+                mm.exposure[instrument_id] = mm.exposure.get(instrument_id, Decimal(0)) + cost
         _count(stats, rules.LEG_BUY, verdict)
 
 
@@ -863,8 +944,20 @@ def startup_fields(ctx: Context) -> dict[str, Any]:
         "notify_enabled": ctx.config.notify_enabled,
         "trades_max_per_hour": ctx.config.trades_max_per_hour,
         "timezone": ctx.config.timezone,
+        "mm_enabled": ctx.config.mm_enabled,
+        "mm_reserve_pct": str(ctx.config.mm_reserve_pct),
+        "mm_step_pct": str(ctx.config.mm_step_pct),
+        "mm_token_cap_pct": str(ctx.config.mm_token_cap_pct),
+        "mm_min_order_usd": str(ctx.config.mm_min_order_usd),
         "instruments": list(ctx.symbols),
     }
+
+
+def mm_overcommitted(config: DemoConfig, tokens: int) -> bool:
+    """Резерв + потолок × число монет > 100 % баланса (только предупреждение)."""
+    return config.mm_enabled and (
+        config.mm_reserve_pct + config.mm_token_cap_pct * tokens > 100
+    )
 
 
 async def run(
@@ -873,6 +966,13 @@ async def run(
 ) -> None:
     """Вечный цикл. Не падает при ошибках итерации; ``report`` — суточная сводка."""
     _log.info("Сервис demo запущен (демо-счёт OKX, спот)", **startup_fields(ctx))
+    if mm_overcommitted(ctx.config, len(ctx.symbols)):
+        _log.warning(
+            "demo_mm_overcommit=1", reserve_pct=str(ctx.config.mm_reserve_pct),
+            token_cap_pct=str(ctx.config.mm_token_cap_pct), tokens=len(ctx.symbols),
+            note="резерв + потолок × число монет > 100%: работать не мешает, резерв "
+                 "соблюдается проверкой правила размера",
+        )
     while True:
         try:
             stats = await run_once(ctx)
@@ -881,6 +981,7 @@ async def run(
                     "demo_iteration=1", recovered=stats.recovered, lost=stats.lost,
                     sells=stats.sells, buys=stats.buys, skipped=stats.skipped,
                     dust=stats.dust, rejected=stats.rejected, no_capital=stats.no_capital,
+                    token_cap=stats.token_cap, reserve=stats.reserve,
                 )
             if report is not None:
                 await report(ctx)

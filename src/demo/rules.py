@@ -35,6 +35,15 @@ SKIP_NO_BALANCE = "no_balance"
 SKIP_NO_CAPITAL = "no_capital"
 # Пропуск ПРОДАЖИ: купленного меньше минимального ордера биржи.
 SKIP_DUST = "below_min_size"
+# Этап 9.6 (манименеджмент): монета упёрлась в свой потолок / покупка залезла бы в резерв.
+SKIP_TOKEN_CAP = "token_cap"
+SKIP_RESERVE = "reserve"
+
+# Значения ``demo_orders.sizing_rule`` (ограничение миграции 031).
+SIZING_FIXED = "fixed"
+SIZING_MM1 = "mm1"
+
+_CENT = Decimal("0.01")
 
 # Префикс clOrdId: «at» — Agent Trade, «95» — этап. Только буквы и цифры (требование
 # OKX к clOrdId), не длиннее 32 символов.
@@ -45,11 +54,50 @@ _CL_MAX_LEN = 32
 def order_cost_usd(position: dict[str, Any]) -> Decimal:
     """Сумма рыночной покупки в долларах — ЕДИНСТВЕННОЕ место, где она решается.
 
-    Этап 9.5: ровно ``positions.notional_usd`` (сейчас $2). Этап 9.6
-    (манименеджмент) заменит только эту функцию. Размер ВИРТУАЛЬНЫХ позиций она
-    не меняет и менять не может: читает позицию, а не пишет.
+    Этап 9.5: ровно ``positions.notional_usd`` (сейчас $2). С этапа 9.6 это размер
+    при ``DEMO_MM_ENABLED=false``; при включённом манименеджменте сумму решает
+    ``mm_order_cost``. Размер ВИРТУАЛЬНЫХ позиций ни одна из функций не меняет и менять
+    не может: читают позицию, а не пишут.
     """
     return Decimal(str(position["notional_usd"]))
+
+
+def mm_order_cost(
+    equity: Decimal,
+    free_cash: Decimal,
+    token_exposure: Decimal,
+    *,
+    step_pct: Decimal,
+    token_cap_pct: Decimal,
+    reserve_pct: Decimal,
+    min_order_usd: Decimal,
+) -> tuple[Decimal, str | None]:
+    """Сумма покупки по манименеджменту: ``(сумма, None)`` или ``(0, причина пропуска)``.
+
+    ``equity`` — баланс учёта (cash + in_market), ``free_cash`` — свободные деньги за
+    вычетом сумм под ордерами с неизвестным исходом, ``token_exposure`` — вложено в эту
+    монету. Покупка — наименьшее из трёх: шаг (``step_pct`` баланса), остаток до потолка
+    монеты (``token_cap_pct`` баланса минус вложенное) и свободные деньги сверх резерва
+    (``reserve_pct`` баланса). Сумма округляется ВНИЗ до цента: вверх нельзя — покупка
+    ушла бы за ограничение.
+
+    Потолок монеты считается по ВЛОЖЕННЫМ деньгам (цена покупки), а не по текущей
+    стоимости. Иначе падающая монета «освобождала» бы место под потолком, и система
+    докупала бы её всё глубже. Это сознательное решение владельца.
+
+    Последняя покупка до потолка может оказаться меньше шага: баланс между покупками
+    сдвинулся, и она добирает остаток. Это ожидаемо. Меньше ``min_order_usd`` — покупка
+    не делается; причина — то ограничение, которое меньше (при равенстве — резерв).
+    """
+    if equity <= 0:
+        return Decimal(0), SKIP_RESERVE
+    step = equity * step_pct / 100
+    token_room = equity * token_cap_pct / 100 - token_exposure
+    reserve_room = free_cash - equity * reserve_pct / 100
+    cost = min(step, token_room, reserve_room).quantize(_CENT, rounding=ROUND_FLOOR)
+    if cost >= min_order_usd:
+        return cost, None
+    return Decimal(0), SKIP_RESERVE if reserve_room <= token_room else SKIP_TOKEN_CAP
 
 
 def cl_ord_id(position_id: int, leg: str) -> str:
@@ -150,19 +198,23 @@ def pair_pnl(
     buy_cost_usd: Decimal,
     sell_cost_usd: Decimal,
     sell_fee_usdt: Decimal,
+    buy_fee_usdt: Decimal = Decimal(0),
 ) -> tuple[Decimal, Decimal]:
-    """Результат пары «покупка + продажа»: ``(прибыль $, прибыль %)``.
+    """Результат пары «покупка + продажа»: ``(прибыль $, прибыль %)``. Формула та же, что
+    у ``ledger.pair_profit`` / ``ledger.pair_cost``.
 
     Комиссия покупки в базовой монете в формулу не входит: она уже съела часть
     купленного количества, и продана была меньшая часть — это видно в
-    ``sell_cost_usd``. Комиссия продажи берётся в USDT и вычитается явно. Процент —
-    от стоимости покупки.
+    ``sell_cost_usd``. Комиссия покупки в USDT (``buy_fee_usdt``) — деньги, ушедшие
+    сверх стоимости покупки: вычитается так же, как комиссия продажи. Процент — от
+    потраченного на покупку (стоимость + её комиссия в USDT).
     """
     buy = Decimal(str(buy_cost_usd))
     if buy <= 0:
         raise ValueError(f"стоимость покупки должна быть > 0, получено {buy_cost_usd}")
-    profit = Decimal(str(sell_cost_usd)) - buy - abs(Decimal(str(sell_fee_usdt)))
-    return profit, profit / buy * 100
+    spent = buy + abs(Decimal(str(buy_fee_usdt)))
+    profit = Decimal(str(sell_cost_usd)) - abs(Decimal(str(sell_fee_usdt))) - spent
+    return profit, profit / spent * 100
 
 
 def fee_in_usdt(

@@ -602,6 +602,13 @@ class Settings(BaseSettings):
     DEMO_OWNER_SHEET: str = "торговля демо апи окх"
     # До какой строки у владельца протянуты формулы: ниже строки данных не пишутся.
     DEMO_OWNER_SHEET_LAST_ROW: int = 1000
+    # Этап 9.6 — манименеджмент демо-покупок. Выключен по умолчанию: при false размер
+    # покупки = positions.notional_usd, как на этапе 9.5.
+    DEMO_MM_ENABLED: bool = False
+    DEMO_MM_RESERVE_PCT: float = 25.0      # % баланса, который не тратится никогда
+    DEMO_MM_STEP_PCT: float = 5.0          # % баланса на одну покупку
+    DEMO_MM_TOKEN_CAP_PCT: float = 15.0    # % баланса — потолок вложенного в одну монету
+    DEMO_MM_MIN_ORDER_USD: float = 5.0     # меньше — покупка не делается
     # ВЫВОД ВИРТУАЛЬНЫХ СДЕЛОК ЧЕЛОВЕКУ (этап 9.5, часть 3). Один выключатель для всех
     # путей, которые НЕ гасятся POSITION_NOTIFY_ENABLED и SHEETS_TRADES_ENABLED: раздел
     # «Сделки за 24 часа» в суточном отчёте здоровья, команда /positions и раздел
@@ -876,6 +883,23 @@ class Settings(BaseSettings):
                 f"DEMO_ENABLED=true, но DEMO_START_CAPITAL_USD={self.DEMO_START_CAPITAL_USD}: "
                 "стартовый капитал учёта обязан быть > 0"
             )
+        if self.DEMO_MM_ENABLED:
+            if not 0 < self.DEMO_MM_STEP_PCT <= self.DEMO_MM_TOKEN_CAP_PCT <= 100:
+                errors.append(
+                    f"DEMO_MM_STEP_PCT={self.DEMO_MM_STEP_PCT} и "
+                    f"DEMO_MM_TOKEN_CAP_PCT={self.DEMO_MM_TOKEN_CAP_PCT}: нужно "
+                    "0 < шаг покупки <= потолок на монету <= 100"
+                )
+            if not 0 <= self.DEMO_MM_RESERVE_PCT < 100:
+                errors.append(
+                    f"DEMO_MM_RESERVE_PCT={self.DEMO_MM_RESERVE_PCT}: резерв должен быть "
+                    "в пределах 0 <= резерв < 100 (процентов баланса)"
+                )
+            if not self.DEMO_MM_MIN_ORDER_USD > 0:
+                errors.append(
+                    f"DEMO_MM_MIN_ORDER_USD={self.DEMO_MM_MIN_ORDER_USD}: минимальная "
+                    "сумма покупки должна быть > 0"
+                )
         return errors
 
     @property

@@ -15,6 +15,7 @@ from __future__ import annotations
 import html
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -313,9 +314,12 @@ def account_screen(
     now: datetime,
     tz: ZoneInfo,
     demo_enabled: bool = True,
+    mm: dict[str, Any] | None = None,
 ) -> Screen:
     """``demo`` — ``{state, mirror_since}`` (``BotQueries.demo_state``); ``week`` — итог
-    ``demo_report`` за последние 7×24 часа."""
+    ``demo_report`` за последние 7×24 часа; ``mm`` — правило размера покупки (этап 9.6,
+    ``None`` — правило выключено): ``step_pct``, ``cap_pct``, ``reserve_pct`` из настроек
+    и ``tokens``, ``reserved`` из ``BotQueries.demo_mm``."""
     title = "💰 <b>Демо-счёт OKX</b>"
     refresh = NavTarget(nav.ACCOUNT)
     if not demo_enabled or demo is None:
@@ -354,6 +358,8 @@ def account_screen(
             f"{fmt.money_signed(week['profit_usd'], 4)} · "
             f"комиссии {fmt.money(week['fees_usd'], 4)}"
         )
+    if mm is not None:
+        lines.extend(_mm_block(state, mm))
     lines.append(_footer(now, tz))
     keyboard = _footer_keyboard(
         refresh,
@@ -361,6 +367,40 @@ def account_screen(
          nav.button("📊 Итоги", NavTarget(nav.RESULTS, period=nav.DEFAULT_PERIOD))],
     )
     return _fit("\n".join(lines)), keyboard
+
+
+def _pct_setting(value: Any) -> str:
+    """Процент из настроек без лишних нулей: ``5`` → ``5%``, ``12.5`` → ``12,5%``."""
+    try:
+        number = Decimal(str(value))
+    except InvalidOperation:
+        return fmt.DASH
+    return f"{number.normalize():f}".replace(".", ",") + "%"
+
+
+def _mm_block(state: LedgerState, mm: dict[str, Any]) -> list[str]:
+    """Блок правила размера покупки на экране счёта (этап 9.6).
+
+    Вложено — деньги, потраченные на купленное и ещё не проданное (по цене покупки);
+    потолок монеты и резерв — проценты ТЕКУЩЕГО баланса. Свободно сверх резерва не бывает
+    меньше нуля: ниже резерва покупки просто не делаются.
+    """
+    cap = state.equity * Decimal(str(mm["cap_pct"])) / 100
+    reserve = state.equity * Decimal(str(mm["reserve_pct"])) / 100
+    spare = max(state.cash - mm["reserved"] - reserve, 0)
+    lines = [
+        "",
+        f"Правило размера: покупка {_pct_setting(mm['step_pct'])} баланса · "
+        f"до {_pct_setting(mm['cap_pct'])} на монету · "
+        f"резерв {_pct_setting(mm['reserve_pct'])}",
+        "<b>Загрузка по монетам:</b>",
+    ]
+    for token, invested in mm["tokens"]:
+        lines.append(f"{esc(token)}  {fmt.money(invested, 0)} из {fmt.money(cap, 0)}")
+    lines.append(
+        f"Резерв: {fmt.money(reserve, 0)} · свободно сверх резерва: {fmt.money(spare, 0)}"
+    )
+    return lines
 
 
 # --------------------------------------------------------------------------- #

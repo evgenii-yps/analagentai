@@ -59,7 +59,7 @@ async def _disabled_loop() -> None:
 
 
 async def _require_schema() -> None:
-    """Таблицы миграции 030 обязаны существовать: сервис их не создаёт сам."""
+    """Таблицы миграции 030 и колонки миграции 031 обязаны существовать: сервис их не создаёт."""
     present = await db.pool.fetchval(
         "SELECT to_regclass('public.demo_orders') IS NOT NULL "
         "AND to_regclass('public.demo_state') IS NOT NULL;"
@@ -68,6 +68,18 @@ async def _require_schema() -> None:
         raise RuntimeError(
             "нет таблиц demo_orders / demo_state: сначала примените миграцию "
             "db/migrations/030_demo_orders.sql"
+        )
+    # Этап 9.6: каждая новая строка покупки пишет sizing_rule (и при выключенном
+    # манименеджменте) — без колонки каждая покупка упала бы на вставке.
+    sized = await db.pool.fetchval(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns "
+        "WHERE table_schema = 'public' AND table_name = 'demo_orders' "
+        "AND column_name = 'sizing_rule');"
+    )
+    if not sized:
+        raise RuntimeError(
+            "в demo_orders нет колонок размера покупки: сначала примените миграцию "
+            "db/migrations/031_demo_sizing.sql"
         )
 
 

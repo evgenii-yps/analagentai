@@ -108,6 +108,9 @@ def test_demo_orders_columns_follow_the_spec(db_name) -> None:
         # редакция 2: учёт капитала
         "fee_usd": ("numeric", "YES"), "exit_reason": ("text", "YES"),
         "cash_after_usd": ("numeric", "YES"), "equity_after_usd": ("numeric", "YES"),
+        # этап 9.6 (миграция 031): чем и от какого баланса посчитана сумма покупки
+        "sizing_rule": ("text", "YES"), "sizing_equity_usd": ("numeric", "YES"),
+        "sizing_exposure_usd": ("numeric", "YES"),
     }
     assert set(got) == set(expected)
     for name, (kind, nullable) in expected.items():
@@ -116,7 +119,8 @@ def test_demo_orders_columns_follow_the_spec(db_name) -> None:
                  "filled_qty": ("28", "12"), "avg_price": ("20", "8"), "cost_usd": ("14", "6"),
                  "fee": ("28", "12"), "virtual_price": ("20", "8"), "slippage_pct": ("12", "6"),
                  "fee_usd": ("14", "6"), "cash_after_usd": ("14", "6"),
-                 "equity_after_usd": ("14", "6")}
+                 "equity_after_usd": ("14", "6"), "sizing_equity_usd": ("14", "6"),
+                 "sizing_exposure_usd": ("14", "6")}
     for name, (prec, scale) in precision.items():
         assert (got[name][1], got[name][2]) == (prec, scale), name
 

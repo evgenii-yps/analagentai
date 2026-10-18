@@ -385,7 +385,7 @@ async def test_every_command_answers_and_none_crashes(monkeypatch, virtual) -> N
             assert text and markup["inline_keyboard"], command
             assert len(text) <= screens.TEXT_LIMIT, command
     for command in handlers.KNOWN_COMMANDS:
-        assert isinstance(await bot._answer_command(f"/{command}", 1), (str, tuple)), command
+        assert isinstance(await bot._answer_command(f"/{command}", 1), str | tuple), command
 
 
 async def test_commands_map_to_the_screens() -> None:
@@ -743,7 +743,8 @@ def test_no_new_dependencies_and_no_migrations_were_added() -> None:
     assert "httpx==0.28.1" in requirements
     migrations = sorted(p.name for p in (ROOT / "db" / "migrations").glob("*.sql")
                         if not p.name.endswith("_rollback.sql"))
-    assert migrations[-1].startswith("030_")                              # новых нет
+    # этап 9.7 миграций не добавлял: после 030 есть только миграция этапа 9.6
+    assert [m for m in migrations if m[:3] > "030"] == ["031_demo_sizing.sql"]
 
 
 def test_the_logic_version_is_untouched() -> None:

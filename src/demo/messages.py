@@ -66,6 +66,8 @@ DEMO_SKIP_RU: dict[str, str] = {
     rules.SKIP_NOT_BUY: "не покупка",
     rules.SKIP_BEFORE_START: "до запуска демо",
     rules.SKIP_DUST: "слишком маленькая сумма",
+    rules.SKIP_TOKEN_CAP: "монета на потолке",
+    rules.SKIP_RESERVE: "сработал резерв",
     "no_market": "нет рынка на бирже",
     "closed_before_buy": "сделка закрылась до покупки",
 }

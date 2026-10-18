@@ -229,7 +229,11 @@ async def test_the_sheet_profit_formula_matches_the_ledger_to_a_millionth(pool) 
     for i, sp in enumerate(specs):
         row = row_values(payload, i)
         net = D(str(row["K"])) - D(str(row["G"])) - D(str(row["M"]))
-        profit, _pct = rules.pair_pnl(D(sp["buy_cost"]), D(sp["sell_cost"]), D(sp["sell_fee"]))
+        # комиссия покупки в USDT вычитается так же, как в ledger.pair_profit (этап 9.6)
+        buy_fee_usdt = D(sp["fee"]) if sp["fee_ccy"] == "USDT" else D(0)
+        profit, _pct = rules.pair_pnl(
+            D(sp["buy_cost"]), D(sp["sell_cost"]), D(sp["sell_fee"]), buy_fee_usdt
+        )
         pair = {
             "buy_cost": D(sp["buy_cost"]), "buy_fee_usd": None, "buy_fee_ccy": sp["fee_ccy"],
             "sell_cost": D(sp["sell_cost"]), "sell_fee_usd": D(sp["sell_fee"]),
@@ -237,12 +241,8 @@ async def test_the_sheet_profit_formula_matches_the_ledger_to_a_millionth(pool) 
         }
         if sp["fee_ccy"] == "USDT":
             pair["buy_fee_usd"] = D(sp["fee"])
-            # rules.pair_pnl не вычитает комиссию покупки В USDT (на споте OKX она берётся в
-            # монете); ledger и cash вычитают — лист обязан совпасть с деньгами (ledger).
-            expected_rules = profit - D(sp["fee"])
-        else:
-            expected_rules = profit
-        assert abs(net - expected_rules) < D("0.000001"), (sp["key"], net, expected_rules)
+        # лист обязан совпасть с деньгами (ledger) и с rules.pair_pnl
+        assert abs(net - profit) < D("0.000001"), (sp["key"], net, profit)
         assert abs(net - ledger.pair_profit(pair)) < D("0.000001"), sp["key"]
         pnl_total += net
         # пара «покупка → продажа» заполнена целиком

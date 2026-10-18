@@ -714,6 +714,23 @@ class BotQueries:
         state = await ledger.compute_state(self._pool, start)
         return {"state": state, "mirror_since": row["mirror_since"]}
 
+    async def demo_mm(self) -> dict[str, Any]:
+        """Загрузка монет для правила размера (этап 9.6). ТОЛЬКО ЧТЕНИЕ.
+
+        ``tokens`` — ``[(монета, вложено $)]`` по всем спотовым инструментам системы в
+        порядке идентификаторов (без вложений — ноль), ``reserved`` — деньги под ордерами
+        с неизвестным исходом. Вложено — по цене покупки (``ledger.fetch_token_exposure``).
+        """
+        exposure = await ledger.fetch_token_exposure(self._pool)
+        instruments = await self.spot_instruments()
+        return {
+            "tokens": [
+                (symbol.split("/", 1)[0], exposure.get(instrument_id, ledger.ZERO))
+                for instrument_id, symbol in instruments
+            ],
+            "reserved": await ledger.fetch_reserved(self._pool),
+        }
+
     async def demo_overview(self, days: int = 7) -> dict[str, Any] | None:
         """Баланс демо-счёта, открытые демо-сделки и итог за окно. ТОЛЬКО ЧТЕНИЕ.
 

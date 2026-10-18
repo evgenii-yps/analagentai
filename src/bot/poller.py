@@ -552,9 +552,10 @@ class BotPoller:
                     ledger.local_day(now, self.tz)
                 )
                 week = await self.queries.demo_report(now - timedelta(days=7))
+            mm = await self._demo_mm() if demo is not None and settings.DEMO_MM_ENABLED else None
             return screens.account_screen(
                 demo=demo, yesterday_close=yesterday, week=week, now=now, tz=self.tz,
-                demo_enabled=flags.demo_enabled,
+                demo_enabled=flags.demo_enabled, mm=mm,
             )
 
         if name == nav.TRADES:
@@ -644,6 +645,21 @@ class BotPoller:
         except Exception as exc:  # noqa: BLE001 — демо не важнее ответа
             self._log.warning("bot_demo_state_failed=1", error=str(exc))
             return None
+
+    async def _demo_mm(self) -> dict[str, Any] | None:
+        """Правило размера покупки для экрана счёта: проценты — из тех же настроек ``.env``,
+        что у сервиса demo. Сбой базы убирает блок, а не экран."""
+        try:
+            data = await self.queries.demo_mm()
+        except Exception as exc:  # noqa: BLE001 — блок не важнее экрана
+            self._log.warning("bot_demo_mm_failed=1", error=str(exc))
+            return None
+        return {
+            **data,
+            "step_pct": settings.DEMO_MM_STEP_PCT,
+            "cap_pct": settings.DEMO_MM_TOKEN_CAP_PCT,
+            "reserve_pct": settings.DEMO_MM_RESERVE_PCT,
+        }
 
     async def _demo_overview(self) -> dict[str, Any] | None:
         try:
