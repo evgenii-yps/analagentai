@@ -944,3 +944,115 @@ def test_verify_scripts_use_the_shared_helper_not_a_json_only_pattern() -> None:
         body = (ROOT / "deploy" / name).read_text("utf-8")
         assert "lib_verify.sh" in body and "startup_line" in body, name
     assert "grep -E '\"mm_enabled\"'" not in (ROOT / "deploy" / "verify_9_6.sh").read_text("utf-8")
+
+
+# --------------------------------------------------------------------------
+# Доработка 1. startup_ts на консольной строке сервера; взвешенная строка блока 07
+# --------------------------------------------------------------------------
+
+SERVER_LINE = (
+    "demo-1  | 2026-10-18 20:39:35 [info     ] Сервис demo запущен (демо-счёт OKX, спот) "
+    "component=demo enabled=True host=www.okx.com mm_enabled=True mm_min_order_usd=5.0 "
+    "mm_reserve_pct=25.0 mm_step_pct=5.0 mm_token_cap_pct=15.0 notify_enabled=True")
+
+
+@needs_bash
+def test_startup_ts_reads_the_real_server_line_as_utc() -> None:
+    """Консольный structlog пишет пробел между датой и временем и не пишет пояс."""
+    res = subprocess.run(
+        ["bash", "-c", f'source "{LIB_VERIFY}"\nstartup_ts "$L"'], capture_output=True,
+        text=True, check=False, env={**os.environ, "L": SERVER_LINE})
+    assert res.stdout == "2026-10-18 20:39:35+00", res.stdout
+    # и PostgreSQL принимает это как момент в UTC
+    got = psql_raw("postgres", f"SELECT '{res.stdout}'::timestamptz AT TIME ZONE 'UTC';")
+    assert got == "2026-10-18 20:39:35"
+
+
+@needs_bash
+@pytest.mark.parametrize("line,want", [
+    ("2026-10-18T09:12:44.512345Z [info] x", "2026-10-18T09:12:44.512345Z"),
+    ("2026-10-18T09:12:44 [info] x", "2026-10-18T09:12:44+00"),
+    ("2026-10-18 09:12:44.5+03:00 [info] x", "2026-10-18 09:12:44.5+03:00"),
+    ('{"timestamp": "2026-10-18 09:12:44", "a": 1}', "2026-10-18 09:12:44+00"),
+    ("строка без времени", ""),
+], ids=["t-z", "t-naive", "space-offset", "json-space", "none"])
+def test_startup_ts_forms(line, want) -> None:
+    res = subprocess.run(
+        ["bash", "-c", f'source "{LIB_VERIFY}"\nstartup_ts "$L"'], capture_output=True,
+        text=True, check=False, env={**os.environ, "L": line})
+    assert res.stdout == want
+
+
+@needs_bash
+async def test_verify_9_6_window_starts_at_the_service_launch(pool, db_name, tmp_path) -> None:
+    """Старая покупка (до запуска, sizing_rule пуст) в окно не попадает: п. 3 ✅ и п. 4 ✅."""
+    started = datetime.now(UTC).replace(microsecond=0) - timedelta(hours=2)
+    line = SERVER_LINE.replace("2026-10-18 20:39:35", started.strftime("%Y-%m-%d %H:%M:%S"))
+    old = await mkpos(pool, "BTC/USDT", started - timedelta(hours=2), status="open")
+    new = await mkpos(pool, "DOGE/USDT", started + timedelta(minutes=5), status="open")
+    await insert_buy_filled(pool, old, cost_usd="2.0")
+    await insert_buy_filled(pool, new, symbol="DOGE/USDT", cost_usd="50.0", avg_price="0.1")
+    await pool.execute("UPDATE demo_orders SET created_at=$1 WHERE position_id=$2;",
+                       started - timedelta(hours=1), old)
+    await pool.execute(
+        "UPDATE demo_orders SET created_at=$1, sizing_rule='mm1', sizing_equity_usd=1000, "
+        "sizing_exposure_usd=0, requested_cost_usd=50 WHERE position_id=$2;",
+        started + timedelta(minutes=10), new)
+    stub = _verify_stub(tmp_path, db_name, {"demo": line})
+    res = subprocess.run(
+        ["bash", str(ROOT / "deploy" / "verify_9_6.sh")], capture_output=True, text=True,
+        check=False, env={"PATH": f"{stub['bin']}:{os.environ['PATH']}",
+                          "APP_DIR": str(stub["app"]), "HOME": str(tmp_path)})
+    out = res.stdout
+    assert "✅ все пять величин в журнале совпадают с .env" in out, out
+    assert f"(запуск {started:%Y-%m-%d %H:%M:%S}+00)" in out, out
+    assert "✅ у всех 1 новых строк sizing_rule='mm1'" in out, out
+    assert "❌ у " not in out, out
+
+
+def test_verify_9_3_does_not_depend_on_the_launch_time() -> None:
+    """verify_9_3.sh берёт из строки запуска только величины, время ему не нужно."""
+    assert "startup_ts" not in (ROOT / "deploy" / "verify_9_3.sh").read_text("utf-8")
+
+
+async def seed_07_weighted(pool) -> None:
+    """Две монеты: BTC — 3 входа, безусловная +1 %; DOGE — 1 вход, безусловная −1 %."""
+    def down(k: float) -> float:
+        return 100.0 * 0.99 ** (k / 24.0)
+
+    for k in range(0, 41):
+        await candle(pool, "BTC/USDT", H0 + timedelta(hours=k), _px(k), tf="1h")
+        await candle(pool, "DOGE/USDT", H0 + timedelta(hours=k), down(k), tf="1h")
+    for k in (1, 2, 3):
+        o = H0 + timedelta(hours=k)
+        await mkpos(pool, "BTC/USDT", o, closed=o + timedelta(hours=3), entry=_px(k) / 1.01)
+        await candle(pool, "BTC/USDT", o + timedelta(hours=24), _px(k + 24))
+    o = H0 + timedelta(hours=1)
+    await mkpos(pool, "DOGE/USDT", o, closed=o + timedelta(hours=3), entry=down(1))
+    await candle(pool, "DOGE/USDT", o + timedelta(hours=24), down(25))
+
+
+async def test_07_weights_the_random_return_by_entries_per_coin(pool, db_name) -> None:
+    await seed_07_weighted(pool)
+    out = run_with_as_of(db_name, "07_entry_vs_random.sql", AS_OF_07)
+    rows = {r["Монета"]: r for r in table(out.split("\n\nВывод")[0])}
+    assert rows["BTC/USDT"]["Входов"] == 3 and rows["DOGE/USDT"]["Входов"] == 1
+    assert rows["BTC/USDT"]["Сл. ср., %"] == pytest.approx(1.0, abs=0.01)
+    assert rows["DOGE/USDT"]["Сл. ср., %"] == pytest.approx(-1.0, abs=0.01)
+    # без весов (все часы всех монет поровну) было бы 0; с весами (3 × 1 + 1 × (−1)) / 4 = 0,5
+    assert rows["ВСЕ"]["Сл. ср., %"] == pytest.approx(0.0, abs=0.01)
+    line = next(ln for ln in out.splitlines() if ln.startswith("Случайная доходность"))
+    m = re.fullmatch(
+        r"Случайная доходность, взвешенная по числу входов в монету = (-?[\d.]+) %; "
+        r"разница средних со взвешиванием = (-?[\d.]+) п\.п\.", line)
+    assert m, line
+    assert float(m.group(1)) == pytest.approx(0.5, abs=0.005)
+    # (3 × 2,01 + 1 × (−1)) / 4 = 1,2575 — средний вход; минус 0,5
+    assert float(m.group(2)) == pytest.approx(rows["ВСЕ"]["Вх. ср., %"] - 0.5, abs=0.011)
+    assert "Вывод без интерпретации: разница средних = " in out        # прежняя строка осталась
+
+
+async def test_07_weighted_line_without_entries_says_no_data(pool, db_name) -> None:
+    out = run_with_as_of(db_name, "07_entry_vs_random.sql", AS_OF_07)
+    assert ("Случайная доходность, взвешенная по числу входов в монету = нет данных %; "
+            "разница средних со взвешиванием = нет данных п.п.") in out

@@ -9,6 +9,9 @@
 -- Случайный момент: для той же монеты каждый часовой бар периода версии 7,
 -- close(t + 24 ч) / close(t) − 1.
 -- n_eff — число различных календарных дней (UTC) открытия: сделки одного дня связаны.
+-- Вторая строка-вывод: безусловная доходность, взвешенная числом входов в монету
+-- (sum(n_e × случайная_ср) / sum(n_e) по монетам с n_e > 0), и разница средних с этим весом:
+-- так выбор монеты не смешивается с эффектом момента входа.
 -- Таблица собирается в JSON и печатается вторым запросом, чтобы строка-вывод брала числа
 -- из того же расчёта (команда gset), а не из его копии.
 
@@ -117,6 +120,12 @@ h_agg AS (
       FROM hrs
      GROUP BY ROLLUP (symbol)
 ),
+w AS (                              -- случайная доходность с весами: число входов в монету
+    SELECT sum(e.n_e * h.m_h) / NULLIF(sum(e.n_e), 0) AS y
+      FROM e_agg e
+      JOIN h_agg h ON h.symbol = e.symbol
+     WHERE e.symbol IS NOT NULL AND e.n_e > 0
+),
 s AS (SELECT DISTINCT symbol FROM v7 UNION ALL SELECT NULL::text),
 tbl AS (
     SELECT s.symbol,
@@ -139,7 +148,10 @@ SELECT (SELECT coalesce(json_agg(json_build_object(
                 'pos_e', pos_e, 'pos_h', pos_h, 'in_pos_hours', in_pos_hours)), '[]'::json)
           FROM tbl)                                               AS rows,
        (SELECT coalesce(d::text, 'нет данных') FROM tbl WHERE symbol IS NULL)      AS d_all,
-       (SELECT n_eff::text FROM tbl WHERE symbol IS NULL)                          AS neff_all
+       (SELECT n_eff::text FROM tbl WHERE symbol IS NULL)                          AS neff_all,
+       (SELECT coalesce(round(y::numeric, 2)::text, 'нет данных') FROM w)         AS y_w,
+       (SELECT coalesce(round((e.m_e - w.y)::numeric, 2)::text, 'нет данных')
+          FROM w, e_agg e WHERE e.symbol IS NULL)                                  AS z_w
 \gset
 
 SELECT x.sym                  AS "Монета",
@@ -163,3 +175,4 @@ SELECT x.sym                  AS "Монета",
 
 \echo
 \echo Вывод без интерпретации: разница средних = :d_all п.п., n_eff = :neff_all
+\echo Случайная доходность, взвешенная по числу входов в монету = :y_w %; разница средних со взвешиванием = :z_w п.п.
