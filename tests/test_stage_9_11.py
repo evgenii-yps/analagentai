@@ -1335,7 +1335,8 @@ UNTOUCHED = ["src", "backtest", "docker-compose.yml", ".env.example", "Dockerfil
              "requirements.txt", "db", "analysis/sql/9_9", "analysis/sql/9_10",
              "analysis/run_7_1.sh", "analysis/run_9_9.sh", "analysis/run_9_10.sh",
              "analysis/lib_ro.sh", "analysis/shift_test.py", "analysis/verdict_9_10.py",
-             "deploy/verify_9_10.sh", "deploy/lib_verify.sh", "scripts", "tests/test_stage_9_10.py"]
+             # deploy/verify_9_10.sh правит этап 9.12 (§8, по поручению владельца)
+             "deploy/lib_verify.sh", "scripts", "tests/test_stage_9_10.py"]
 
 
 def test_the_stage_touches_only_its_own_files() -> None:
