@@ -75,3 +75,11 @@ G1 passes only if S1-01–16 pass at the applicable phases, known defects are de
 ## Full roadmap
 
 0. Audit and independent review. 1. Data foundation, registry, quality/profile lifecycle and G1. 2. Analytical modules and adaptive estimation. 3. Scenarios, temporal confirmation, episodes and pinned versions. 4. Decisions, positions and portfolio risk. 5. Execution adaptation, exclusive ownership and recovery. 6. Calibration, chronological replay and independent validation. 7. Forward shadow without order-submission capability. 8. Separately authorized demo pilot and new Sheets journal. 9. Separately authorized rollout, verified cleanup and Telegram.
+
+## Stage 1A implementation status (fixture-only)
+
+Business identity is `(venue, instrument_id, market_type, quote_currency)`; `schema_version` is representation metadata and is excluded from the business key. Lifecycle, quality, expiry and permissions are independent. The fixture builder packages supplied measurements and policy identifiers without calibration; fixture shadow evidence is not Stage 7 system forward-shadow evidence. Optional defects affect only dependent consumers. This branch contains no runtime wiring, SQL or exchange operations.
+
+S1-01 partly covered by `tests/v9/test_contracts.py` (zero versus missing); S1-02 partly covered (field-scoped unknown side/unit); S1-03 partly covered (fixture quality and graph); S1-04 deferred to 1B (source coverage and immutable corrections); S1-05 partly covered (fixture closed flag); S1-06 partly covered (timestamps; historical replay integration deferred); S1-07 partly covered (fixture digest; full sample replay 1B); S1-08 partly covered (fixture lifecycle; real shadow evidence later); S1-09 deferred 1B; S1-10 interface only, durable atomic publication 1B; S1-11 identity/unchanged supplied limits only, integration deferred; S1-12 partly covered by import/config regression, consumer compatibility 1B; S1-13 partly covered (cycles, unresolved nodes, collisions); S1-14–16 deferred 1B. Full G1 remains unpassed.
+
+Stage 0: eight document texts reviewed and principal corrections resolved, but full audit acceptance, baseline evidence, remote publication and runtime remain unverified. This is not evidence of production readiness.
