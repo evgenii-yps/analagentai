@@ -46,5 +46,8 @@ jobs:
       - name: Ruff check
         run: ruff check .
 
+      - name: Provision isolated legacy test role
+        run: psql -h localhost -U postgres -d postgres -v ON_ERROR_STOP=1 -c 'CREATE ROLE agenttrade SUPERUSER LOGIN;'
+
       - name: Pytest
         run: pytest
