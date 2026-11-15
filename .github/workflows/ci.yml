@@ -21,6 +21,8 @@ jobs:
         image: postgres:16-alpine
         env:
           POSTGRES_PASSWORD: ci_test_password
+          # Isolated CI service: legacy test subprocesses intentionally clear credentials.
+          POSTGRES_HOST_AUTH_METHOD: trust
         ports:
           - 5432:5432
         options: >-
@@ -43,6 +45,9 @@ jobs:
 
       - name: Ruff check
         run: ruff check .
+
+      - name: Provision isolated legacy test role
+        run: psql -h localhost -U postgres -d postgres -v ON_ERROR_STOP=1 -c 'CREATE ROLE agenttrade SUPERUSER LOGIN;'
 
       - name: Pytest
         run: pytest
